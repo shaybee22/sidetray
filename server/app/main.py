@@ -10,6 +10,7 @@ approves them and uploads the group key sealed (and signed) to them.
 import base64
 import binascii
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -87,6 +88,19 @@ CREATE TABLE IF NOT EXISTS media (
     path        TEXT NOT NULL,
     created_at  INTEGER NOT NULL
 );
+-- A Key Master's signed statement about one device (see crypto::roster).
+-- The server checks the fields match its records but can't verify or forge
+-- the signature's meaning; clients verify the chain themselves.
+CREATE TABLE IF NOT EXISTS member_certs (
+    group_id          TEXT NOT NULL REFERENCES groups(id),
+    device_id         TEXT NOT NULL REFERENCES devices(id),
+    issuer_device_id  TEXT NOT NULL REFERENCES devices(id),
+    role              TEXT NOT NULL CHECK (role IN ('member', 'keymaster')),
+    display_name      TEXT NOT NULL,
+    signature         BLOB NOT NULL,
+    created_at        INTEGER NOT NULL,
+    PRIMARY KEY (device_id, issuer_device_id, role)
+);
 CREATE TABLE IF NOT EXISTS acks (
     group_id   TEXT NOT NULL REFERENCES groups(id),
     device_id  TEXT PRIMARY KEY REFERENCES devices(id),
@@ -134,14 +148,22 @@ def add_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> 
 
 
 def drop_legacy_test_group(conn: sqlite3.Connection) -> None:
-    """Remove the Phase 1 seed (group g_test and everything in it)."""
+    """Remove the Phase 1 seed (group g_test and everything in it).
+
+    Runs on every startup and is a no-op once g_test is gone. Every statement
+    is filtered on group_id = 'g_test', and real group ids are `g_` plus 16
+    random characters (new_id), so no real group can match.
+    """
     if not conn.execute("SELECT 1 FROM groups WHERE id = ?", (LEGACY_TEST_GROUP_ID,)).fetchone():
         return
     for row in conn.execute("SELECT path FROM media WHERE group_id = ?", (LEGACY_TEST_GROUP_ID,)):
         (MEDIA_DIR / row["path"]).unlink(missing_ok=True)
-    for table in ("acks", "events", "media", "sealed_keys", "devices", "members"):
+    for table in ("acks", "events", "media", "member_certs", "sealed_keys", "devices", "members"):
         conn.execute(f"DELETE FROM {table} WHERE group_id = ?", (LEGACY_TEST_GROUP_ID,))
     conn.execute("DELETE FROM groups WHERE id = ?", (LEGACY_TEST_GROUP_ID,))
+    legacy_dir = MEDIA_DIR / LEGACY_TEST_GROUP_ID
+    if legacy_dir.is_dir() and not any(legacy_dir.iterdir()):
+        legacy_dir.rmdir()
 
 
 def init_db() -> None:
@@ -155,6 +177,8 @@ def init_db() -> None:
         add_column(conn, "devices", "approved_by", "TEXT REFERENCES devices(id)")
         add_column(conn, "sealed_keys", "signature", "BLOB")
         add_column(conn, "sealed_keys", "signer_device_id", "TEXT REFERENCES devices(id)")
+        add_column(conn, "devices", "anchors", "TEXT")  # JSON [{device_id, sign_pubkey}]
+        add_column(conn, "devices", "anchors_signature", "BLOB")
         drop_legacy_test_group(conn)
 
 
@@ -255,8 +279,57 @@ class SealedKeyIn(BaseModel):
         return v
 
 
+class CertIn(BaseModel):
+    """A member certificate. member_id and the public keys are the device's own
+    (from the server's records); the issuer is the calling Key Master device."""
+
+    device_id: str
+    role: Literal["member", "keymaster"]
+    display_name: str = Field(min_length=1, max_length=100)
+    signature: str  # base64, Ed25519 over crypto::protocol::member_cert_message
+
+    @field_validator("signature")
+    @classmethod
+    def check_sig(cls, v: str):
+        if len(b64decode(v, "signature")) != 64:
+            raise ValueError("signature must be 64 bytes")
+        return v
+
+
+class AnchorIn(BaseModel):
+    device_id: str
+    sign_pubkey: str  # base64
+
+    @field_validator("sign_pubkey")
+    @classmethod
+    def check_key(cls, v: str):
+        pubkey(v, "sign_pubkey")
+        return v
+
+
 class ApproveIn(BaseModel):
     sealed_keys: list[SealedKeyIn] = Field(min_length=1, max_length=1000)
+    cert: CertIn
+    # Key Master signing keys the approver trusts, handed to the new device,
+    # signed over crypto::protocol::anchors_message.
+    anchors: list[AnchorIn] = Field(min_length=1, max_length=100)
+    anchors_signature: str
+
+    @field_validator("anchors_signature")
+    @classmethod
+    def check_sig(cls, v: str):
+        if len(b64decode(v, "anchors_signature")) != 64:
+            raise ValueError("anchors_signature must be 64 bytes")
+        return v
+
+
+class CertsIn(BaseModel):
+    certs: list[CertIn] = Field(min_length=1, max_length=100)
+
+
+class RoleIn(BaseModel):
+    role: Literal["keymaster"]  # demotion waits for revocation (Phase 6)
+    certs: list[CertIn] = Field(min_length=1, max_length=100)
 
 
 class EventIn(BaseModel):
@@ -373,8 +446,15 @@ def join_status(dev: Device = Depends(any_device)):
         return {"status": "pending", "device_id": dev.id}
     if dev.status != "active":
         return {"status": "denied", "device_id": dev.id}
+    with db() as conn:
+        row = conn.execute(
+            "SELECT approved_by, anchors, anchors_signature FROM devices WHERE id = ?", (dev.id,)
+        ).fetchone()
     return {"status": "active", "device_id": dev.id, "member_id": dev.member_id,
-            "role": dev.role, "sealed_keys": sealed_keys_for(dev.id)}
+            "role": dev.role, "sealed_keys": sealed_keys_for(dev.id),
+            "approved_by": row["approved_by"],
+            "anchors": json.loads(row["anchors"]) if row["anchors"] else [],
+            "anchors_signature": b64encode(row["anchors_signature"] or b"")}
 
 
 def sealed_keys_for(device_id: str) -> list[dict]:
@@ -437,6 +517,38 @@ def pending_joins(km: Device = Depends(keymaster_device)):
     }
 
 
+def store_cert(conn: sqlite3.Connection, km: Device, cert: CertIn, role: str,
+               allowed_status: tuple[str, ...] = ("active",)) -> None:
+    """Check a certificate describes the device as the server knows it, then keep it."""
+    row = conn.execute(
+        "SELECT d.status, m.display_name FROM devices d JOIN members m ON m.id = d.member_id"
+        " WHERE d.id = ? AND d.group_id = ?",
+        (cert.device_id, km.group_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, f"no such device: {cert.device_id}")
+    if row["status"] not in allowed_status:
+        raise HTTPException(409, f"device {cert.device_id} is {row['status']}")
+    if cert.role != role:
+        raise HTTPException(422, f"certificate role {cert.role} doesn't match the member's role {role}")
+    if cert.display_name != row["display_name"]:
+        raise HTTPException(422, "certificate display_name doesn't match the member")
+    conn.execute(
+        "INSERT OR REPLACE INTO member_certs"
+        " (group_id, device_id, issuer_device_id, role, display_name, signature, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (km.group_id, cert.device_id, km.id, cert.role, cert.display_name,
+         b64decode(cert.signature, "signature"), now()),
+    )
+
+
+def member_role_of(conn: sqlite3.Connection, device_id: str) -> str:
+    row = conn.execute(
+        "SELECT m.role FROM devices d JOIN members m ON m.id = d.member_id WHERE d.id = ?", (device_id,)
+    ).fetchone()
+    return row["role"] if row else ""
+
+
 def pending_device(conn: sqlite3.Connection, device_id: str, group_id: str) -> sqlite3.Row:
     row = conn.execute(
         "SELECT id, member_id, status FROM devices WHERE id = ? AND group_id = ?",
@@ -457,6 +569,14 @@ def approve_join(device_id: str, body: ApproveIn, km: Device = Depends(keymaster
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         pending_device(conn, device_id, km.group_id)
+        if body.cert.device_id != device_id:
+            raise HTTPException(422, "certificate is for a different device")
+        store_cert(conn, km, body.cert, member_role_of(conn, device_id), allowed_status=("pending",))
+        conn.execute(
+            "UPDATE devices SET anchors = ?, anchors_signature = ? WHERE id = ?",
+            (json.dumps([a.model_dump() for a in body.anchors]),
+             b64decode(body.anchors_signature, "anchors_signature"), device_id),
+        )
         for k in body.sealed_keys:
             conn.execute(
                 "INSERT OR REPLACE INTO sealed_keys"
@@ -490,20 +610,69 @@ def deny_join(device_id: str, km: Device = Depends(keymaster_device)):
 
 @api.get("/members")
 def members(dev: Device = Depends(current_device)):
+    """The roster as the server sees it. Clients must verify each device's
+    certificates (crypto::roster) and ignore anything that doesn't verify."""
     with db() as conn:
         rows = conn.execute(
-            "SELECT m.id AS member_id, m.display_name, m.role, d.id AS device_id, d.sign_pubkey"
+            "SELECT m.id AS member_id, m.display_name, m.role, d.id AS device_id, d.enc_pubkey, d.sign_pubkey"
             " FROM members m JOIN devices d ON d.member_id = m.id"
             " WHERE m.group_id = ? AND m.status = 'active' AND d.status = 'active'"
             " ORDER BY m.created_at, d.requested_at",
             (dev.group_id,),
         ).fetchall()
+        certs: dict[str, list[dict]] = {}
+        for c in conn.execute(
+            "SELECT device_id, issuer_device_id, role, display_name, signature FROM member_certs"
+            " WHERE group_id = ? ORDER BY created_at",
+            (dev.group_id,),
+        ):
+            certs.setdefault(c["device_id"], []).append({
+                "issuer_device_id": c["issuer_device_id"], "role": c["role"],
+                "display_name": c["display_name"], "signature": b64encode(c["signature"]),
+            })
     out: dict[str, dict] = {}
     for r in rows:
         m = out.setdefault(r["member_id"], {"id": r["member_id"], "display_name": r["display_name"],
                                             "role": r["role"], "devices": []})
-        m["devices"].append({"id": r["device_id"], "sign_pubkey": b64encode(r["sign_pubkey"])})
+        m["devices"].append({"id": r["device_id"], "enc_pubkey": b64encode(r["enc_pubkey"]),
+                             "sign_pubkey": b64encode(r["sign_pubkey"]),
+                             "certs": certs.get(r["device_id"], [])})
     return {"members": list(out.values())}
+
+
+@api.post("/certs")
+def add_certs(body: CertsIn, km: Device = Depends(keymaster_device)):
+    """A Key Master certifies active devices at their current role (its own,
+    after creating the group, or devices approved before certificates existed)."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for c in body.certs:
+            store_cert(conn, km, c, member_role_of(conn, c.device_id))
+    return {"stored": len(body.certs)}
+
+
+@api.post("/members/{member_id}/role")
+def set_role(member_id: str, body: RoleIn, km: Device = Depends(keymaster_device)):
+    """Promote a member to Key Master. Needs a keymaster certificate, signed by
+    the calling Key Master, for every active device of that member."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        m = conn.execute(
+            "SELECT role FROM members WHERE id = ? AND group_id = ? AND status = 'active'",
+            (member_id, km.group_id),
+        ).fetchone()
+        if m is None:
+            raise HTTPException(404, "no such member")
+        if m["role"] == body.role:
+            raise HTTPException(409, f"already {body.role}")
+        devices = {r["id"] for r in conn.execute(
+            "SELECT id FROM devices WHERE member_id = ? AND status = 'active'", (member_id,))}
+        if {c.device_id for c in body.certs} != devices:
+            raise HTTPException(422, "need exactly one certificate per active device of the member")
+        for c in body.certs:
+            store_cert(conn, km, c, body.role)
+        conn.execute("UPDATE members SET role = ? WHERE id = ?", (body.role, member_id))
+    return {"member_id": member_id, "role": body.role}
 
 
 @api.post("/events", status_code=201)

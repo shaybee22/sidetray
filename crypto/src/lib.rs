@@ -30,6 +30,7 @@ use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub mod protocol;
+pub mod roster;
 mod wordlist;
 
 pub const PUBLIC_KEY_LEN: usize = 32;

@@ -33,8 +33,9 @@ pub struct State {
     sign_secret: String,
     /// Group keys by version (base64).
     group_keys: BTreeMap<u32, String>,
-    /// Key Masters whose signing key this device has seen sign a key grant,
-    /// by device id. The user checked the approver's safety code at join.
+    /// Pinned Key Master signing keys (roster trust anchors), by device id:
+    /// the approver, whose safety code the user confirmed at join, and the
+    /// Key Masters that approver vouched for. A Key Master also pins itself.
     pub trusted_keymasters: BTreeMap<String, TrustedKeymaster>,
     pub last_seq: i64,
 }
@@ -43,6 +44,8 @@ pub struct State {
 pub struct TrustedKeymaster {
     pub name: String,
     pub sign_pubkey: String,
+    /// Known for the approver (its code was checked); empty for handed-over anchors.
+    #[serde(default)]
     pub enc_pubkey: String,
 }
 

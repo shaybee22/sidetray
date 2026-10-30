@@ -62,6 +62,48 @@ pub fn event_ad(group_id: &str, kind: &str) -> Vec<u8> {
     framed(b"sidetray/event-ad/v1", &[group_id.as_bytes(), kind.as_bytes()])
 }
 
+/// What a Key Master signs to certify one device of a member: who it belongs to,
+/// what the member is called, the device's two public keys and the member's role.
+#[allow(clippy::too_many_arguments)]
+pub fn member_cert_message(
+    group_id: &str,
+    member_id: &str,
+    device_id: &str,
+    display_name: &str,
+    role: &str,
+    enc_pk: &[u8; 32],
+    sign_pk: &[u8; 32],
+    issuer_device_id: &str,
+) -> Vec<u8> {
+    framed(
+        b"sidetray/member-cert/v1",
+        &[
+            group_id.as_bytes(),
+            member_id.as_bytes(),
+            device_id.as_bytes(),
+            display_name.as_bytes(),
+            role.as_bytes(),
+            enc_pk,
+            sign_pk,
+            issuer_device_id.as_bytes(),
+        ],
+    )
+}
+
+/// What an approving Key Master signs to hand a new device the Key Master
+/// signing keys it already trusts (its own included), as `(device_id, sign_pk)`.
+/// Order doesn't matter: the list is sorted before framing.
+pub fn anchors_message(group_id: &str, recipient_device_id: &str, anchors: &[(String, [u8; 32])]) -> Vec<u8> {
+    let mut sorted: Vec<&(String, [u8; 32])> = anchors.iter().collect();
+    sorted.sort();
+    let mut fields: Vec<&[u8]> = vec![group_id.as_bytes(), recipient_device_id.as_bytes()];
+    for (id, pk) in &sorted {
+        fields.push(id.as_bytes());
+        fields.push(pk);
+    }
+    framed(b"sidetray/anchors/v1", &fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +132,33 @@ mod tests {
         assert_ne!(base, event_message("g", "d", "comment", 1, b"ct"));
         assert_ne!(base, event_message("g", "d", "post", 2, b"ct"));
         assert_ne!(base, event_message("g", "d", "post", 1, b"cu"));
+    }
+
+    #[test]
+    fn every_cert_field_matters() {
+        let m = |g, mi, d, n, r, e: u8, s: u8, i| member_cert_message(g, mi, d, n, r, &[e; 32], &[s; 32], i);
+        let base = m("g", "m", "d", "Ana", "member", 1, 2, "k");
+        for other in [
+            m("h", "m", "d", "Ana", "member", 1, 2, "k"),
+            m("g", "n", "d", "Ana", "member", 1, 2, "k"),
+            m("g", "m", "e", "Ana", "member", 1, 2, "k"),
+            m("g", "m", "d", "Anna", "member", 1, 2, "k"),
+            m("g", "m", "d", "Ana", "keymaster", 1, 2, "k"),
+            m("g", "m", "d", "Ana", "member", 3, 2, "k"),
+            m("g", "m", "d", "Ana", "member", 1, 3, "k"),
+            m("g", "m", "d", "Ana", "member", 1, 2, "j"),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    #[test]
+    fn anchors_are_order_independent_but_complete() {
+        let a = ("d1".to_string(), [1; 32]);
+        let b = ("d2".to_string(), [2; 32]);
+        assert_eq!(anchors_message("g", "r", &[a.clone(), b.clone()]), anchors_message("g", "r", &[b.clone(), a.clone()]));
+        assert_ne!(anchors_message("g", "r", &[a.clone(), b.clone()]), anchors_message("g", "r", &[a.clone()]));
+        assert_ne!(anchors_message("g", "r", &[a.clone()]), anchors_message("g", "s", &[a]));
     }
 
     #[test]

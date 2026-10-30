@@ -59,9 +59,11 @@ base64. The server never decrypts.
 | GET | /join/status | any device token | | `{status: pending\|active\|denied, role?, sealed_keys[]?}` |
 | GET | /keys | member | | `{sealed_keys[]}` |
 | GET | /joins/pending | Key Master | | `{pending[]}` with each device's public keys |
-| POST | /joins/{device_id}/approve | Key Master | `{sealed_keys: [{key_version, sealed_blob, signature}]}` | `{status: active}` |
+| POST | /joins/{device_id}/approve | Key Master | `{sealed_keys: [{key_version, sealed_blob, signature}], cert, anchors[], anchors_signature}` | `{status: active}` |
 | POST | /joins/{device_id}/deny | Key Master | | `{status: denied}` |
-| GET | /members | member | | `{members: [{id, display_name, role, devices: [{id, sign_pubkey}]}]}` |
+| GET | /members | member | | `{members: [{id, display_name, role, devices: [{id, enc_pubkey, sign_pubkey, certs[]}]}]}` |
+| POST | /certs | Key Master | `{certs: [{device_id, role, display_name, signature}]}` | `{stored}` |
+| POST | /members/{id}/role | Key Master | `{role: "keymaster", certs[]}`, one per active device | `{role}` |
 | POST | /events | member | `{kind, key_version, ciphertext, signature, media_ids[]}` | `{seq}` |
 | GET | /events | member | `?after=<seq>&limit=<1..500>` | `{events[], last_seq, has_more}` |
 | POST | /ack | member | `{seq}` (only moves forward) | `{last_seq}` |
@@ -79,6 +81,33 @@ base64. The server never decrypts.
   new device. Each sealed blob carries the Key Master's Ed25519 signature over
   `protocol::key_grant_message` (group, recipient device, recipient key, version,
   blob). `/join/status` returns it with the signer's public keys.
+- **Certificates:** every device in the roster carries member certificates:
+  a Key Master's signature over `protocol::member_cert_message` (group, member,
+  device, display name, role, both public keys, issuer). The server only checks
+  that a certificate's role and name match its records; clients verify the
+  signatures. Approving uploads the new device's certificate, plus the Key
+  Master keys the approver trusts (`anchors`), signed over
+  `protocol::anchors_message`. Promotion needs a `keymaster` certificate from the
+  calling Key Master for each of the member's devices. Demotion waits for
+  revocation (Phase 6).
+
+## Roster trust
+
+The server relays the roster, but clients don't take its word for it
+(`crypto::roster::verify_roster`):
+
+- Each device pins **anchors**: the Key Master signing keys it trusts.
+  - The founder pins itself.
+  - A joining device pins the approving Key Master, but only after the user types
+    that Key Master's code (`status --km-code`). It also pins the Key Masters the
+    approver vouched for in the signed anchors list.
+- A certificate counts only if it's signed by an anchor or by a device that
+  itself has a valid `keymaster` certificate. A promotion therefore needs an
+  existing Key Master's signature. A member can't certify anyone, including
+  promoting itself.
+- Devices without a valid certificate are listed as `UNVERIFIED`, and `pull`
+  refuses their posts. Names and roles shown come from certificates, never from
+  the server's fields.
 
 ## CLI (Phase 3)
 
@@ -97,8 +126,10 @@ no real domain.
 | `pending` | Key Master | Lists join requests with codes computed from the relayed keys |
 | `approve <device> --code <code>` | Key Master | Refuses unless the code you heard matches; seals and signs every key version; prints your Key Master code |
 | `deny <device>` | Key Master | Rejects a request |
-| `status` | anyone | While pending: on approval, verifies each grant's signature, unseals the keys and shows the approver's code to check |
-| `members`, `post <text>`, `pull` | members | Roster; encrypt + sign a post; verify + decrypt new events and ack them |
+| `status [--km-code <code>]` | anyone | After approval: verifies the grants and anchors, then stores keys and pins the approver once you type their code. Later: picks up a promotion |
+| `certify [<device> --code <code>] [--keymaster]` | Key Master | Self-certify, or certify a device approved before certificates existed |
+| `promote <member_id>` | Key Master | Signs Key Master certificates for a verified member's devices |
+| `members`, `post <text>`, `pull` | members | Verified roster (flags unverified devices); encrypt + sign a post; verify author certificate + signature, decrypt, ack |
 
 Posts are encrypted with associated data `protocol::event_ad(group, kind)`.
 Authors sign `protocol::event_message(group, author device, kind, version, ciphertext)`.
@@ -132,5 +163,8 @@ It comes from the public-domain [12dicts](http://wordlist.aspell.net/12dicts/) l
 
 - Every table carries `group_id`; the MVP has one group per server.
 - Tokens are stored as SHA-256 hashes.
-- Phase 3 removes the Phase 1 seed (group `g_test` and its test token) on startup.
+- Every startup removes the Phase 1 seed (group `g_test`). The cleanup is a no-op
+  once the seed is gone, and touches only rows with `group_id = 'g_test'`; real ids
+  are `g_` plus 16 random characters. `server/tests/test_legacy_cleanup.py` checks this
+  (`cd server && python -m unittest discover tests`).
 - Footprint on the test VM: ~35 MB (api) + ~70 MB (caddy), with 256 MB / 128 MB caps.

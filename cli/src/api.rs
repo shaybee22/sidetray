@@ -79,6 +79,17 @@ pub struct JoinStatus {
     pub role: Option<String>,
     #[serde(default)]
     pub sealed_keys: Vec<SealedKey>,
+    pub approved_by: Option<String>,
+    #[serde(default)]
+    pub anchors: Vec<AnchorJson>,
+    #[serde(default)]
+    pub anchors_signature: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AnchorJson {
+    pub device_id: String,
+    pub sign_pubkey: String,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +111,7 @@ pub struct PendingList {
 #[derive(Deserialize)]
 pub struct Pending {
     pub device_id: String,
+    pub member_id: String,
     pub display_name: String,
     pub email: String,
     pub role: String,
@@ -118,6 +130,29 @@ pub struct SealedKeyUpload {
 #[derive(Serialize)]
 pub struct ApproveReq {
     pub sealed_keys: Vec<SealedKeyUpload>,
+    pub cert: CertUpload,
+    pub anchors: Vec<AnchorJson>,
+    pub anchors_signature: String,
+}
+
+/// A member certificate as uploaded; the server fills in member and keys from its records.
+#[derive(Serialize)]
+pub struct CertUpload {
+    pub device_id: String,
+    pub role: String,
+    pub display_name: String,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+pub struct CertsReq {
+    pub certs: Vec<CertUpload>,
+}
+
+#[derive(Serialize)]
+pub struct RoleReq {
+    pub role: String,
+    pub certs: Vec<CertUpload>,
 }
 
 #[derive(Deserialize)]
@@ -126,16 +161,28 @@ pub struct Roster {
 }
 
 #[derive(Deserialize)]
+/// The server's view of a member. Its role claim isn't parsed: roles come from certificates.
 pub struct Member {
+    pub id: String,
     pub display_name: String,
-    pub role: String,
     pub devices: Vec<MemberDevice>,
 }
 
 #[derive(Deserialize)]
 pub struct MemberDevice {
     pub id: String,
+    pub enc_pubkey: String,
     pub sign_pubkey: String,
+    #[serde(default)]
+    pub certs: Vec<CertJson>,
+}
+
+#[derive(Deserialize)]
+pub struct CertJson {
+    pub issuer_device_id: String,
+    pub role: String,
+    pub display_name: String,
+    pub signature: String,
 }
 
 #[derive(Serialize)]
