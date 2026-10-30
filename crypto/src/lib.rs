@@ -29,6 +29,7 @@ use rand_core::{OsRng, RngCore};
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+pub mod protocol;
 mod wordlist;
 
 pub const PUBLIC_KEY_LEN: usize = 32;

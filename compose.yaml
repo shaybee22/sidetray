@@ -3,7 +3,8 @@ services:
     build: ./server
     restart: unless-stopped
     environment:
-      SIDETRAY_TEST_TOKEN: ${SIDETRAY_TEST_TOKEN:-sidetray-test-token}
+      # Lets the first device create the group (and become Key Master). Unset = disabled.
+      SIDETRAY_SETUP_TOKEN: ${SIDETRAY_SETUP_TOKEN:-}
     volumes:
       - api_data:/data
     mem_limit: 256m
