@@ -273,19 +273,23 @@ fn wordlist_is_frozen() {
     let mut sorted = words.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), 256, "words must be unique");
-    assert!(words.iter().all(|w| (3..=7).contains(&w.len()) && w.bytes().all(|c| c.is_ascii_uppercase())));
-    // Any edit to the list changes this hash. Don't update it: make a v2 list instead.
+    assert_eq!(sorted.len(), 1024, "words must be unique");
+    assert!(words.iter().all(|w| (4..=7).contains(&w.len()) && w.bytes().all(|c| c.is_ascii_uppercase())));
+    let mut prefixes: Vec<&str> = words.iter().map(|w| &w[..4]).collect();
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    assert_eq!(prefixes.len(), 1024, "first four letters must be unique");
+    // Any edit to the list changes this hash. Don't update it: make a new list and bump SAFETY_CODE_DOMAIN.
     let h = Blake2b::<U32>::digest(words.join("\n").as_bytes());
-    assert_eq!(hex::encode(h), "34f0f53dde4b86a9dfced25f32c746b02cddba0957fc202352922e1414ed1a0b");
+    assert_eq!(hex::encode(h), "892520d37817c694073fadfac321eb0ffbdab014ad1b5a917ef880f854f88773");
 }
 
 #[test]
 fn safety_code_known_answer() {
     // Computed independently in Python with libsodium's BLAKE2b; must never change.
-    assert_eq!(safety_code(&fixed_device().public()), "ISLAND-HARP-JIGSAW-81");
+    assert_eq!(safety_code(&fixed_device().public()), "MISS-PARCEL-EARTH-PRICE-88");
     let zeros = DevicePublicKeys { enc: [0; 32], sign: [0; 32] };
-    assert_eq!(safety_code(&zeros), "JIGSAW-HORIZON-MELON-48");
+    assert_eq!(safety_code(&zeros), "IMPACT-DEED-FRAGILE-YEAR-18");
 }
 
 #[test]
@@ -294,12 +298,12 @@ fn safety_code_is_deterministic_and_well_formed() {
     let code = safety_code(&p);
     assert_eq!(code, safety_code(&p));
     let parts: Vec<&str> = code.split('-').collect();
-    assert_eq!(parts.len(), 4, "{code}");
-    for w in &parts[..3] {
+    assert_eq!(parts.len(), 5, "{code}");
+    for w in &parts[..4] {
         assert!(wordlist::WORDS.contains(w), "{code}");
     }
-    assert_eq!(parts[3].len(), 2);
-    assert!(parts[3].bytes().all(|c| c.is_ascii_digit()));
+    assert_eq!(parts[4].len(), 2);
+    assert!(parts[4].bytes().all(|c| c.is_ascii_digit()));
 }
 
 #[test]

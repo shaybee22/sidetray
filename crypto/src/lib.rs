@@ -44,7 +44,7 @@ pub const SEALED_GROUP_KEY_LEN: usize = SEAL_OVERHEAD + 4 + GROUP_KEY_LEN;
 
 /// Domain separator for the safety-code hash. Bump the suffix if the
 /// derivation or wordlist ever changes.
-pub const SAFETY_CODE_DOMAIN: &[u8] = b"sidetray/safety-code/v1";
+pub const SAFETY_CODE_DOMAIN: &[u8] = b"sidetray/safety-code/v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -267,11 +267,12 @@ pub fn verify(sign_pk: &[u8; PUBLIC_KEY_LEN], message: &[u8], signature: &[u8]) 
 // Safety code
 // ---------------------------------------------------------------------------
 
-/// The code both screens show during a join, e.g. `TACO-RIVER-42`.
+/// The code both screens show during a join, e.g. `TACO-RIVER-MAPLE-LANTERN-42`.
 ///
-/// `h = BLAKE2b-256(SAFETY_CODE_DOMAIN || enc_pk || sign_pk)`; the words are
-/// `WORDS[h[0]]`, `WORDS[h[1]]`, `WORDS[h[2]]` and the number is
-/// `u16::from_be_bytes([h[3], h[4]]) % 100`, zero-padded to two digits.
+/// `h = BLAKE2b-256(SAFETY_CODE_DOMAIN || enc_pk || sign_pk)`. The first 40 bits
+/// of `h` (big-endian) are split into four 10-bit indices into the 1024-word
+/// list, and the number is `u16::from_be_bytes([h[5], h[6]]) % 100`,
+/// zero-padded to two digits. About 46 bits in all.
 ///
 /// Both public keys are covered, so swapping either one in transit changes
 /// the code. Pure byte arithmetic on a fixed hash and a compiled-in list, so
@@ -282,14 +283,10 @@ pub fn safety_code(device: &DevicePublicKeys) -> String {
     hasher.update(device.enc);
     hasher.update(device.sign);
     let h = hasher.finalize();
-    let n = u16::from_be_bytes([h[3], h[4]]) % 100;
-    format!(
-        "{}-{}-{}-{:02}",
-        wordlist::WORDS[h[0] as usize],
-        wordlist::WORDS[h[1] as usize],
-        wordlist::WORDS[h[2] as usize],
-        n
-    )
+    let bits = u64::from_be_bytes([0, 0, 0, h[0], h[1], h[2], h[3], h[4]]);
+    let word = |i: u32| wordlist::WORDS[((bits >> (30 - 10 * i)) & 0x3ff) as usize];
+    let n = u16::from_be_bytes([h[5], h[6]]) % 100;
+    format!("{}-{}-{}-{}-{:02}", word(0), word(1), word(2), word(3), n)
 }
 
 #[cfg(test)]

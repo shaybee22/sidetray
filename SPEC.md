@@ -51,7 +51,7 @@ The group key never travels through email or the server in readable form. Each d
 1. User installs the app and enters server address, group name, display name and email.
 2. App generates its keypairs and sends a join request with the public keys.
 3. Server holds the request as `pending` and pushes it to every Key Master online.
-4. Both screens show the same safety code: 3 words + 2 digits derived from a hash of the new device's public key (e.g. `TACO-RIVER-42`).
+4. Both screens show the same safety code: 4 words from a 1024-word list + 2 digits, derived from a hash of the new device's public keys (encryption and signing), e.g. `TIGER-RIVER-MAPLE-LEMON-42`.
 5. Key Master phones the new user and compares codes, or scans a QR code from their screen in person.
 6. Key Master approves; their app seals the group key (all versions) to the new device's public key and uploads the sealed blobs.
 7. New device downloads, unseals, and the feed unlocks.
@@ -162,6 +162,7 @@ Each phase ends with something you can run and poke at; hand them to CC one at a
 1. **Server skeleton**: FastAPI + SQLite, the events/ack/media endpoints with a hardcoded test token, Docker Compose with Caddy for HTTPS. Done when `curl` can post and pull events.
 2. **Crypto core**: a small shared module (Rust crate for the client; the server never decrypts) for keygen, sealing, encrypt/decrypt, sign/verify, safety-code words. Done when round-trip tests pass.
 3. **Join and Key Master flow**: join, pending list, approve with sealed keys, device tokens, safety code on both screens. Done when a second device joins with a phone-call code check.
+   - Sealed boxes are anonymous, so each sealed group-key blob must be signed with the approving Key Master's Ed25519 key. The new device verifies that signature against a Key Master's signing key before it trusts the unsealed group key.
 4. **Desktop client feed**: Tauri app, first-run wizard, local SQLite, sync loop, post/comment/react, photo resize + upload. Done when two devices see each other's posts.
 5. **Tray and notifications**: minimize to tray, unread badge, native notifications, start with OS (optional toggle).
 6. **Pruning and removal**: hourly prune job, member removal, key rotation. Done when a removed device stops receiving and old events disappear from the server.

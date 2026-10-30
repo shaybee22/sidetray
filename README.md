@@ -79,7 +79,7 @@ curl --cacert sidetray-root.crt -H "$H" "$B/events?after=0"
 | `seal_group_key` / `unseal_group_key` | `crypto_box_seal` | seals `u32le(version) ‖ key`, 84 bytes |
 | `encrypt` / `decrypt` | XChaCha20-Poly1305 IETF | `nonce[24] ‖ ct ‖ tag[16]`, AD = `u32le(key_version) ‖ ad` |
 | `sign` / `verify` | Ed25519 detached, strict verify | 64 bytes |
-| `safety_code` | BLAKE2b-256 over both public keys, 256-word list | `ISLAND-HARP-JIGSAW-81` |
+| `safety_code` | BLAKE2b-256 over both public keys, 1024-word list | `MISS-PARCEL-EARTH-PRICE-88` |
 
 ```sh
 cd crypto && cargo test
@@ -88,6 +88,8 @@ cd crypto && cargo test
 The tests include vectors produced by libsodium (via PyNaCl) and RFC 8032, and they
 check that flipping any single byte is caught. The wordlist in `crypto/src/wordlist.rs`
 is frozen: a test pins its hash, because editing it would change every safety code.
+It comes from the public-domain [12dicts](http://wordlist.aspell.net/12dicts/) lists;
+`crypto/tools/wordlist/` has the script and blocklist that picked it.
 
 ## Notes
 
