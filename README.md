@@ -2,9 +2,9 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: Phase 1 (server skeleton).** The relay stores and serves events, acks and
-encrypted media. Auth is a single hardcoded test token; joins, crypto, WebSocket,
-pruning and rate limits come in later phases.
+**Status: Phase 2 (crypto core).** The relay stores and serves events, acks and
+encrypted media. Auth is a single hardcoded test token. The client crypto crate
+(`crypto/`) is done; joins, WebSocket, pruning and rate limits come in later phases.
 
 ## Layout
 
@@ -13,6 +13,7 @@ compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS)
 Caddyfile             TLS via Caddy's internal CA (no domain yet)
 server/app/main.py    the relay
 scripts/smoke-test.sh end-to-end curl checks
+crypto/               Rust crate: keys, sealing, encryption, signatures, safety codes
 ```
 
 ## Run
@@ -66,6 +67,27 @@ curl --cacert sidetray-root.crt -H "$H" -H 'Content-Type: application/json' \
   -d '{"kind":"post","key_version":1,"ciphertext":"aGVsbG8=","signature":"c2ln"}' $B/events
 curl --cacert sidetray-root.crt -H "$H" "$B/events?after=0"
 ```
+
+## Crypto core (Phase 2)
+
+`crypto/` is a pure-Rust library (no system libsodium) whose formats match libsodium:
+
+| Function | Construction | Format |
+| --- | --- | --- |
+| `generate_device_keys` | X25519 + Ed25519 | 32-byte public keys each |
+| `generate_group_key(version)` | 32 random bytes | |
+| `seal_group_key` / `unseal_group_key` | `crypto_box_seal` | seals `u32le(version) ‖ key`, 84 bytes |
+| `encrypt` / `decrypt` | XChaCha20-Poly1305 IETF | `nonce[24] ‖ ct ‖ tag[16]`, AD = `u32le(key_version) ‖ ad` |
+| `sign` / `verify` | Ed25519 detached, strict verify | 64 bytes |
+| `safety_code` | BLAKE2b-256 over both public keys, 256-word list | `ISLAND-HARP-JIGSAW-81` |
+
+```sh
+cd crypto && cargo test
+```
+
+The tests include vectors produced by libsodium (via PyNaCl) and RFC 8032, and they
+check that flipping any single byte is caught. The wordlist in `crypto/src/wordlist.rs`
+is frozen: a test pins its hash, because editing it would change every safety code.
 
 ## Notes
 

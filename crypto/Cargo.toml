@@ -1,0 +1,23 @@
+[package]
+name = "sidetray-crypto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Side Tray crypto core: device keys, group keys, sealed key delivery, content encryption, signatures, safety codes"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "sidetray_crypto"
+
+[dependencies]
+# Pure-Rust, libsodium-compatible primitives (no system libsodium to link).
+crypto_box = { version = "0.9.1", features = ["seal"] }                 # crypto_box_seal (X25519 + XSalsa20-Poly1305)
+chacha20poly1305 = "0.10.1"                                              # crypto_aead_xchacha20poly1305_ietf
+ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] } # crypto_sign_detached
+blake2 = "0.10.6"                                                        # crypto_generichash (safety code)
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+hex = "0.4"

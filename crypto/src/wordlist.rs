@@ -1,0 +1,40 @@
+//! Safety-code wordlist: exactly 256 words, one per byte value.
+//!
+//! FROZEN. The order is part of the safety-code format; changing, reordering or
+//! replacing any word changes every device's code. Make a new list and bump the
+//! safety-code domain string instead (see `SAFETY_CODE_DOMAIN`).
+
+pub(crate) const WORDS: [&str; 256] = [
+    "ACORN", "ALARM", "ALBUM", "AMBER", "ANCHOR", "APPLE", "APRON", "ARROW",
+    "ATLAS", "ATTIC", "BACON", "BADGE", "BAGEL", "BAMBOO", "BANANA", "BANJO",
+    "BARREL", "BASIL", "BASKET", "BEACH", "BEAVER", "BELT", "BENCH", "BERRY",
+    "BISON", "BLANKET", "BLOSSOM", "BOOT", "BOTTLE", "BRICK", "BRIDGE", "BROOM",
+    "BUCKET", "BUTTON", "CABIN", "CACTUS", "CAMEL", "CANDLE", "CANNON", "CANOE",
+    "CANYON", "CARPET", "CARROT", "CASTLE", "CEDAR", "CELLO", "CHALK", "CHERRY",
+    "CHESS", "CIRCUS", "CLOVER", "COBRA", "COCOA", "COMET", "COMPASS", "COOKIE",
+    "COPPER", "CORAL", "COTTON", "COYOTE", "CRAYON", "CRICKET", "CROWN", "CRYSTAL",
+    "CUPCAKE", "DAISY", "DANCER", "DESERT", "DIAMOND", "DOLPHIN", "DONKEY", "DRAGON",
+    "DRUM", "EAGLE", "ECHO", "ELBOW", "EMBER", "ENGINE", "FALCON", "FEATHER",
+    "FENCE", "FERRY", "FIDDLE", "FIREFLY", "FOREST", "FOSSIL", "FOX", "GALAXY",
+    "GARDEN", "GARLIC", "GECKO", "GINGER", "GIRAFFE", "GLACIER", "GLOVE", "GOOSE",
+    "GRAPE", "GRAVY", "GUITAR", "HAMMER", "HARBOR", "HARP", "HAZEL", "HELMET",
+    "HERON", "HICKORY", "HONEY", "HORIZON", "HORSE", "ICEBERG", "IGLOO", "INK",
+    "ISLAND", "IVORY", "JACKET", "JAGUAR", "JASMINE", "JELLY", "JIGSAW", "JUNGLE",
+    "KAYAK", "KETTLE", "KITE", "KIWI", "KOALA", "LADDER", "LADLE", "LANTERN",
+    "LEMON", "LEOPARD", "LETTUCE", "LILAC", "LIZARD", "LLAMA", "LOBSTER", "LOCKET",
+    "LOTUS", "MAGNET", "MANGO", "MAPLE", "MARBLE", "MEADOW", "MELON", "METEOR",
+    "MITTEN", "MONKEY", "MOOSE", "MOSAIC", "MUFFIN", "NAPKIN", "NEEDLE", "NOODLE",
+    "NUTMEG", "OASIS", "OCEAN", "OLIVE", "ONION", "OPAL", "ORANGE", "ORBIT",
+    "ORCHID", "OTTER", "OWL", "PADDLE", "PALACE", "PANDA", "PANTHER", "PARROT",
+    "PASTA", "PEACH", "PEANUT", "PEBBLE", "PELICAN", "PENCIL", "PEPPER", "PIANO",
+    "PICKLE", "PILLOW", "PINE", "PIZZA", "PLANET", "PLUM", "POCKET", "POPCORN",
+    "POTATO", "PRETZEL", "PUFFIN", "PUMPKIN", "PUPPET", "PUZZLE", "PYRAMID", "QUILT",
+    "RABBIT", "RACCOON", "RADIO", "RAINBOW", "RAVEN", "RIBBON", "RIVER", "ROBIN",
+    "ROCKET", "RUBY", "SADDLE", "SALMON", "SANDAL", "SATURN", "SCARF", "SHADOW",
+    "SHELL", "SHIELD", "SILVER", "SKATE", "SLED", "SNAIL", "SPARROW", "SPIDER",
+    "SPOON", "SPRUCE", "SQUID", "STAR", "STORM", "STREAM", "SUGAR", "SUNSET",
+    "SWAN", "TABLE", "TACO", "TEAPOT", "TIGER", "TOAST", "TOMATO", "TORCH",
+    "TRACTOR", "TRUMPET", "TULIP", "TUNNEL", "TURTLE", "TWIG", "VALLEY", "VELVET",
+    "VIOLIN", "VOLCANO", "WAFFLE", "WAGON", "WALNUT", "WALRUS", "WHALE", "WHISTLE",
+    "WILLOW", "WINDOW", "WIZARD", "WOMBAT", "YACHT", "YOGURT", "ZEBRA", "ZIPPER",
+];
