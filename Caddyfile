@@ -1,0 +1,21 @@
+{
+	# Clients connecting by bare IP send no SNI; serve this host's cert to them.
+	default_sni {$SIDETRAY_HOST}
+}
+
+{$SIDETRAY_HOST} {
+	# No domain yet: Caddy's own local CA. Swap for a real hostname later and drop this line.
+	tls internal
+
+	request_body {
+		max_size 12MB
+	}
+
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		respond "Side Tray relay" 200
+	}
+}
