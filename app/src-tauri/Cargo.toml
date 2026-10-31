@@ -1,6 +1,6 @@
 [package]
 name = "sidetray-app"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.90"
 description = "Side Tray desktop client"
@@ -34,7 +34,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rusqlite = { version = "0.41", features = ["bundled"] }
 tokio = { version = "1", features = ["sync", "time", "macros"] }
 # Photos: decode common formats, apply EXIF orientation, resize; libwebp for lossy WebP.
-image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 webp = { version = "0.3", default-features = false }
 # Push channel (/ws). Same rustls as reqwest, with a config built from the same pinned roots.
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "__rustls-tls"] }

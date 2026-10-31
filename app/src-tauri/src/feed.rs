@@ -30,6 +30,8 @@ use std::collections::BTreeMap;
 
 pub const MAX_TEXT: usize = 20_000;
 pub const MAX_PHOTOS: usize = 10;
+/// Photos one comment may carry (more arriving from another client are dropped).
+pub const MAX_COMMENT_PHOTOS: usize = 4;
 const MAX_MEDIA_ATTEMPTS: i64 = 5;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -57,6 +59,9 @@ struct RefBody {
     text: String,
     #[serde(default)]
     emoji: String,
+    /// Comments only (0.1.1).
+    #[serde(default)]
+    photos: Vec<PhotoRef>,
 }
 
 /// Media ids become file names, so only allow what the relay hands out.
@@ -294,19 +299,7 @@ fn apply_event(
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![event_id, e.seq, member, e.author_device_id, body.text, e.created_at],
             )?;
-            for (i, p) in body.photos.iter().enumerate() {
-                let (Ok(fd), Ok(td)) = (account::decode32(&p.full_digest), account::decode32(&p.thumb_digest)) else {
-                    continue;
-                };
-                if !safe_media_id(&p.full) || !safe_media_id(&p.thumb) || p.width == 0 || p.height == 0 {
-                    continue;
-                }
-                conn.execute(
-                    "INSERT OR IGNORE INTO media (id, post_id, idx, key_version, width, height, full_digest, thumb_id, thumb_digest)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![p.full, event_id, i as i64, e.key_version, p.width, p.height, &fd[..], p.thumb, &td[..]],
-                )?;
-            }
+            store_photo_refs(conn, &event_id, None, e.key_version, &body.photos)?;
             Ok((inserted > 0 && by_other).then(|| Notice {
                 post_id: event_id.clone(),
                 author: author_name(),
@@ -317,13 +310,15 @@ fn apply_event(
         }
         "comment" => {
             let b: RefBody = serde_json::from_slice(&plain).context("bad comment payload")?;
-            if b.text.trim().is_empty() || b.text.len() > MAX_TEXT {
+            if (b.text.trim().is_empty() && b.photos.is_empty()) || b.text.len() > MAX_TEXT || b.photos.len() > MAX_PHOTOS {
                 bail!("empty or oversized comment");
             }
             let inserted = conn.execute(
                 "INSERT OR IGNORE INTO comments (id, seq, post_id, author_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![event_id, e.seq, b.post, member, b.text, e.created_at],
             )?;
+            let photos = &b.photos[..b.photos.len().min(MAX_COMMENT_PHOTOS)];
+            store_photo_refs(conn, &b.post, Some(&event_id), e.key_version, photos)?;
             if inserted == 0 || !by_other {
                 return Ok(None);
             }
@@ -333,7 +328,7 @@ fn apply_event(
             Ok(Some(Notice {
                 post_id: b.post.clone(),
                 author: author_name(),
-                text: snippet(&b.text, 0),
+                text: snippet(&b.text, photos.len()),
                 comment: true,
                 notify: post_author.as_deref() == Some(id.member_id.as_str()),
             }))
@@ -384,6 +379,24 @@ fn apply_event(
         }
         other => bail!("unknown event kind {other}"),
     }
+}
+
+/// Record a post's or comment's photos for download, skipping unusable references.
+fn store_photo_refs(conn: &Connection, post_id: &str, comment_id: Option<&str>, key_version: u32, photos: &[PhotoRef]) -> Result<()> {
+    for (i, p) in photos.iter().enumerate() {
+        let (Ok(fd), Ok(td)) = (account::decode32(&p.full_digest), account::decode32(&p.thumb_digest)) else {
+            continue;
+        };
+        if !safe_media_id(&p.full) || !safe_media_id(&p.thumb) || p.width == 0 || p.height == 0 {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO media (id, post_id, comment_id, idx, key_version, width, height, full_digest, thumb_id, thumb_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![p.full, post_id, comment_id, i as i64, key_version, p.width, p.height, &fd[..], p.thumb, &td[..]],
+        )?;
+    }
+    Ok(())
 }
 
 /// (full id, key version, full digest, thumb id, thumb digest, need full, need thumb)
@@ -511,12 +524,12 @@ pub fn latest_key(app: &App, id: &Identity) -> Result<GroupKey> {
     secrets::latest_group_key(&app.db(), &s)
 }
 
-/// What `post_once` returns: the post's event id, the key it used, its photo
+/// What `publish_once` returns: the event id, the key it used, its photo
 /// references and the digests of the encrypted blobs.
 type Posted = (String, GroupKey, Vec<PhotoRef>, Vec<([u8; 32], [u8; 32])>);
 
-/// Upload a post's photos and the post itself under the latest key.
-async fn post_once(app: &App, id: &Identity, text: &str, photos: &[crate::photo::Processed]) -> Result<Posted> {
+/// Upload the photos, then send a post or comment carrying them, under the latest key.
+async fn publish_once(app: &App, id: &Identity, kind: &str, body: &serde_json::Value, photos: &[crate::photo::Processed]) -> Result<Posted> {
     let gk = latest_key(app, id)?;
     let api = app.api(id)?;
     let ad = protocol::media_ad(&id.group_id);
@@ -541,13 +554,13 @@ async fn post_once(app: &App, id: &Identity, text: &str, photos: &[crate::photo:
         });
         local.push((fd, td));
     }
-    let mut body = serde_json::json!({ "text": text });
+    let mut body = body.clone();
     if !refs.is_empty() {
         body["photos"] = serde_json::to_value(&refs)?;
     }
     let media_ids = refs.iter().flat_map(|r| [r.full.clone(), r.thumb.clone()]).collect();
-    let post_id = send_event(app, "post", &body, &gk, media_ids).await?;
-    Ok((post_id, gk, refs, local))
+    let event_id = send_event(app, kind, &body, &gk, media_ids).await?;
+    Ok((event_id, gk, refs, local))
 }
 
 /// Send a comment, reaction or delete under the latest key. If the relay says
@@ -563,33 +576,32 @@ async fn send_fresh(app: &App, kind: &str, body: &serde_json::Value) -> Result<S
     }
 }
 
-pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()> {
+/// The staged photos with these ids, in order.
+fn take_staged(app: &App, staged: &[String]) -> Result<Vec<crate::photo::Processed>> {
+    let map = app.staged.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(missing) = staged.iter().find(|k| !map.contains_key(*k)) {
+        bail!("photo {missing} is no longer attached; add it again");
+    }
+    Ok(staged.iter().map(|k| map.get(k).expect("checked").clone()).collect())
+}
+
+/// Send a post (`post_id` None) or a comment on `post_id` with staged photos,
+/// keep the plaintext photos locally, and sync.
+async fn publish(app: &App, kind: &str, body: serde_json::Value, staged: &[String], post_id: Option<&str>) -> Result<()> {
     let id = app.require_active()?;
-    let text = text.trim();
-    if text.len() > MAX_TEXT {
-        bail!("that post is too long");
-    }
-    if staged.len() > MAX_PHOTOS {
-        bail!("at most {MAX_PHOTOS} photos per post");
-    }
-    let photos: Vec<crate::photo::Processed> = {
-        let map = app.staged.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(missing) = staged.iter().find(|k| !map.contains_key(*k)) {
-            bail!("photo {missing} is no longer attached; add it again");
-        }
-        staged.iter().map(|k| map.get(k).expect("checked").clone()).collect()
-    };
-    if text.is_empty() && photos.is_empty() {
-        bail!("write something or add a photo");
-    }
-    let (post_id, gk, refs, local) = match post_once(app, &id, text, &photos).await {
+    let photos = take_staged(app, staged)?;
+    let (event_id, gk, refs, local) = match publish_once(app, &id, kind, &body, &photos).await {
         // A rotation we hadn't picked up: get the new key and redo it (the
         // first uploads become orphans, which the relay prunes after a day).
         Err(e) if is_stale_key(&e) => {
             manage::refresh_keys_now(app).await?;
-            post_once(app, &id, text, &photos).await?
+            publish_once(app, &id, kind, &body, &photos).await?
         }
         r => r?,
+    };
+    let (owner, comment_id) = match post_id {
+        Some(post) => (post, Some(event_id.as_str())),
+        None => (event_id.as_str(), None),
     };
 
     // We already have the plaintext photos: keep them, so sync doesn't download them back.
@@ -599,9 +611,9 @@ pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()>
         write_file(&app.media_dir.join(&thumb_name), &p.thumb)?;
         let (fd, td) = local[i];
         app.db().execute(
-            "INSERT OR IGNORE INTO media (id, post_id, idx, key_version, width, height, full_digest, thumb_id, thumb_digest, local_path, thumb_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![r.full, post_id, i as i64, gk.version(), r.width, r.height, &fd[..], r.thumb, &td[..], full_name, thumb_name],
+            "INSERT OR IGNORE INTO media (id, post_id, comment_id, idx, key_version, width, height, full_digest, thumb_id, thumb_digest, local_path, thumb_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![r.full, owner, comment_id, i as i64, gk.version(), r.width, r.height, &fd[..], r.thumb, &td[..], full_name, thumb_name],
         )?;
     }
     {
@@ -614,6 +626,20 @@ pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()>
     Ok(())
 }
 
+pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()> {
+    let text = text.trim();
+    if text.len() > MAX_TEXT {
+        bail!("that post is too long");
+    }
+    if staged.len() > MAX_PHOTOS {
+        bail!("at most {MAX_PHOTOS} photos per post");
+    }
+    if text.is_empty() && staged.is_empty() {
+        bail!("write something or add a photo");
+    }
+    publish(app, "post", serde_json::json!({ "text": text }), staged, None).await
+}
+
 fn require_post(app: &App, post_id: &str) -> Result<String> {
     app.db()
         .query_row("SELECT author_id FROM posts WHERE id = ?1 AND deleted = 0", params![post_id], |r| r.get(0))
@@ -621,16 +647,17 @@ fn require_post(app: &App, post_id: &str) -> Result<String> {
         .context("that post isn't in this app's archive")
 }
 
-pub async fn add_comment(app: &App, post_id: &str, text: &str) -> Result<()> {
+pub async fn add_comment(app: &App, post_id: &str, text: &str, staged: &[String]) -> Result<()> {
     app.require_active()?;
     let text = text.trim();
-    if text.is_empty() || text.len() > MAX_TEXT {
+    if (text.is_empty() && staged.is_empty()) || text.len() > MAX_TEXT {
         bail!("write a comment first");
     }
+    if staged.len() > MAX_COMMENT_PHOTOS {
+        bail!("at most {MAX_COMMENT_PHOTOS} photos per comment");
+    }
     require_post(app, post_id)?;
-    send_fresh(app, "comment", &serde_json::json!({ "post": post_id, "text": text })).await?;
-    sync_once(app).await?;
-    Ok(())
+    publish(app, "comment", serde_json::json!({ "post": post_id, "text": text }), staged, Some(post_id)).await
 }
 
 pub async fn set_reaction(app: &App, post_id: &str, emoji: &str) -> Result<()> {
@@ -690,6 +717,7 @@ pub struct CommentView {
     pub mine: bool,
     pub text: String,
     pub created_at: i64,
+    pub photos: Vec<PhotoView>,
 }
 
 #[derive(Serialize)]
@@ -742,7 +770,20 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
     })?;
     let mut posts: Vec<PostView> = rows.collect::<rusqlite::Result<_>>()?;
 
-    let mut photos = conn.prepare("SELECT thumb_path, local_path, width, height FROM media WHERE post_id = ?1 ORDER BY idx")?;
+    let mut photos =
+        conn.prepare("SELECT thumb_path, local_path, width, height FROM media WHERE post_id = ?1 AND comment_id IS NULL ORDER BY idx")?;
+    let mut comment_photos =
+        conn.prepare("SELECT thumb_path, local_path, width, height FROM media WHERE comment_id = ?1 ORDER BY idx")?;
+    let photo_view = |r: &rusqlite::Row| -> rusqlite::Result<PhotoView> {
+        let thumb: Option<String> = r.get(0)?;
+        let full: Option<String> = r.get(1)?;
+        Ok(PhotoView {
+            thumb: thumb.as_deref().map(media_url),
+            full: full.as_deref().map(media_url),
+            width: r.get(2)?,
+            height: r.get(3)?,
+        })
+    };
     let mut comments = conn.prepare(
         "SELECT c.id, c.author_id, COALESCE(m.display_name, ?2), c.body, c.created_at, pr.avatar_path
          FROM comments c LEFT JOIN members m ON m.id = c.author_id LEFT JOIN profiles pr ON pr.member_id = c.author_id
@@ -754,18 +795,7 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
          WHERE r.post_id = ?1 ORDER BY r.seq",
     )?;
     for p in &mut posts {
-        p.photos = photos
-            .query_map(params![p.id], |r| {
-                let thumb: Option<String> = r.get(0)?;
-                let full: Option<String> = r.get(1)?;
-                Ok(PhotoView {
-                    thumb: thumb.as_deref().map(media_url),
-                    full: full.as_deref().map(media_url),
-                    width: r.get(2)?,
-                    height: r.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        p.photos = photos.query_map(params![p.id], photo_view)?.collect::<rusqlite::Result<_>>()?;
         p.comments = comments
             .query_map(params![p.id, UNKNOWN], |r| {
                 let author_id: String = r.get(1)?;
@@ -776,9 +806,13 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
                     author_avatar: r.get::<_, Option<String>>(5)?.as_deref().map(media_url),
                     text: r.get(3)?,
                     created_at: r.get(4)?,
+                    photos: vec![],
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
+        for c in &mut p.comments {
+            c.photos = comment_photos.query_map(params![c.id], photo_view)?.collect::<rusqlite::Result<_>>()?;
+        }
         let mut grouped: Vec<ReactionView> = Vec::new();
         let rs: Vec<(String, String, String)> =
             reactions.query_map(params![p.id, UNKNOWN], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
@@ -970,6 +1004,29 @@ mod tests {
         let (p, _) = f.event("post", serde_json::json!({ "text": "", "photos": [photo] }));
         assert_eq!(f.apply(&p).unwrap().unwrap().text, "shared a photo");
         assert_eq!(snippet(&"x".repeat(200), 0).chars().count(), 141);
+    }
+
+    #[test]
+    fn comments_carry_photos_kept_apart_from_the_posts() {
+        let mut f = fixture();
+        let d = B64.encode([7u8; 32]);
+        let photo = |n: u32| serde_json::json!({ "full": format!("cf{n}"), "full_digest": d, "thumb": format!("ct{n}"), "thumb_digest": d, "width": 4, "height": 3 });
+        let (post, _) = f.event("post", serde_json::json!({ "text": "pics", "photos": [photo(0)] }));
+        f.apply(&post).unwrap();
+        let post_id = crypto::event_id(&B64.decode(&post.ciphertext).unwrap());
+
+        // A photo-only comment is fine, and more than MAX_COMMENT_PHOTOS are cut.
+        let six: Vec<_> = (1..=6).map(photo).collect();
+        let (c, _) = f.event("comment", serde_json::json!({ "post": post_id, "text": "", "photos": six }));
+        assert_eq!(f.apply(&c).unwrap().unwrap().text, format!("shared {MAX_COMMENT_PHOTOS} photos"));
+        // Empty with no photos is still refused.
+        let (empty, _) = f.event("comment", serde_json::json!({ "post": post_id, "text": " " }));
+        assert!(f.apply(&empty).is_err());
+
+        let posts = feed(&f.conn, "m_me", false, None, 10).unwrap();
+        assert_eq!(posts[0].photos.len(), 1);
+        assert_eq!(posts[0].comments.len(), 1);
+        assert_eq!(posts[0].comments[0].photos.len(), MAX_COMMENT_PHOTOS);
     }
 
     #[test]

@@ -4,9 +4,12 @@
 //!
 //! EXIF (GPS included) and every other metadata block are dropped because the
 //! output is encoded from raw pixels: nothing from the original file is copied.
+//!
+//! Animated GIF, WebP and PNG keep only their first frame (the feed shows still
+//! WebP); `Processed::still` says so, and the app tells the person.
 
 use anyhow::{bail, Context, Result};
-use image::{imageops::FilterType, DynamicImage, ImageDecoder, ImageReader};
+use image::{imageops::FilterType, AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use std::io::Cursor;
 
 pub const MAX_SIDE: u32 = 2048;
@@ -22,6 +25,8 @@ pub struct Processed {
     pub thumb: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// The input was animated and only its first frame was kept.
+    pub still: bool,
 }
 
 pub fn process(bytes: &[u8]) -> Result<Processed> {
@@ -30,8 +35,9 @@ pub fn process(bytes: &[u8]) -> Result<Processed> {
     }
     let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     if reader.format().is_none() {
-        bail!("that isn't a photo this app can read (JPEG, PNG, GIF or WebP)");
+        bail!("that isn't a photo this app can read (JPEG, PNG, GIF, WebP or BMP)");
     }
+    let still = is_animated(bytes, reader.format());
     let mut decoder = reader.into_decoder().context("reading the photo")?;
     let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(decoder).context("decoding the photo")?;
@@ -44,7 +50,20 @@ pub fn process(bytes: &[u8]) -> Result<Processed> {
         height: full.height(),
         full: encode_webp(&full, QUALITY),
         thumb: encode_webp(&thumb, THUMB_QUALITY),
+        still,
     })
+}
+
+/// More than one frame: an animated GIF, WebP or PNG (APNG).
+fn is_animated(bytes: &[u8], format: Option<ImageFormat>) -> bool {
+    use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
+    let c = || Cursor::new(bytes);
+    match format {
+        Some(ImageFormat::Gif) => GifDecoder::new(c()).is_ok_and(|d| d.into_frames().take(2).filter(|f| f.is_ok()).count() > 1),
+        Some(ImageFormat::WebP) => WebPDecoder::new(c()).is_ok_and(|d| d.has_animation()),
+        Some(ImageFormat::Png) => PngDecoder::new(c()).is_ok_and(|d| d.is_apng().unwrap_or(false)),
+        _ => false,
+    }
 }
 
 fn fit(img: &DynamicImage, side: u32) -> DynamicImage {
@@ -146,6 +165,42 @@ mod tests {
         let p = process(&jpeg_with_exif(640, 480, 1)).unwrap();
         assert_eq!((p.width, p.height), (640, 480));
         assert_eq!(dims(&p.thumb), (400, 300));
+    }
+
+    fn gif(frames: usize) -> Vec<u8> {
+        use image::codecs::gif::GifEncoder;
+        use image::{Delay, Frame, RgbaImage};
+        let mut out = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut out);
+            for i in 0..frames {
+                let img = RgbaImage::from_pixel(60, 40, image::Rgba([(i * 80) as u8, 0, 0, 255]));
+                enc.encode_frame(Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(100, 1))).unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn animated_gif_becomes_a_still_and_says_so() {
+        let p = process(&gif(3)).unwrap();
+        assert!(p.still);
+        assert_eq!((p.width, p.height), (60, 40));
+        assert_eq!(&p.full[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn single_frame_gif_and_jpeg_are_not_flagged() {
+        assert!(!process(&gif(1)).unwrap().still);
+        assert!(!process(&jpeg_with_exif(64, 64, 1)).unwrap().still);
+    }
+
+    #[test]
+    fn bmp_is_accepted() {
+        let img = image::RgbImage::from_pixel(30, 20, image::Rgb([1, 2, 3]));
+        let mut bmp = Vec::new();
+        img.write_to(&mut Cursor::new(&mut bmp), ImageFormat::Bmp).unwrap();
+        assert_eq!(process(&bmp).unwrap().width, 30);
     }
 
     #[test]

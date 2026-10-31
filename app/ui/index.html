@@ -166,7 +166,7 @@
       <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
       <div class="staged" id="cp-photos"></div>
       <div class="composer-bar">
-        <label class="button ghost">Add photos<input id="cp-file" type="file" accept="image/*" multiple hidden></label>
+        <label class="button ghost" title="Or paste or drop pictures here">Add photos<input id="cp-file" type="file" accept="image/*" multiple hidden></label>
         <span class="muted small" id="cp-hint"></span>
         <button class="primary" id="cp-post">Post</button>
       </div>
@@ -209,6 +209,7 @@
           <textarea id="dm-text" rows="2" maxlength="20000" placeholder="Write a message… (Ctrl+Enter sends)"></textarea>
           <button class="primary" id="dm-send">Send</button>
         </div>
+        <p class="muted small" id="dm-hint" hidden></p>
         <p class="error" id="dm-err" hidden></p>
       </form>
     </div>
@@ -319,10 +320,14 @@
     <div class="photos"></div>
     <div class="reactions"></div>
     <div class="comments"></div>
+    <div class="staged comment-photos"></div>
+    <p class="muted small comment-hint" hidden></p>
     <form class="comment-form" novalidate>
+      <label class="button ghost small" title="Add photos (or paste or drop them here)">Photo<input class="comment-file" type="file" accept="image/*" multiple hidden></label>
       <input class="comment-input" placeholder="Write a comment…" maxlength="20000" autocomplete="off">
-      <button class="ghost small">Reply</button>
+      <button class="ghost small" type="submit">Reply</button>
     </form>
+    <p class="error comment-err" hidden></p>
   </article>
 </template>
 

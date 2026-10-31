@@ -2,7 +2,7 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: 0.1.0, the first release** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 desktop app
+**Status: 0.1.1** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 desktop app
 (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
 comments and reactions. It keeps a local SQLite archive and syncs the moment the
@@ -538,7 +538,20 @@ see [Releases](#releases).
   pixels. Both files are encrypted with the group key
   (AD `protocol::media_ad(group)`) and uploaded to `POST /media`. The post
   records each blob's `blob_digest`, so the server can't swap photos; it's
-  checked before decrypting.
+  checked before decrypting. Animated GIF, WebP and PNG keep only their first
+  frame, and the app says so (a *Still* tag on the preview).
+- **Adding photos.** In the post composer, a post's comment box and a chat,
+  photos come from the picker button, from **paste** (Ctrl+V or right-click
+  *Paste*: a copied picture or screenshot, or picture files copied in
+  Explorer), or from **drag and drop** (files from Explorer, or a picture
+  dragged out of a browser). Each goes through the pipeline above and shows as
+  a preview with a remove (×) button until it's sent: up to 10 per post or
+  message and 4 per comment. When the clipboard also holds text (Word and Excel
+  put a picture of the text next to it), the text is pasted instead. A picture
+  dragged from a web page that arrives as only its address is downloaded by the
+  app (`stage_photo_url`: http or https, at most 64 MB); a `data:` address is
+  read directly. Tauri's own file-drop handling is off (`dragDropEnabled`), so
+  the page gets every drop and nothing dropped can navigate the window away.
 - **HTTPS.** Trust is per server, for both HTTPS calls and the `wss://` push
   socket. A server on a domain is checked against the public web roots
   (`webpki-roots`), as a browser would, so Let's Encrypt just works. A **test
@@ -690,13 +703,13 @@ it without breaking the signature.
 | kind | payload |
 | --- | --- |
 | post | `{"text", "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}]}`, with media ids, and digests as base64 `blob_digest` of each encrypted blob |
-| comment | `{"post": event_id, "text"}` |
+| comment | `{"post": event_id, "text", "photos"?: [...]}`. Photo references as in posts (0.1.1, at most 4); with photos the text may be empty |
 | reaction | `{"post": event_id, "emoji"}`. The latest one per member wins; `""` removes it |
 | edit | `{"post": event_id, "text"}`. Only the post's author |
 | delete | `{"post": event_id}`. Only the post's author |
 | profile | `{"display_name"?, "avatar": {"id", "digest"} \| null}`: the author's whole profile; the latest one wins. No `display_name` means the certified name. The avatar is a 256x256 WebP encrypted like a photo, `digest` its `blob_digest` |
 
-A post's photo media ids (and a profile's avatar id) also go in the event's
+A post's or comment's photo media ids (and a profile's avatar id) also go in the event's
 clear `media_ids` field, so the server can prune them with the event.
 
 ## Direct messages (Phase 5b)

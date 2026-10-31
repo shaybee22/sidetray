@@ -11,7 +11,6 @@ const REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🎉"];
 
 let view = null;          // last get_state()
 let pollTimer = null;     // waiting-for-approval poll
-let photosStaged = [];    // [{id, preview}] in the composer
 let loadedCount = 50;     // how many posts the feed shows
 let pendingTimer = null;
 
@@ -478,6 +477,8 @@ async function loadFeed() {
   }
   const feed = $("#feed");
   feed.replaceChildren(...posts.map(renderPost));
+  const shown = new Set(posts.map((p) => p.id));
+  for (const [id, tray] of commentTrays) if (!shown.has(id)) { tray.clear(); commentTrays.delete(id); }
   $("#feed-empty").hidden = posts.length > 0;
   $("#load-more").hidden = posts.length < loadedCount;
   for (const input of $$("#feed .comment-input")) {
@@ -552,24 +553,42 @@ function renderPost(p) {
     const text = document.createElement("div");
     text.className = "comment-body";
     text.append(b, body, t);
+    if (c.photos.length) {
+      const photos = document.createElement("div");
+      photos.className = "photos small-grid";
+      for (const ph of c.photos) photos.append(renderPhoto(ph, false));
+      text.append(photos);
+    }
     row.append(face, text);
     comments.append(row);
   }
 
   const form = $(".comment-form", el);
   const input = $(".comment-input", el);
+  const err = $(".comment-err", el);
   input.dataset.post = p.id;
+  const tray = commentTray(p.id);
+  tray.attach($(".comment-photos", el), $(".comment-hint", el), err);
+  $(".comment-file", el).addEventListener("change", (ev) => {
+    const files = [...ev.target.files];
+    ev.target.value = "";
+    tray.addFiles(files);
+  });
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
+    hideError(err);
+    if (tray.preparing) return showError(err, "Wait for the photos to finish preparing.");
     const text = input.value.trim();
-    if (!text) return;
-    await busy($("button", form), async () => {
+    const photos = tray.ids;
+    if (!text && !photos.length) return;
+    await busy($("button[type=submit]", form), async () => {
       try {
-        await invoke("add_comment", { postId: p.id, text });
+        await invoke("add_comment", { postId: p.id, text, photos });
         input.value = "";
+        tray.sent();
         await loadFeed();
       } catch (e) {
-        showError($("#cp-err"), e);
+        showError(err, e);
       }
     });
   });
@@ -665,76 +684,251 @@ function closeLightbox() {
 $("#lightbox").addEventListener("click", closeLightbox);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLightbox(); });
 
-// --- composer -----------------------------------------------------------------------
+// --- attaching photos: picker, paste, drag and drop ------------------------------------
 
-function renderStaged() {
-  const box = $("#cp-photos");
-  box.replaceChildren(...photosStaged.map((s) => {
-    const item = document.createElement("div");
-    item.className = "staged-item" + (s.preview ? "" : " busy");
-    if (s.preview) {
-      const img = document.createElement("img");
-      img.src = s.preview;
-      img.alt = "";
-      const x = document.createElement("button");
-      x.type = "button";
-      x.textContent = "×";
-      x.setAttribute("aria-label", "Remove photo");
-      x.addEventListener("click", () => {
-        invoke("unstage_photo", { id: s.id });
-        photosStaged = photosStaged.filter((o) => o !== s);
-        renderStaged();
-      });
-      item.append(img, x);
-    } else {
-      const sp = document.createElement("span");
-      sp.className = "spinner";
-      item.append(sp);
+/**
+ * Photos waiting to go out with a post, a comment or a message, shown as
+ * thumbnails with a remove (×) button. Every way in (the picker, paste, drag
+ * and drop) goes through stage_photo: resized, EXIF and GPS stripped,
+ * re-encoded, thumbnailed; encrypted when it's sent.
+ */
+class Attachments {
+  constructor({ max, noun, summary = false }) {
+    this.items = [];   // [{id, preview, still}]; no preview yet while preparing
+    this.max = max;
+    this.noun = noun;
+    this.summary = summary;
+    this.box = this.hint = this.err = null;
+  }
+
+  /** Show in these elements (a comment's are new after every feed render). */
+  attach(box, hint, err) {
+    this.box = box;
+    this.hint = hint;
+    this.err = err;
+    this.render();
+  }
+
+  get ids() { return this.items.map((s) => s.id); }
+  get preparing() { return this.items.some((s) => !s.preview); }
+
+  /** Drop everything, telling the app to forget the prepared photos. */
+  clear() {
+    for (const s of this.items) if (s.id) invoke("unstage_photo", { id: s.id });
+    this.items = [];
+    this.render();
+  }
+
+  /** After sending: the app has already let go of them. */
+  sent() {
+    this.items = [];
+    this.render();
+  }
+
+  addFiles(files) {
+    return this.add(files.map((f) => ({
+      label: f.name,
+      load: async () => invoke("stage_photo", new Uint8Array(await f.arrayBuffer())),
+    })));
+  }
+
+  addUrl(url) {
+    return this.add([{ label: "", load: () => invoke("stage_photo_url", { url }) }]);
+  }
+
+  async add(sources) {
+    if (this.err) hideError(this.err);
+    for (const src of sources) {
+      if (this.items.length >= this.max) {
+        this.fail(`At most ${this.max} photos per ${this.noun}.`);
+        break;
+      }
+      const slot = { id: null, preview: null, still: false };
+      this.items.push(slot);
+      this.render();
+      try {
+        const r = await src.load();
+        if (!this.items.includes(slot)) { invoke("unstage_photo", { id: r.id }); continue; } // removed meanwhile
+        Object.assign(slot, { id: r.id, preview: r.preview, still: r.still });
+      } catch (e) {
+        this.items = this.items.filter((o) => o !== slot);
+        this.fail(src.label ? `${src.label}: ${e}` : String(e));
+      }
+      this.render();
     }
-    return item;
-  }));
-  const ready = photosStaged.filter((s) => s.preview).length;
-  $("#cp-hint").textContent = ready ? `${ready} photo${ready > 1 ? "s" : ""}, resized and stripped of location data` : "";
+  }
+
+  fail(msg) { if (this.err) showError(this.err, msg); }
+
+  render() {
+    if (!this.box) return;
+    this.box.replaceChildren(...this.items.map((s) => {
+      const item = document.createElement("div");
+      item.className = "staged-item" + (s.preview ? "" : " busy");
+      if (s.preview) {
+        const img = document.createElement("img");
+        img.src = s.preview;
+        img.alt = "";
+        img.draggable = false;
+        const x = document.createElement("button");
+        x.type = "button";
+        x.textContent = "×";
+        x.setAttribute("aria-label", "Remove photo");
+        x.addEventListener("click", () => {
+          invoke("unstage_photo", { id: s.id });
+          this.items = this.items.filter((o) => o !== s);
+          this.render();
+        });
+        item.append(img, x);
+        if (s.still) {
+          const tag = document.createElement("span");
+          tag.className = "still-tag";
+          tag.textContent = "Still";
+          tag.title = "Animation can't be kept: this goes out as a still image";
+          item.append(tag);
+        }
+      } else {
+        const sp = document.createElement("span");
+        sp.className = "spinner";
+        item.append(sp);
+      }
+      return item;
+    }));
+    if (!this.hint) return;
+    const ready = this.items.filter((s) => s.preview);
+    const parts = [];
+    if (this.summary && ready.length) parts.push(`${ready.length} photo${ready.length > 1 ? "s" : ""}, resized and stripped of location data`);
+    if (ready.some((s) => s.still)) parts.push("Animated pictures can't stay animated here, so they go out as still images.");
+    this.hint.textContent = parts.join(". ");
+    this.hint.hidden = !parts.length;
+  }
 }
 
-$("#cp-file").addEventListener("change", async (ev) => {
+const commentTrays = new Map(); // post id -> Attachments, kept across feed re-renders
+function commentTray(postId) {
+  let t = commentTrays.get(postId);
+  if (!t) commentTrays.set(postId, (t = new Attachments({ max: 4, noun: "comment" })));
+  return t;
+}
+
+/** Where a paste or drop on `el` goes: the composer, a post's comments, or the open chat. */
+function attachTarget(el) {
+  if (!(el instanceof Element) || $("#screen-main").hidden || $("#screen-main").classList.contains("readonly")) return null;
+  if (el.closest("#composer")) return { tray: postTray, zone: $("#composer"), input: $("#cp-text") };
+  const post = el.closest("#feed .post");
+  if (post) return { tray: commentTray(post.dataset.id), zone: post, input: $(".comment-input", post) };
+  if (el.closest("#dm-chat-view") && !$("#dm-composer").hidden) return { tray: dmTray, zone: $("#dm-chat-view"), input: $("#dm-text") };
+  return null;
+}
+
+/** A picture's bytes from a `data:` address (some pages drag those). */
+function fileFromDataUrl(url) {
+  const m = /^data:([^;,]*)((?:;[^;,]*)*),(.*)$/s.exec(url);
+  if (!m) return null;
+  const base64 = /;base64/i.test(m[2]);
+  const raw = base64 ? atob(m[3].replace(/\s+/g, "")) : decodeURIComponent(m[3]);
+  return new File([Uint8Array.from(raw, (c) => c.charCodeAt(0))], "dropped picture", { type: m[1] || "" });
+}
+
+/** Paste: a copied picture or picture file gets attached; text pastes as usual. */
+document.addEventListener("paste", (e) => {
+  const at = attachTarget(e.target);
+  const dt = e.clipboardData;
+  if (!at || !dt) return;
+  const files = [...dt.files];
+  // Copying from Word, Excel and the like also puts a picture of the text on
+  // the clipboard: when there's text, the text is what was meant.
+  if (!files.length || dt.getData("text/plain").trim()) return;
+  e.preventDefault();
+  at.tray.addFiles(files);
+});
+
+// Drag and drop. Tauri's own file-drop handling is off (dragDropEnabled), so
+// the page gets the drop and nothing dropped can navigate the window away.
+let dragFromApp = false;
+let dropZone = null;
+document.addEventListener("dragstart", () => { dragFromApp = true; });
+document.addEventListener("dragend", () => { dragFromApp = false; });
+
+function carriesPicture(dt) {
+  return !!dt && [...dt.types].some((t) => t === "Files" || t === "text/uri-list" || t === "text/html");
+}
+
+function setDropZone(z) {
+  if (dropZone === z) return;
+  if (dropZone) dropZone.classList.remove("drop-target");
+  dropZone = z;
+  if (z) z.classList.add("drop-target");
+}
+
+document.addEventListener("dragover", (e) => {
+  if (dragFromApp || !carriesPicture(e.dataTransfer)) return;
+  e.preventDefault();
+  const at = attachTarget(e.target);
+  e.dataTransfer.dropEffect = at ? "copy" : "none";
+  setDropZone(at && at.zone);
+});
+document.addEventListener("dragleave", (e) => { if (!e.relatedTarget) setDropZone(null); });
+
+document.addEventListener("drop", (e) => {
+  setDropZone(null);
+  const dt = e.dataTransfer;
+  if (dragFromApp || !carriesPicture(dt)) return;
+  e.preventDefault();
+  const at = attachTarget(e.target);
+  if (!at) return;
+  const files = [...dt.files];
+  if (files.length) return void at.tray.addFiles(files);
+  // A picture dragged out of a web page may come with only its address: the
+  // <img> in the HTML (not a link around it), or the bare address without HTML.
+  let url = null;
+  const html = dt.getData("text/html");
+  if (html) {
+    const img = new DOMParser().parseFromString(html, "text/html").querySelector("img[src]");
+    url = img && img.getAttribute("src");
+  } else {
+    url = (dt.getData("text/uri-list") || "").split(/\r?\n/).find((l) => l && !l.startsWith("#")) || null;
+  }
+  if (url && /^data:/i.test(url)) {
+    const f = fileFromDataUrl(url);
+    if (f) return void at.tray.addFiles([f]);
+  } else if (url && /^https?:\/\//i.test(url.trim())) {
+    return void at.tray.addUrl(url.trim());
+  }
+  // Not a picture after all (a selected bit of a web page, a link): drop it in as text.
+  const text = dt.getData("text/plain");
+  if (text && at.input) {
+    at.input.focus();
+    at.input.setRangeText(text, at.input.selectionStart, at.input.selectionEnd, "end");
+    at.input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+});
+
+// --- composer -----------------------------------------------------------------------
+
+const postTray = new Attachments({ max: 10, noun: "post", summary: true });
+postTray.attach($("#cp-photos"), $("#cp-hint"), $("#cp-err"));
+
+$("#cp-file").addEventListener("change", (ev) => {
   const files = [...ev.target.files];
   ev.target.value = "";
-  const err = $("#cp-err");
-  hideError(err);
-  for (const file of files) {
-    if (photosStaged.length >= 10) { showError(err, "At most 10 photos per post."); break; }
-    const slot = { id: null, preview: null };
-    photosStaged.push(slot);
-    renderStaged();
-    try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const r = await invoke("stage_photo", bytes);
-      slot.id = r.id;
-      slot.preview = r.preview;
-    } catch (e) {
-      photosStaged = photosStaged.filter((o) => o !== slot);
-      showError(err, `${file.name}: ${e}`);
-    }
-    renderStaged();
-  }
+  postTray.addFiles(files);
 });
 
 $("#composer").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const err = $("#cp-err");
   hideError(err);
-  if (photosStaged.some((s) => !s.preview)) return showError(err, "Wait for the photos to finish preparing.");
+  if (postTray.preparing) return showError(err, "Wait for the photos to finish preparing.");
   const text = $("#cp-text").value;
-  const photos = photosStaged.map((s) => s.id);
+  const photos = postTray.ids;
   if (!text.trim() && !photos.length) return;
   await busy($("#cp-post"), async () => {
     $("#cp-post").textContent = photos.length ? "Uploading…" : "Posting…";
     try {
       await invoke("create_post", { text, photos });
       $("#cp-text").value = "";
-      photosStaged = [];
-      renderStaged();
+      postTray.sent();
       await loadFeed();
     } catch (e) {
       showError(err, e);
@@ -1428,7 +1622,6 @@ $("#crop-save").addEventListener("click", async () => {
 // --- direct messages (Phase 5b) ----------------------------------------------------------------
 
 let chatWith = null;   // member id of the open conversation, null for the list
-let dmStaged = [];     // [{id, preview}] in the chat composer
 let draftFor = null;   // whose conversation the composer's draft and photos belong to
 
 function renderDmBadge() {
@@ -1518,9 +1711,7 @@ function renderConversation(c) {
 async function openChat(memberId) {
   if (draftFor !== memberId) {
     draftFor = memberId;
-    for (const s of dmStaged) if (s.id) invoke("unstage_photo", { id: s.id });
-    dmStaged = [];
-    renderDmStaged();
+    dmTray.clear();
     $("#dm-text").value = "";
     hideError($("#dm-err"));
   }
@@ -1631,63 +1822,23 @@ $("#dm-new").addEventListener("click", async () => {
 });
 $("#dm-picker-cancel").addEventListener("click", () => { $("#dm-picker").hidden = true; });
 
-function renderDmStaged() {
-  $("#dm-photos").replaceChildren(...dmStaged.map((s) => {
-    const item = document.createElement("div");
-    item.className = "staged-item" + (s.preview ? "" : " busy");
-    if (s.preview) {
-      const img = document.createElement("img");
-      img.src = s.preview;
-      img.alt = "";
-      const x = document.createElement("button");
-      x.type = "button";
-      x.textContent = "×";
-      x.setAttribute("aria-label", "Remove photo");
-      x.addEventListener("click", () => {
-        invoke("unstage_photo", { id: s.id });
-        dmStaged = dmStaged.filter((o) => o !== s);
-        renderDmStaged();
-      });
-      item.append(img, x);
-    } else {
-      const sp = document.createElement("span");
-      sp.className = "spinner";
-      item.append(sp);
-    }
-    return item;
-  }));
-}
+// The same pipeline as posts: resized, re-encoded as WebP, EXIF (GPS included) dropped.
+const dmTray = new Attachments({ max: 10, noun: "message" });
+dmTray.attach($("#dm-photos"), $("#dm-hint"), $("#dm-err"));
 
-$("#dm-file").addEventListener("change", async (ev) => {
+$("#dm-file").addEventListener("change", (ev) => {
   const files = [...ev.target.files];
   ev.target.value = "";
-  const err = $("#dm-err");
-  hideError(err);
-  for (const file of files) {
-    if (dmStaged.length >= 10) { showError(err, "At most 10 photos per message."); break; }
-    const slot = { id: null, preview: null };
-    dmStaged.push(slot);
-    renderDmStaged();
-    try {
-      // The same pipeline as posts: resized, re-encoded as WebP, EXIF (GPS included) dropped.
-      const r = await invoke("stage_photo", new Uint8Array(await file.arrayBuffer()));
-      slot.id = r.id;
-      slot.preview = r.preview;
-    } catch (e) {
-      dmStaged = dmStaged.filter((o) => o !== slot);
-      showError(err, `${file.name}: ${e}`);
-    }
-    renderDmStaged();
-  }
+  dmTray.addFiles(files);
 });
 
 $("#dm-composer").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const err = $("#dm-err");
   hideError(err);
-  if (dmStaged.some((s) => !s.preview)) return showError(err, "Wait for the photos to finish preparing.");
+  if (dmTray.preparing) return showError(err, "Wait for the photos to finish preparing.");
   const text = $("#dm-text").value;
-  const photos = dmStaged.map((s) => s.id);
+  const photos = dmTray.ids;
   if (!text.trim() && !photos.length) return;
   const member = chatWith;
   await busy($("#dm-send"), async () => {
@@ -1696,8 +1847,7 @@ $("#dm-composer").addEventListener("submit", async (ev) => {
       await invoke("send_dm", { memberId: member, text, photos });
       if (chatWith === member) {
         $("#dm-text").value = "";
-        dmStaged = [];
-        renderDmStaged();
+        dmTray.sent();
         await loadChat(true);
       }
     } catch (e) {

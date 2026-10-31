@@ -165,6 +165,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     add_column(&conn, "sync_state", "missed_days", "REAL")?;
     // Phase 5b: how far direct messages have synced.
     add_column(&conn, "sync_state", "dm_last_seq", "INTEGER NOT NULL DEFAULT 0")?;
+    // 0.1.1: photos on comments. `post_id` stays the post (so the photos go
+    // with it); `comment_id` is the comment, NULL for the post's own photos.
+    add_column(&conn, "media", "comment_id", "TEXT")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS media_comment ON media(comment_id, idx)")?;
     Ok(conn)
 }
 

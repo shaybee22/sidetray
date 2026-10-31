@@ -486,16 +486,12 @@ struct StagedView {
     width: u32,
     height: u32,
     bytes: usize,
+    /// It was animated and only the first frame will be sent.
+    still: bool,
 }
 
-/// Takes the raw file bytes as the request body (no JSON), so large photos
-/// cross the IPC bridge without being turned into number arrays.
-#[tauri::command]
-async fn stage_photo(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) -> Res<StagedView> {
-    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
-        return Err("expected the photo's bytes".into());
-    };
-    let bytes = bytes.clone();
+/// Run the photo pipeline on `bytes` and keep the result until it's posted.
+async fn stage(app: &App, bytes: Vec<u8>) -> Res<StagedView> {
     let p = tauri::async_runtime::spawn_blocking(move || photo::process(&bytes))
         .await
         .map_err(|e| e.to_string())?
@@ -509,9 +505,52 @@ async fn stage_photo(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>)
         width: p.width,
         height: p.height,
         bytes: p.full.len(),
+        still: p.still,
     };
     app.staged.lock().unwrap_or_else(|e| e.into_inner()).insert(id, p);
     Ok(view)
+}
+
+/// Takes the raw file bytes as the request body (no JSON), so large photos
+/// cross the IPC bridge without being turned into number arrays.
+#[tauri::command]
+async fn stage_photo(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) -> Res<StagedView> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected the photo's bytes".into());
+    };
+    stage(&app, bytes.clone()).await
+}
+
+/// An image dragged in from a web page that came with only its address:
+/// download it (http or https, at most `photo::MAX_INPUT_BYTES`) and stage it.
+#[tauri::command]
+async fn stage_photo_url(app: State<'_, Arc<App>>, url: String) -> Res<StagedView> {
+    let bytes = download_image(&url).await.map_err(err)?;
+    stage(&app, bytes).await
+}
+
+async fn download_image(url: &str) -> anyhow::Result<Vec<u8>> {
+    use anyhow::{bail, Context};
+    let u = reqwest::Url::parse(url.trim()).context("that isn't a web address")?;
+    if !matches!(u.scheme(), "http" | "https") {
+        bail!("can't fetch a picture from that kind of address");
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!("SideTray/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let mut resp = client.get(u).send().await.context("couldn't download that picture")?;
+    if !resp.status().is_success() {
+        bail!("couldn't download that picture (the site said {})", resp.status());
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("couldn't download that picture")? {
+        out.extend_from_slice(&chunk);
+        if out.len() > photo::MAX_INPUT_BYTES {
+            bail!("that picture is over {} MB", photo::MAX_INPUT_BYTES / 1024 / 1024);
+        }
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -525,8 +564,8 @@ async fn create_post(app: State<'_, Arc<App>>, text: String, photos: Vec<String>
 }
 
 #[tauri::command]
-async fn add_comment(app: State<'_, Arc<App>>, post_id: String, text: String) -> Res<()> {
-    feed::add_comment(&app, &post_id, &text).await.map_err(err)
+async fn add_comment(app: State<'_, Arc<App>>, post_id: String, text: String, photos: Option<Vec<String>>) -> Res<()> {
+    feed::add_comment(&app, &post_id, &text, &photos.unwrap_or_default()).await.map_err(err)
 }
 
 #[tauri::command]
@@ -787,6 +826,7 @@ fn main() {
             sync_now,
             get_feed,
             stage_photo,
+            stage_photo_url,
             unstage_photo,
             create_post,
             add_comment,
