@@ -581,13 +581,15 @@ see [Releases](#releases).
   sit in SQLite, encrypted under that wrapping key. Linux has no keychain
   backend yet, so there those secrets live in the database.
 
-## Android app (A1)
+## Android app (A1, A2)
 
-The same app builds for Android (SPEC.md "Android app", phase A1): join with
-the safety-code check (or from a `sidetray://` invite link), the feed, posts
-with photos, comments, reactions, direct messages and the Key Master tab. It
-syncs, with the push socket, only while it's open; background notifications
-are A3. There's no release APK yet (A4): build a debug one as below.
+The same app builds for Android (SPEC.md "Android app", phases A1 and A2):
+join with the safety-code check (or from a `sidetray://` invite link), the
+feed, posts with photos, comments, reactions, direct messages and the Key
+Master tab; *Share → Side Tray* from other apps, the camera, multi-select from
+the photo picker, HEIC photos, and a phone layout with bottom tabs. It syncs,
+with the push socket, only while it's open; background notifications are A3.
+There's no release APK yet (A4): build a debug one as below.
 
 **Build setup on Windows** (all per user, no admin except Developer Mode):
 
@@ -629,11 +631,35 @@ hand-made small desktop icons).
   `tray_mobile.rs` and `update_mobile.rs` stand in). Coming back to the
   foreground syncs at once.
 - **Photos** go to Rust as base64 in JSON (Android's IPC can't carry a raw
-  body). The *Add photos* button opens Android's photo picker.
-- **Layout.** The page runs edge to edge, so the CSS pads for the status and
-  gesture bars (`env(safe-area-inset-*)`), and on a phone (`html.mobile`) the
-  chat is sized from the visual viewport so the composer stays above the
-  keyboard.
+  body). *Photos* opens Android's photo picker (several at once); *Camera*
+  (composer, comments, chat) opens the camera app, and the full-size shot it
+  leaves in the app's folder is deleted once the photo is staged. HEIC/HEIF
+  (and AVIF) photos are decoded by Android itself (Android 9 and newer), then
+  go through the same resize, EXIF strip and WebP encode; a computer refuses
+  them with a message saying so.
+- **Share → Side Tray.** Intent filters for one or several images and for
+  text and links. `MainActivity.kt` hands the intent to `SideTrayAndroid.kt`,
+  which copies the pictures into the app's cache; the page asks for them
+  (`take_share`, `src/android.rs`), stages them, and lets the person post them
+  or send them as a message. Not in a group yet (or still waiting for
+  approval): it says so.
+- **Back button.** `MainActivity.kt` passes Back to the page: it closes the
+  photo viewer, a dialog or a chat, then goes back to the feed, and only then
+  puts the app in the background, asking first if a post, comment or message
+  is half-written.
+- **Layout.** The page runs edge to edge. The CSS pads for the status and
+  gesture bars with `--sat`, `--sab` and so on: the larger of
+  `env(safe-area-inset-*)` and the insets Android reports (older WebViews
+  leave out the gesture bar). Tabs are at the bottom; the chat is sized from
+  the visual viewport so the composer stays above the keyboard. Photos in the
+  viewer pinch-zoom.
+- **Flip phones.** Moving between a razr's inner and outer screens changes
+  the density, which recreates the activity and reloads the page (the WebView
+  can't change scale in place). Drafts (text, and the IDs of photos still
+  staged in the app) and the open tab and chat are kept in `localStorage` and
+  put back. Motorola asks once whether Side Tray may run on the outer screen.
+- **No backups.** `allowBackup` is off: the local archive holds decrypted
+  posts and photos, and a restored copy couldn't unlock its keys anyway.
 - `sidetray://join?...` links open the app through an intent filter
   (`plugins.deep-link.mobile` in `tauri.conf.json`).
 
@@ -642,6 +668,8 @@ localhost, and `adb reverse` makes the PC's localhost the phone's:
 `adb reverse tcp:8765 tcp:8765`, then use `http://127.0.0.1:8765` in the
 wizard. A debug build's WebView can be driven over DevTools:
 `adb forward tcp:9401 localabstract:webview_devtools_remote_$(adb shell pidof org.sidetray.app)`.
+To try sharing without another app:
+`adb shell am start -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT https://example.org`.
 
 ## Releases
 

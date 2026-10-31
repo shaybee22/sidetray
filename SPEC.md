@@ -268,7 +268,7 @@ Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, 
 
 ## Android app
 
-Side Tray 0.1.1 runs on Windows and Linux. This section plans a phone app for Android. A1 is built (see "As built" under A1); A2 to A4 are not.
+Side Tray 0.1.1 runs on Windows and Linux. This section plans a phone app for Android. A1 and A2 are built (see "As built" under each); A3 and A4 are not.
 
 **Decisions**
 
@@ -320,6 +320,16 @@ What this Windows machine needs to build for Android:
 - Photo picker with the camera and the system gallery (Android photo picker).
 - Mobile layout polish: bottom tabs, full-width composer, larger touch targets, back button behaviour, safe areas, the photo lightbox with pinch zoom.
 - **Done when** sharing a photo from another app lands in a Side Tray post on a desktop, and a photo taken with the camera posts the same way.
+- **As built:**
+  - Intent filters: `SEND` for `image/*` and `text/plain`, `SEND_MULTIPLE` for `image/*`. `MainActivity.kt` passes the intent to `SideTrayAndroid.kt`, which copies up to 20 pictures (64 MB each) into the app's cache on a worker thread; the page polls `take_share` (on start and on resume) and stages each picture through the usual pipeline by index (`stage_shared_photo`), which deletes it. The share dialog shows the staged thumbnails and the text (a browser's page title and address are joined), with *Post it to the feed* or a list of people to message; the choice puts everything into that composer to review and send. Not active (no group, waiting, removed): a notice says so and the share is dropped.
+  - Camera: `<input capture="environment">` buttons (composer, comment, chat). The manifest declares a `<queries>` entry for `IMAGE_CAPTURE` (since Android 11 the WebView can't see a camera app otherwise); no CAMERA permission is needed. The WebView's capture file (full size, with location) is deleted after staging and at a cold start.
+  - Gallery: the existing `multiple` inputs open the system photo picker with multi-select. A picked file that's briefly unreadable (`NotReadableError`, seen once on the emulator) is retried.
+  - HEIC/HEIF and AVIF: when the image crate can't decode a photo, Android's `ImageDecoder` does (over JNI, `src/android.rs`), scaled to 2048 px with the EXIF orientation applied; the RGBA pixels then go through the same WebP encode, so no metadata survives. A computer refuses HEIC with a message. The profile cropper converts through `photo_preview`, since the WebView can't show HEIC.
+  - Back: `MainActivity.kt` registers its own back callback that calls `window.__sidetrayBack()` in the page (Tauri's back-button listener belongs to the activity it was registered with and stops working once the activity is recreated). Order: photo viewer, dialog, emoji row, chat, another tab → feed; on the feed, if anything is unsent, "Leave without sending?"; then `moveTaskToBack` (the app keeps running).
+  - Layout: bottom tab bar with icons, icon-only photo and camera buttons in comments and chat, a full-width composer, a pinch/drag/double-tap photo viewer, and safe areas from `system_insets` (Android's own insets) where the WebView reports none. Tested on the razr's outer screen (480×410 CSS px usable, density 2.25) and inner screen (408×997, density 3).
+  - Flip phones: a density change recreates the activity and reloads the page; drafts (text, and IDs of photos still staged in the app process) and the open tab and chat are saved in `localStorage` and restored (`staged_photos`, `page_boot`). Keeping the activity across the change was tried: the WebView then kept drawing at the old scale.
+  - `allowBackup="false"`, with data-extraction rules that exclude everything: a restored backup put an old identity back on a reinstalled phone (without its Keystore key), and backups would copy decrypted posts.
+  - Tested on the emulator (Android 15, x86_64) and the razr ultra 2025 against a relay on the build PC: three pictures (JPEG, PNG, a rotated HEIC with GPS tags) shared from the Files app as a message, arriving on the desktop upright, scaled and without EXIF; a link shared to the feed; a cold-start share; sharing with no group joined; camera shots posted from the composer and a comment; multi-select from the photo picker (HEIC included on the phone); Back at every level; a draft carried from the inner to the outer screen and back.
 
 **A3. Push through UnifiedPush and ntfy**
 

@@ -134,11 +134,11 @@
       <span id="tb-group"></span>
     </div>
     <nav class="tabs" role="tablist">
-      <button class="tab" role="tab" data-tab="feed" aria-selected="true">Feed</button>
-      <button class="tab" role="tab" data-tab="messages">Messages <span class="badge" id="dm-badge" hidden></span></button>
-      <button class="tab" role="tab" data-tab="members">Members</button>
-      <button class="tab" role="tab" data-tab="km" id="tab-km-btn" hidden>Key Master <span class="badge" id="km-badge" hidden></span></button>
-      <button class="tab" role="tab" data-tab="device">This device</button>
+      <button class="tab" role="tab" data-tab="feed" aria-selected="true"><svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h16M4 12h16M4 17.5h10"/></svg><span class="tab-label">Feed</span></button>
+      <button class="tab" role="tab" data-tab="messages"><svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H10l-5 4v-4H4z"/></svg><span class="tab-label">Messages</span> <span class="badge" id="dm-badge" hidden></span></button>
+      <button class="tab" role="tab" data-tab="members"><svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.3"/><path d="M2.8 19.5c.8-3.4 3.2-5.2 6.2-5.2s5.4 1.8 6.2 5.2"/><circle cx="17" cy="9" r="2.4"/><path d="M16.6 14.4c2.4.3 4 2 4.6 5.1"/></svg><span class="tab-label">Members</span></button>
+      <button class="tab" role="tab" data-tab="km" id="tab-km-btn" hidden><svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="3.8"/><path d="M11.8 12H21M18 12v3M20.8 12v2.2"/></svg><span class="tab-label">Key Master</span> <span class="badge" id="km-badge" hidden></span></button>
+      <button class="tab" role="tab" data-tab="device"><svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2.5" width="10" height="19" rx="2.2"/><path d="M11 18.2h2"/></svg><span class="tab-label"><span class="desktop-only">This device</span><span class="mobile-only">Device</span></span></button>
     </nav>
     <div class="sync">
       <span class="muted small" id="sync-status"></span>
@@ -166,7 +166,8 @@
       <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
       <div class="staged" id="cp-photos"></div>
       <div class="composer-bar">
-        <label class="button ghost" title="Or paste or drop pictures here">Add photos<input id="cp-file" type="file" accept="image/*" multiple hidden></label>
+        <label class="button ghost" title="Or paste or drop pictures here"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16.5l-4.5-4.5-7.5 7"/></svg><span class="desktop-only">Add photos</span><span class="mobile-only">Photos</span><input id="cp-file" type="file" accept="image/*" multiple hidden></label>
+        <label class="button ghost mobile-only"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8.5h3.2l1.8-2.6h6l1.8 2.6H20V19H4z"/><circle cx="12" cy="13.3" r="3.4"/></svg>Camera<input id="cp-camera" type="file" accept="image/*" capture="environment" hidden></label>
         <span class="muted small" id="cp-hint"></span>
         <button class="primary" id="cp-post">Post</button>
       </div>
@@ -205,7 +206,8 @@
       <form id="dm-composer" class="chat-composer" novalidate>
         <div class="staged" id="dm-photos"></div>
         <div class="chat-input-row">
-          <label class="button ghost" title="Add photos">Photo<input id="dm-file" type="file" accept="image/*" multiple hidden></label>
+          <label class="button ghost icon-on-phone" title="Add photos" aria-label="Add photos"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16.5l-4.5-4.5-7.5 7"/></svg><span class="desktop-only">Photo</span><input id="dm-file" type="file" accept="image/*" multiple hidden></label>
+          <label class="button ghost icon-on-phone mobile-only" title="Take a photo" aria-label="Take a photo"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8.5h3.2l1.8-2.6h6l1.8 2.6H20V19H4z"/><circle cx="12" cy="13.3" r="3.4"/></svg><input id="dm-camera" type="file" accept="image/*" capture="environment" hidden></label>
           <textarea id="dm-text" rows="2" maxlength="20000" placeholder="Write a message…"></textarea>
           <button class="primary" id="dm-send">Send</button>
         </div>
@@ -302,7 +304,7 @@
   </section>
 </div>
 
-<div id="lightbox" hidden>
+<div id="lightbox" hidden aria-label="Photo. Pinch or double-tap to zoom.">
   <img id="lightbox-img" alt="">
   <button class="lightbox-close" id="lightbox-close" aria-label="Close">×</button>
 </div>
@@ -324,7 +326,8 @@
     <div class="staged comment-photos"></div>
     <p class="muted small comment-hint" hidden></p>
     <form class="comment-form" novalidate>
-      <label class="button ghost small" title="Add photos (or paste or drop them here)">Photo<input class="comment-file" type="file" accept="image/*" multiple hidden></label>
+      <label class="button ghost small icon-on-phone" title="Add photos (or paste or drop them here)" aria-label="Add photos"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16.5l-4.5-4.5-7.5 7"/></svg><span class="desktop-only">Photo</span><input class="comment-file" type="file" accept="image/*" multiple hidden></label>
+      <label class="button ghost small icon-on-phone mobile-only" title="Take a photo" aria-label="Take a photo"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8.5h3.2l1.8-2.6h6l1.8 2.6H20V19H4z"/><circle cx="12" cy="13.3" r="3.4"/></svg><input class="comment-camera" type="file" accept="image/*" capture="environment" hidden></label>
       <input class="comment-input" placeholder="Write a comment…" maxlength="20000" autocomplete="off">
       <button class="ghost small" type="submit">Reply</button>
     </form>
@@ -365,6 +368,24 @@
       <button value="cancel" class="ghost" id="crop-cancel">Cancel</button>
       <button type="button" class="primary" id="crop-save">Save photo</button>
     </div>
+  </form>
+</dialog>
+
+<!-- Share → Side Tray (Android): what came in, and where it should go -->
+<dialog id="share" class="sheet" aria-labelledby="sh-title">
+  <form method="dialog" class="stack">
+    <h2 id="sh-title">Share to Side Tray</h2>
+    <p class="hint" id="sh-what"></p>
+    <div class="staged" id="sh-photos"></div>
+    <div class="share-text" id="sh-text" hidden></div>
+    <p class="muted small" id="sh-hint" hidden></p>
+    <p class="error" id="sh-err" hidden></p>
+    <button type="button" class="primary" id="sh-feed">Post it to the feed</button>
+    <div id="sh-dm">
+      <p class="hint">Or send it as a message to:</p>
+      <div id="sh-people"></div>
+    </div>
+    <div class="actions"><button value="cancel" class="ghost" id="sh-cancel">Cancel</button></div>
   </form>
 </dialog>
 

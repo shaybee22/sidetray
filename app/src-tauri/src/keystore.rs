@@ -70,7 +70,7 @@ pub fn unwrap(wrapped: &[u8]) -> Result<Vec<u8>> {
 
 /// Attach this thread to the JVM, run `f` in a local reference frame, and turn
 /// a pending Java exception into an error (cleared, so the thread stays usable).
-fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T>) -> Result<T> {
+pub(crate) fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T>) -> Result<T> {
     let ctx = ndk_context::android_context();
     // SAFETY: tao stores the process's JavaVM pointer in ndk-context at startup.
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }?;

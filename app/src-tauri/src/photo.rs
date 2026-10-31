@@ -7,8 +7,13 @@
 //!
 //! Animated GIF, WebP and PNG keep only their first frame (the feed shows still
 //! WebP); `Processed::still` says so, and the app tells the person.
+//!
+//! HEIC/HEIF (and AVIF) aren't in the image library. On Android the platform
+//! decoder reads them (Android 9 and newer); the pixels then go through the
+//! same steps, so nothing from the original file survives there either. On a
+//! computer they're refused with a message saying so.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use image::{imageops::FilterType, AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use std::io::Cursor;
 
@@ -33,15 +38,14 @@ pub fn process(bytes: &[u8]) -> Result<Processed> {
     if bytes.len() > MAX_INPUT_BYTES {
         bail!("that file is over {} MB", MAX_INPUT_BYTES / 1024 / 1024);
     }
-    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
-    if reader.format().is_none() {
-        bail!("that isn't a photo this app can read (JPEG, PNG, GIF, WebP or BMP)");
-    }
-    let still = is_animated(bytes, reader.format());
-    let mut decoder = reader.into_decoder().context("reading the photo")?;
-    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder).context("decoding the photo")?;
-    img.apply_orientation(orientation);
+    let (img, still) = match decode(bytes) {
+        Ok(decoded) => decoded,
+        Err(e) => match platform_decode(bytes)? {
+            Some(img) => (img, false),
+            None if is_heif(bytes) => bail!("{HEIF_UNSUPPORTED}"),
+            None => return Err(e),
+        },
+    };
 
     let full = fit(&img, MAX_SIDE);
     let thumb = fit(&full, THUMB_SIDE);
@@ -52,6 +56,56 @@ pub fn process(bytes: &[u8]) -> Result<Processed> {
         thumb: encode_webp(&thumb, THUMB_QUALITY),
         still,
     })
+}
+
+#[cfg(target_os = "android")]
+const UNREADABLE: &str = "that isn't a photo this app can read (JPEG, PNG, GIF, WebP, BMP or HEIC)";
+#[cfg(not(target_os = "android"))]
+const UNREADABLE: &str = "that isn't a photo this app can read (JPEG, PNG, GIF, WebP or BMP)";
+
+#[cfg(target_os = "android")]
+const HEIF_UNSUPPORTED: &str =
+    "this phone can't open that HEIC/HEIF photo (it needs Android 9 or newer). Save it as a JPEG first, then add that";
+#[cfg(not(target_os = "android"))]
+const HEIF_UNSUPPORTED: &str = "HEIC/HEIF photos (the format iPhones and many phone cameras use) can't be opened on a computer yet. Save it as a JPEG first, or send it from the Side Tray app on an Android phone";
+
+/// The image library: the photo with its EXIF orientation applied, and whether it was animated.
+fn decode(bytes: &[u8]) -> Result<(DynamicImage, bool)> {
+    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    if reader.format().is_none() {
+        return Err(anyhow!(UNREADABLE));
+    }
+    let still = is_animated(bytes, reader.format());
+    let mut decoder = reader.into_decoder().context("reading the photo")?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).context("decoding the photo")?;
+    img.apply_orientation(orientation);
+    Ok((img, still))
+}
+
+/// Android's own decoder, for what the image library can't read (HEIC/HEIF, AVIF).
+#[cfg(target_os = "android")]
+fn platform_decode(bytes: &[u8]) -> Result<Option<DynamicImage>> {
+    Ok(crate::android::decode_image(bytes, MAX_SIDE)?.map(DynamicImage::ImageRgba8))
+}
+
+#[cfg(not(target_os = "android"))]
+fn platform_decode(_bytes: &[u8]) -> Result<Option<DynamicImage>> {
+    Ok(None)
+}
+
+/// An ISO base media file whose brands say HEIF (HEIC, or AVIF).
+pub fn is_heif(bytes: &[u8]) -> bool {
+    const BRANDS: [&[u8; 4]; 10] = [b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1", b"avif", b"avis"];
+    if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let size = (u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize).clamp(16, bytes.len().min(256));
+    // Major brand at 8, minor version at 12, compatible brands from 16.
+    let major: &[u8; 4] = bytes[8..12].try_into().unwrap();
+    std::iter::once(major)
+        .chain(bytes[16..size].as_chunks::<4>().0)
+        .any(|b| BRANDS.contains(&b))
 }
 
 /// More than one frame: an animated GIF, WebP or PNG (APNG).
@@ -206,5 +260,32 @@ mod tests {
     #[test]
     fn non_images_are_refused() {
         assert!(process(b"hello, not a photo").is_err());
+    }
+
+    /// The start of an iPhone HEIC: an `ftyp` box, major brand heic, compatible mif1 and heic.
+    fn heic_header() -> Vec<u8> {
+        let mut b = 24u32.to_be_bytes().to_vec();
+        b.extend_from_slice(b"ftypheic\0\0\0\0mif1heic");
+        b.extend_from_slice(&[0u8; 64]);
+        b
+    }
+
+    #[test]
+    fn heif_is_recognised() {
+        assert!(is_heif(&heic_header()));
+        let mut avif = 28u32.to_be_bytes().to_vec();
+        avif.extend_from_slice(b"ftypmp42\0\0\0\0isommp42avif");
+        assert!(is_heif(&avif));
+        let mut mp4 = 24u32.to_be_bytes().to_vec();
+        mp4.extend_from_slice(b"ftypisom\0\0\0\0isommp42");
+        assert!(!is_heif(&mp4));
+        assert!(!is_heif(&jpeg_with_exif(8, 8, 1)));
+    }
+
+    #[test]
+    fn heif_on_a_computer_says_what_to_do() {
+        let e = process(&heic_header()).err().unwrap().to_string();
+        assert!(e.contains("HEIC/HEIF"), "{e}");
+        assert!(e.contains("JPEG"), "{e}");
     }
 }

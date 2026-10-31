@@ -74,6 +74,7 @@ input, textarea {
 }
 input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
 textarea { resize: vertical; }
+html.mobile textarea { resize: none; }
 details { font-size: .9rem; }
 details summary { cursor: pointer; color: var(--muted); }
 details[open] summary { margin-bottom: 8px; }
@@ -340,17 +341,20 @@ dialog#crop p { margin: 0; }
 #dm-hint { margin: 6px 0 0; }
 
 /* A1 (Android): the desktop layout made usable on a phone; real mobile polish is A2 */
+/* Safe areas: what the WebView reports, or what Android says (app.js sets these
+   from system_insets, since older WebViews leave out the gesture bar). */
+html.mobile { --sat: env(safe-area-inset-top, 0px); --sar: env(safe-area-inset-right, 0px); --sab: env(safe-area-inset-bottom, 0px); --sal: env(safe-area-inset-left, 0px); }
 .mobile-only { display: none; }
 html.mobile .desktop-only { display: none !important; }
 html.mobile .mobile-only { display: revert; }
 /* Edge-to-edge: keep content clear of the status bar, notch and gesture bar. */
-html.mobile .topbar { padding-top: calc(10px + env(safe-area-inset-top)); padding-left: calc(12px + env(safe-area-inset-left)); padding-right: calc(12px + env(safe-area-inset-right)); }
-html.mobile .screen-center { padding-top: calc(24px + env(safe-area-inset-top)); padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
-html.mobile .panel { padding-left: calc(10px + env(safe-area-inset-left)); padding-right: calc(10px + env(safe-area-inset-right)); padding-bottom: calc(48px + env(safe-area-inset-bottom)); }
+html.mobile .topbar { padding-top: calc(10px + var(--sat)); padding-left: calc(12px + var(--sal)); padding-right: calc(12px + var(--sar)); }
+html.mobile .screen-center { padding-top: calc(24px + var(--sat)); padding-bottom: calc(24px + var(--sab)); }
+html.mobile .panel { padding-left: calc(10px + var(--sal)); padding-right: calc(10px + var(--sar)); padding-bottom: calc(48px + var(--sab)); }
 html.mobile .panel .card { padding: 14px; }
 /* The chat fills the screen above the keyboard (dvh follows the keyboard and browser bars). */
-html.mobile #panel-messages { padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
-html.mobile .chat { height: calc(100dvh - 128px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); min-height: 300px; }
+html.mobile #panel-messages { padding-bottom: calc(8px + var(--sab)); }
+html.mobile .chat { height: calc(100dvh - 128px - var(--sat) - var(--sab)); min-height: 300px; }
 html.mobile .bubble { max-width: 85%; }
 html.mobile .tabs { gap: 2px; justify-content: space-between; overflow-x: auto; scrollbar-width: none; }
 html.mobile .tab { flex: 0 1 auto; padding: 8px 3px; font-size: .88rem; }
@@ -358,8 +362,8 @@ html.mobile .tab .badge { font-size: .68rem; padding: 0 5px; min-width: 16px; }
 html.mobile .facts { grid-template-columns: 1fr; gap: 2px; }
 html.mobile .facts dd { margin-bottom: 8px; }
 html.mobile .invite-link { flex-wrap: wrap; }
-html.mobile #lightbox { padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
-html.mobile .lightbox-close { top: calc(12px + env(safe-area-inset-top)); }
+html.mobile #lightbox { padding: var(--sat) 0 var(--sab); }
+html.mobile .lightbox-close { top: calc(12px + var(--sat)); }
 /* Fingers, not a mouse: bigger targets, and 16 px inputs so nothing zooms on focus. */
 @media (pointer: coarse) {
   button, .button { min-height: 40px; }
@@ -369,3 +373,80 @@ html.mobile .lightbox-close { top: calc(12px + env(safe-area-inset-top)); }
   input, textarea { font-size: 16px; }
   .conv:hover, .pick:hover { background: none; }
 }
+
+/* A2 (Android): bottom tabs, camera and gallery buttons, the share sheet, a zoomable photo viewer */
+.tab-icon { display: none; }
+label.button { flex-direction: row; }
+html.mobile .button.mobile-only { display: inline-flex; }
+.btn-icon { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.button.small .btn-icon { width: 16px; height: 16px; }
+html:not(.mobile) .composer-bar .btn-icon { display: none; }
+html:not(.mobile) .icon-on-phone .btn-icon { display: none; }
+
+html.mobile { --tabs-h: calc(56px + var(--sab)); }
+/* The top bar is just the group and sync; the tabs sit at the bottom, under the thumb.
+   (No backdrop blur here: it would make the fixed tab bar position itself inside the top bar.) */
+html.mobile .topbar { backdrop-filter: none; background: var(--bg); flex-wrap: nowrap; gap: 8px; padding-bottom: 8px; }
+html.mobile .brand { flex: 1; min-width: 0; }
+html.mobile #tb-group { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html.mobile .tabs {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 6; height: var(--tabs-h);
+  display: flex; gap: 0; justify-content: space-around; overflow: visible;
+  padding: 0 var(--sar) var(--sab) var(--sal);
+  background: var(--surface); border-top: 1px solid var(--line);
+}
+html.mobile .tab {
+  position: relative; flex: 1 1 0; min-width: 0; height: 56px; min-height: 0; padding: 6px 2px 4px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  font-size: .72rem; font-weight: 600; border-radius: 0; box-shadow: none; background: none;
+}
+html.mobile .tab[aria-selected="true"] { color: var(--accent); background: none; box-shadow: none; }
+html.mobile .tab-icon { display: block; width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+html.mobile .tab-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+html.mobile .tab .badge { position: absolute; top: 4px; left: calc(50% + 6px); }
+html.mobile .panel { padding-bottom: calc(var(--tabs-h) + 24px); }
+html.mobile #panel-messages { padding-bottom: calc(var(--tabs-h) + 8px); }
+html.mobile .readonly .panel { padding-bottom: calc(24px + var(--sab)); }
+
+/* Full-width composer and bigger photo buttons */
+html.mobile .composer-bar { flex-wrap: wrap; }
+html.mobile .composer-bar #cp-hint { order: 5; flex-basis: 100%; }
+html.mobile .composer-bar #cp-hint:empty { display: none; }
+html.mobile #cp-post { margin-left: auto; }
+html.mobile .icon-on-phone { padding: 0; width: 40px; justify-content: center; flex: none; }
+html.mobile .icon-on-phone.small { width: 36px; }
+html.mobile .icon-on-phone .btn-icon { width: 22px; height: 22px; }
+html.mobile .comment-form { gap: 6px; }
+html.mobile .comment-form input { min-width: 0; flex: 1; }
+html.mobile .chat-input-row { gap: 6px; }
+html.mobile .chat-input-row textarea { min-width: 0; }
+
+/* Dialogs: the confirm box, and the share sheet */
+dialog.sheet { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); box-shadow: var(--shadow); padding: 20px; width: min(440px, calc(100% - 24px)); max-height: calc(100dvh - 32px); overflow-y: auto; }
+dialog.sheet::backdrop { background: rgba(10, 10, 10, .5); }
+dialog.sheet p { margin: 0; }
+dialog.sheet .staged:not(:empty) { margin: 0; }
+dialog.sheet .staged-item { width: 72px; height: 72px; }
+.share-text { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface-2); border-radius: 8px; padding: 8px 10px; max-height: 6.5em; overflow: hidden; font-size: .92rem; }
+#sh-feed { justify-content: center; }
+#sh-people { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; max-height: 40vh; overflow-y: auto; }
+html.mobile dialog#confirm, html.mobile dialog#crop { max-height: calc(100dvh - 32px); overflow-y: auto; }
+
+/* The photo viewer: pinch and drag (the page itself doesn't scroll or zoom under it) */
+#lightbox { touch-action: none; cursor: default; overflow: hidden; }
+#lightbox img { user-select: none; -webkit-user-drag: none; transition: transform .12s ease-out; will-change: transform; }
+
+/* Short screens (the razr's outer screen, a phone on its side): less chrome */
+@media (max-height: 640px) {
+  html.mobile .topbar { padding-top: calc(6px + var(--sat)); padding-bottom: 6px; }
+  html.mobile { --tabs-h: calc(50px + var(--sab)); }
+  html.mobile .tab { height: 50px; }
+  html.mobile .tab-icon { width: 21px; height: 21px; }
+  html.mobile .composer textarea { min-height: 3em; }
+  .screen-center { align-items: flex-start; }
+}
+#lightbox.gesture img { transition: none; }
+/* The × on a staged photo stays a small round button (touch sizing would stretch it). */
+.staged-item button { min-height: 0; width: 26px; height: 26px; padding: 0; justify-content: center; line-height: 1; }
+@media (pointer: coarse) { .staged-item button { width: 30px; height: 30px; font-size: 1rem; } }
+@media (max-height: 640px) { html.mobile .panel { padding-top: 8px; } }

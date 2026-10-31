@@ -15,10 +15,28 @@ the app, the Rust crates and the relay share one version number.
   Android Keystore.
 - `sidetray://` invite links open the app on a phone too.
 
+### Android app (phase A2)
+
+- **Share → Side Tray** from any app: pictures (one or several), text and
+  links. Side Tray shows what came in and asks where it goes: the feed, or a
+  message to someone. If the app isn't in a group yet, it says so.
+- **Camera** buttons on the composer, comments and chat. The full-size shot
+  is deleted from the phone once it's been resized and stripped.
+- Choose **several photos at once** from the photo picker.
+- **HEIC/HEIF photos** (and AVIF) work on Android 9 and newer.
+- **Back button**: closes the photo viewer, dialogs and chats, goes back to
+  the feed, and asks before leaving with something unsent.
+- **Phone layout**: tabs at the bottom, icon buttons, pinch-zoom in the photo
+  viewer, and it fits the razr's small outer screen. Drafts survive moving
+  between the inner and outer screens.
+- The app is left out of Android backups (they would copy decrypted posts).
+
 ### Desktop app
 
 - No visible changes. Internally the app is now a library plus a small
   executable, so the same code builds for Android.
+- A HEIC/HEIF photo is refused with a clear message instead of "isn't a
+  photo this app can read".
 
 ## [0.1.1] - 2026-10-31
 

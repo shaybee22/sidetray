@@ -61,14 +61,50 @@ let mobile = false;
  */
 async function bytesArg(blob) {
   if (!mobile) return new Uint8Array(await blob.arrayBuffer());
-  const url = await new Promise((resolve, reject) => {
+  const read = () => new Promise((resolve, reject) => {
     const r = new FileReader();
     r.onload = () => resolve(r.result);
     r.onerror = () => reject(r.error);
     r.readAsDataURL(blob);
   });
+  // A photo straight from Android's picker now and then can't be read on the
+  // first try (NotReadableError); a moment later it can.
+  let url;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      url = await read();
+      break;
+    } catch (e) {
+      if (attempt >= 2 || !e || e.name !== "NotReadableError") throw e;
+      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
+  }
   return { b64: url.slice(url.indexOf(",") + 1) };
 }
+
+/**
+ * Keep the page clear of the status bar, the gesture bar and camera cutouts.
+ * Android's own numbers count where the WebView's env(safe-area-inset-*)
+ * comes up short; checked again whenever the window changes (rotation, or
+ * moving between a flip phone's inner and outer screens).
+ */
+async function applyInsets() {
+  let i;
+  try { i = await invoke("system_insets"); } catch (_) { return; }
+  if (!i) return;
+  const root = document.documentElement.style;
+  ["--sat", "--sar", "--sab", "--sal"].forEach((v, n) => {
+    const side = ["top", "right", "bottom", "left"][n];
+    root.setProperty(v, `max(env(safe-area-inset-${side}, 0px), ${Math.round(i[n])}px)`);
+  });
+  fitChat();
+}
+let insetsTimer = null;
+window.addEventListener("resize", () => {
+  if (!mobile) return;
+  clearTimeout(insetsTimer);
+  insetsTimer = setTimeout(applyInsets, 150);
+});
 
 async function boot() {
   try {
@@ -83,8 +119,16 @@ async function boot() {
     $("#screen-loading p").textContent = `Couldn't open the app's data: ${e}`;
     return;
   }
+  if (mobile) await restoreDrafts();
   route();
   handleInvite();
+  if (mobile) {
+    restoreView();
+    applyInsets();
+    // Called by the activity (MainActivity.kt) on Back; true = the page took it.
+    window.__sidetrayBack = () => { onBack(); return true; };
+    checkShare();
+  }
 }
 
 function route() {
@@ -241,6 +285,197 @@ async function handleInvite() {
 
 listen("invite", handleInvite);
 
+// --- Share → Side Tray (Android) ------------------------------------------------------------
+
+let shareTray = null; // made on first use (the Attachments class is defined further down)
+let shareText = "";
+let shareChecking = null;
+let shareGen = 0; // which share the dialog is showing; an older one's pictures stop loading
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Something shared from another app, if there is: wait while it's copied, then offer it. */
+function checkShare() {
+  if (!mobile || !view) return;
+  shareChecking ??= (async () => {
+    try {
+      let s = await invoke("take_share");
+      for (let i = 0; s && s.state === "copying" && i < 200; i++) {
+        await sleep(250);
+        s = await invoke("take_share");
+      }
+      if (s && s.state === "ready") receiveShare(s); // not awaited: a newer share may replace it
+    } catch (e) {
+      console.warn("take_share", e);
+    } finally {
+      shareChecking = null;
+    }
+  })();
+}
+
+listen("resumed", checkShare);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") checkShare(); });
+
+/** A link shared from a browser comes as the page title (subject) and its address (text). */
+function sharedText(s) {
+  const text = (s.text || "").trim();
+  const subject = (s.subject || "").trim();
+  if (subject && !text.includes(subject)) return text ? `${subject}\n${text}` : subject;
+  return text;
+}
+
+async function receiveShare(s) {
+  const text = sharedText(s);
+  const notes = [...s.errors];
+  if (s.skipped) notes.push(`${s.skipped} shared file${s.skipped > 1 ? "s weren't pictures" : " wasn't a picture"}, so ${s.skipped > 1 ? "they were" : "it was"} left out.`);
+  const active = view.stage === "active" && !$("#screen-main").classList.contains("readonly");
+  if (!active) {
+    invoke("end_share");
+    const why = {
+      setup: "Side Tray isn't in a group yet, so there's nowhere to share this. Join a group first (ask a Key Master for an invite link), then share it again.",
+      pending: "Your request to join the group is still waiting for a Key Master. Once you're in, share it again.",
+      denied: "Your request to join the group was turned down, so there's nowhere to share this.",
+      removed: "This device isn't in the group any more, so it can't share anything.",
+      revoked: "This device was disconnected from the group, so it can't share anything.",
+    }[view.stage] || "Side Tray can't share anything right now.";
+    return notice("Can't share this yet", why);
+  }
+  if (!s.photos && !text) {
+    invoke("end_share");
+    return notice("Nothing to share", notes.join(" ") || "Side Tray didn't receive a picture or any text.");
+  }
+
+  // A new share replaces one still waiting in the dialog.
+  const gen = ++shareGen;
+  if (!shareTray) {
+    shareTray = new Attachments({ max: 20, noun: "share" });
+    shareTray.attach($("#sh-photos"), $("#sh-hint"), $("#sh-err"));
+  }
+  shareTray.clear();
+  shareText = text;
+  const dlg = $("#share");
+  if (!dlg.open) dlg.showModal();
+  const what = [];
+  if (s.photos) what.push(`${s.photos} picture${s.photos > 1 ? "s" : ""}`);
+  if (text) what.push(/^https?:\/\/\S+$/.test(s.text.trim()) ? "a link" : "some text");
+  $("#sh-what").textContent = `From another app: ${what.join(" and ")}. Where should it go?`;
+  $("#sh-text").textContent = text;
+  $("#sh-text").hidden = !text;
+  hideError($("#sh-err"));
+  if (notes.length) showError($("#sh-err"), notes.join("\n"));
+  $("#sh-dm").hidden = true;
+  invoke("dm_recipients").then((people) => {
+    $("#sh-people").replaceChildren(...people.map((p) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "pick";
+      const face = document.createElement("span");
+      face.className = "avatar";
+      face.setAttribute("aria-hidden", "true");
+      avatar(face, p.name, p.avatar);
+      const name = document.createElement("span");
+      name.textContent = p.name;
+      b.append(face, name);
+      b.addEventListener("click", () => shareTo(p.member_id));
+      return b;
+    }));
+    $("#sh-dm").hidden = !people.length;
+  }).catch((e) => console.warn("dm_recipients", e));
+  setShareReady(false);
+  const sources = Array.from({ length: s.photos }, (_, index) => ({
+    label: s.photos > 1 ? `Picture ${index + 1}` : "The picture",
+    load: () => (gen === shareGen ? invoke("stage_shared_photo", { index }) : null),
+  }));
+  await shareTray.add(sources);
+  if (gen !== shareGen) return;
+  invoke("end_share");
+  if (dlg.open) setShareReady(true);
+}
+
+/** Sending is possible once the pictures are ready (resized and stripped). */
+function setShareReady(ready) {
+  for (const b of $$("#sh-feed, #sh-people button")) b.disabled = !ready;
+  $("#sh-feed").textContent = ready ? "Post it to the feed" : "Preparing pictures…";
+}
+
+function shareTo(memberId) {
+  const items = shareTray.take();
+  const text = shareText;
+  shareText = "";
+  $("#share").close("sent");
+  const into = (input) => {
+    input.value = input.value.trim() ? `${input.value.trimEnd()}\n\n${text}` : text;
+  };
+  if (memberId) {
+    chatWith = memberId;
+    selectTab("messages"); // opens the chat; its draft belongs to this person from here on
+    into($("#dm-text"));
+    dmTray.adopt(items);
+  } else {
+    selectTab("feed");
+    into($("#cp-text"));
+    postTray.adopt(items);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+}
+
+$("#sh-feed").addEventListener("click", () => shareTo(null));
+$("#share").addEventListener("close", () => {
+  if ($("#share").returnValue === "sent") return;
+  // Cancelled (the button, or Back): nothing of it is kept.
+  shareTray?.clear();
+  shareText = "";
+  invoke("end_share");
+});
+
+// --- the Back button (Android) ----------------------------------------------------------------
+
+/** Unsent words or photos anywhere: the composer, a comment, a message. */
+function unsentWork() {
+  const what = [];
+  if ($("#cp-text").value.trim() || postTray.items.length) what.push("post");
+  if ($$("#feed .comment-input").some((i) => i.value.trim()) || [...commentTrays.values()].some((t) => t.items.length)) what.push("comment");
+  if ($("#dm-text").value.trim() || dmTray.items.length) what.push("message");
+  return what;
+}
+
+/**
+ * Back closes whatever is on top (the photo viewer, a dialog, a chat), then
+ * goes back to the feed, and only then leaves the app (to the background, like
+ * Home), asking first if something is half-written.
+ */
+async function onBack() {
+  if (!$("#lightbox").hidden) return closeLightbox();
+  const dlg = $$("dialog").find((d) => d.open);
+  if (dlg) return dlg.close();
+  const main = $("#screen-main");
+  if (!$("#screen-wizard").hidden && $("#wz-server").hidden) return void $($("#wz-trust").hidden ? "#wz-back" : "#wz-trust-back").click();
+  if (!main.hidden && main.classList.contains("readonly")) return startRemoved();
+  if (!main.hidden) {
+    if (!$("#panel-feed").hidden && $("#feed .react-picker")) return void loadFeed(); // an open emoji row
+    if (!$("#panel-messages").hidden) {
+      if (!$("#dm-picker").hidden) return void ($("#dm-picker").hidden = true);
+      if (!$("#dm-chat-view").hidden) { chatWith = null; return showMessages(); }
+    }
+    if ($("#panel-feed").hidden) {
+      selectTab("feed");
+      return window.scrollTo({ top: 0 });
+    }
+    const unsent = unsentWork();
+    if (unsent.length) {
+      const list = unsent.length === 1 ? `an unsent ${unsent[0]}` : `an unsent ${unsent.slice(0, -1).join(", ")} and ${unsent.at(-1)}`;
+      const leave = await askConfirm({
+        title: "Leave without sending?",
+        body: `You have ${list}. It stays here while Side Tray is in the background, but it's lost if Android closes the app.`,
+        ok: "Leave",
+        cancelLabel: "Keep writing",
+      });
+      if (!leave) return;
+    }
+  }
+  invoke("leave_app").catch((e) => console.warn("leave_app", e));
+}
+
 // --- waiting for approval ----------------------------------------------------------------
 
 function startWaiting() {
@@ -326,7 +561,7 @@ function confirmClick(button, question, action) {
     }
     const label = button.textContent;
     button.dataset.armed = "1";
-    button.textContent = question;
+    button.textContent = mobile ? question.replace(/^Click/, "Tap") : question;
     setTimeout(() => { delete button.dataset.armed; button.textContent = label; }, 4000);
   });
 }
@@ -350,6 +585,7 @@ function startMain() {
 }
 
 function selectTab(name) {
+  saveDraftsSoon();
   for (const t of $$(".tab")) t.setAttribute("aria-selected", String(t.dataset.tab === name));
   for (const p of $$(".panel")) p.hidden = p.id !== `panel-${name}`;
   clearInterval(pendingTimer);
@@ -507,6 +743,9 @@ async function loadFeed() {
   $("#feed-empty").hidden = posts.length > 0;
   $("#load-more").hidden = posts.length < loadedCount;
   for (const input of $$("#feed .comment-input")) {
+    const id = input.dataset.post;
+    if (!drafts[id] && restoredCommentText[id]) drafts[id] = restoredCommentText[id];
+    delete restoredCommentText[id];
     if (drafts[input.dataset.post]) input.value = drafts[input.dataset.post];
     if (input.dataset.post === focused) input.focus();
   }
@@ -594,11 +833,8 @@ function renderPost(p) {
   input.dataset.post = p.id;
   const tray = commentTray(p.id);
   tray.attach($(".comment-photos", el), $(".comment-hint", el), err);
-  $(".comment-file", el).addEventListener("change", (ev) => {
-    const files = [...ev.target.files];
-    ev.target.value = "";
-    tray.addFiles(files);
-  });
+  onPicked($(".comment-file", el), tray);
+  onPicked($(".comment-camera", el), tray);
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     hideError(err);
@@ -698,15 +934,104 @@ async function react(postId, emoji) {
   }
 }
 
+// The photo viewer: pinch (or the mouse wheel) to zoom, drag to move a zoomed
+// photo, double-tap to zoom in or out, a single tap (or ×, Back, Esc) closes.
+const lb = { s: 1, x: 0, y: 0, pts: new Map(), pinch: null, moved: false, lastTap: 0, tapTimer: null };
+
 function openLightbox(src) {
+  Object.assign(lb, { s: 1, x: 0, y: 0, pinch: null });
+  lb.pts.clear();
+  lbApply();
   $("#lightbox-img").src = src;
   $("#lightbox").hidden = false;
 }
 function closeLightbox() {
+  clearTimeout(lb.tapTimer);
   $("#lightbox").hidden = true;
   $("#lightbox-img").removeAttribute("src");
 }
-$("#lightbox").addEventListener("click", closeLightbox);
+
+function lbApply() {
+  const img = $("#lightbox-img");
+  // Keep the photo covering the screen where it's bigger than it, centred where it isn't.
+  const maxX = Math.max(0, (img.offsetWidth * lb.s - innerWidth) / 2);
+  const maxY = Math.max(0, (img.offsetHeight * lb.s - innerHeight) / 2);
+  lb.x = Math.min(maxX, Math.max(-maxX, lb.x));
+  lb.y = Math.min(maxY, Math.max(-maxY, lb.y));
+  img.style.transform = lb.s === 1 ? "" : `translate(${lb.x}px, ${lb.y}px) scale(${lb.s})`;
+}
+
+/**
+ * Zoom to `s` so that the photo point that was under (fx, fy) with the
+ * transform `from` ends up under (px, py): zooming in place, or a pinch whose
+ * fingers have also moved.
+ */
+function lbZoomAt(s, px, py, from = lb, fx = px, fy = py) {
+  const img = $("#lightbox-img");
+  // The photo's centre before the transform (it's centred in the full-screen box).
+  const cx = img.offsetLeft + img.offsetWidth / 2, cy = img.offsetTop + img.offsetHeight / 2;
+  const qx = (fx - cx - from.x) / from.s, qy = (fy - cy - from.y) / from.s;
+  lb.s = Math.min(5, Math.max(1, s));
+  lb.x = px - cx - lb.s * qx;
+  lb.y = py - cy - lb.s * qy;
+  if (lb.s === 1) lb.x = lb.y = 0;
+  lbApply();
+}
+
+(() => {
+  const box = $("#lightbox");
+  const mid = () => { const [a, b] = [...lb.pts.values()]; return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) || 1 }; };
+  box.addEventListener("pointerdown", (e) => {
+    if (e.target.closest(".lightbox-close")) return;
+    box.setPointerCapture(e.pointerId);
+    box.classList.add("gesture");
+    lb.pts.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY });
+    if (lb.pts.size === 1) lb.moved = false;
+    if (lb.pts.size === 2) {
+      const m = mid();
+      lb.pinch = { fx: m.x, fy: m.y, d: m.d, s: lb.s, x: lb.x, y: lb.y };
+      lb.moved = true;
+    }
+  });
+  box.addEventListener("pointermove", (e) => {
+    const p = lb.pts.get(e.pointerId);
+    if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (Math.hypot(p.x - p.x0, p.y - p.y0) > 10) lb.moved = true;
+    if (lb.pts.size >= 2 && lb.pinch) {
+      // Pinch: scale with the fingers' spread, and follow their midpoint.
+      const m = mid(), p0 = lb.pinch;
+      lbZoomAt(p0.s * (m.d / p0.d), m.x, m.y, p0, p0.fx, p0.fy);
+    } else if (lb.s > 1) {
+      lb.x += dx; lb.y += dy;
+      lbApply();
+    }
+  });
+  const up = (e) => {
+    if (!lb.pts.delete(e.pointerId)) return;
+    if (lb.pts.size < 2) lb.pinch = null;
+    if (!lb.pts.size) box.classList.remove("gesture");
+    if (lb.pts.size || lb.moved || e.type === "pointercancel") return;
+    // A tap: a second one soon after zooms, otherwise it closes (unless zoomed in).
+    const now = Date.now();
+    clearTimeout(lb.tapTimer);
+    if (now - lb.lastTap < 300) {
+      lb.lastTap = 0;
+      lbZoomAt(lb.s > 1 ? 1 : 2.5, e.clientX, e.clientY);
+    } else {
+      lb.lastTap = now;
+      lb.tapTimer = setTimeout(() => { if (lb.s === 1) closeLightbox(); }, 300);
+    }
+  };
+  box.addEventListener("pointerup", up);
+  box.addEventListener("pointercancel", up);
+  box.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    lbZoomAt(lb.s * Math.exp(-e.deltaY / 400), e.clientX, e.clientY);
+  }, { passive: false });
+  $("#lightbox-close").addEventListener("click", closeLightbox);
+})();
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLightbox(); });
 
 // --- attaching photos: picker, paste, drag and drop ------------------------------------
@@ -773,7 +1098,12 @@ class Attachments {
       this.render();
       try {
         const r = await src.load();
-        if (!this.items.includes(slot)) { invoke("unstage_photo", { id: r.id }); continue; } // removed meanwhile
+        if (!r || !this.items.includes(slot)) { // removed meanwhile, or the source was withdrawn
+          if (r) invoke("unstage_photo", { id: r.id });
+          this.items = this.items.filter((o) => o !== slot);
+          this.render();
+          continue;
+        }
         Object.assign(slot, { id: r.id, preview: r.preview, still: r.still });
       } catch (e) {
         this.items = this.items.filter((o) => o !== slot);
@@ -785,7 +1115,25 @@ class Attachments {
 
   fail(msg) { if (this.err) showError(this.err, msg); }
 
+  /** Give up the (prepared) photos, to hand them to another tray with adopt(). */
+  take() {
+    const items = this.items;
+    this.items = [];
+    this.render();
+    return items;
+  }
+
+  adopt(items) {
+    if (this.err) hideError(this.err);
+    const room = Math.max(0, this.max - this.items.length);
+    for (const s of items.slice(room)) invoke("unstage_photo", { id: s.id });
+    this.items.push(...items.slice(0, room));
+    this.render();
+    if (items.length > room) this.fail(`At most ${this.max} photos per ${this.noun}, so ${items.length - room} of them were left out.`);
+  }
+
   render() {
+    saveDraftsSoon();
     if (!this.box) return;
     this.box.replaceChildren(...this.items.map((s) => {
       const item = document.createElement("div");
@@ -827,6 +1175,19 @@ class Attachments {
     this.hint.textContent = parts.join(". ");
     this.hint.hidden = !parts.length;
   }
+}
+
+/**
+ * A photo input feeding a tray. The camera (Android) saves each shot as a
+ * full-size JPEG in the app's folder; once staged, the app deletes it.
+ */
+function onPicked(input, tray) {
+  input.addEventListener("change", async (ev) => {
+    const files = [...ev.target.files];
+    ev.target.value = "";
+    await tray.addFiles(files);
+    if (input.hasAttribute("capture")) invoke("forget_captures").catch(() => {});
+  });
 }
 
 const commentTrays = new Map(); // post id -> Attachments, kept across feed re-renders
@@ -934,11 +1295,8 @@ document.addEventListener("drop", (e) => {
 const postTray = new Attachments({ max: 10, noun: "post", summary: true });
 postTray.attach($("#cp-photos"), $("#cp-hint"), $("#cp-err"));
 
-$("#cp-file").addEventListener("change", (ev) => {
-  const files = [...ev.target.files];
-  ev.target.value = "";
-  postTray.addFiles(files);
-});
+onPicked($("#cp-file"), postTray);
+onPicked($("#cp-camera"), postTray);
 
 $("#composer").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -1066,12 +1424,13 @@ function renderPending(p) {
 // --- confirmations ---------------------------------------------------------------------------
 
 /** A modal yes/no. Cancel has the focus, so Enter alone never confirms. */
-function askConfirm({ title, body, ok, danger = false, cancel = true }) {
+function askConfirm({ title, body, ok, danger = false, cancel = true, cancelLabel = "Cancel" }) {
   const dlg = $("#confirm");
   if (dlg.open) dlg.close();
   $("#cf-title").textContent = title;
   $("#cf-body").textContent = body;
   $("#cf-ok").textContent = ok;
+  $("#cf-cancel").textContent = cancelLabel;
   $("#cf-ok").classList.toggle("danger", danger);
   $("#cf-cancel").hidden = !cancel;
   dlg.returnValue = "";
@@ -1553,7 +1912,17 @@ $("#pf-file").addEventListener("change", (ev) => {
   reader.onerror = () => showError($("#pf-err"), "Couldn't read that file.");
   reader.onload = () => {
     const img = $("#crop-img");
-    img.onerror = () => showError($("#pf-err"), "That isn't a photo this app can read.");
+    let converted = false;
+    img.onerror = async () => {
+      // The webview can't show HEIC/HEIF; the app can convert it (on a phone).
+      if (converted) return showError($("#pf-err"), "That isn't a photo this app can read.");
+      converted = true;
+      try {
+        img.src = await invoke("photo_preview", await bytesArg(file));
+      } catch (e) {
+        showError($("#pf-err"), String(e));
+      }
+    };
     img.onload = () => {
       hideError($("#crop-err"));
       $("#crop").showModal();
@@ -1742,6 +2111,7 @@ async function openChat(memberId) {
   chatWith = memberId;
   $("#dm-list-view").hidden = true;
   $("#dm-chat-view").hidden = false;
+  saveDraftsSoon();
   fitChat();
   await loadChat(true);
   // On a phone, focusing would throw the keyboard up before they've read anything.
@@ -1764,11 +2134,13 @@ function fitChat() {
   const atEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   window.scrollTo(0, 0);
   const top = chat.getBoundingClientRect().top;
-  // Below the chat: the panel's padding, which includes the gesture bar (under the keyboard when it's up).
-  const below = keyboard ? 8 : parseFloat(getComputedStyle($("#panel-messages")).paddingBottom) || 8;
+  // Below the chat: the tab bar (with the gesture bar under it), which the keyboard covers when it's up.
+  const tabs = $(".tabs");
+  const below = keyboard || readonlyMode() ? 8 : (tabs ? tabs.getBoundingClientRect().height : 0) + 8;
   chat.style.height = `${Math.max(220, Math.floor(height - top - below))}px`;
   if (atEnd) log.scrollTop = log.scrollHeight;
 }
+function readonlyMode() { return $("#screen-main").classList.contains("readonly"); }
 window.visualViewport?.addEventListener("resize", fitChat);
 window.addEventListener("resize", fitChat);
 
@@ -1876,11 +2248,8 @@ $("#dm-picker-cancel").addEventListener("click", () => { $("#dm-picker").hidden 
 const dmTray = new Attachments({ max: 10, noun: "message" });
 dmTray.attach($("#dm-photos"), $("#dm-hint"), $("#dm-err"));
 
-$("#dm-file").addEventListener("change", (ev) => {
-  const files = [...ev.target.files];
-  ev.target.value = "";
-  dmTray.addFiles(files);
-});
+onPicked($("#dm-file"), dmTray);
+onPicked($("#dm-camera"), dmTray);
 
 $("#dm-composer").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -1982,5 +2351,85 @@ $("#update-install").addEventListener("click", async (ev) => {
     $("#update-text").textContent = String(e);
   }
 });
+
+// --- drafts that outlive the page (Android) ---------------------------------------------------
+
+// Android can rebuild the app's window (moving between a flip phone's screens,
+// for one), which reloads this page. Half-written posts, comments and messages
+// are kept here, and their photos stay staged in the app, so they come back.
+const DRAFTS_KEY = "sidetray.drafts";
+let draftsTimer = null;
+let restoringDrafts = false;
+let restoredCommentText = {}; // post id -> comment text, until the feed shows that post
+let restoredView = null;       // the tab and chat that were open
+
+/** The page was reloaded under a running app (a rebuilt window): go back to where it was. */
+async function restoreView() {
+  const v = restoredView;
+  restoredView = null;
+  if (!v || !view || view.stage !== "active") return;
+  let boots = 1;
+  try { boots = await invoke("page_boot"); } catch (_) {}
+  if (boots < 2 || !v.tab || v.tab === "feed" && !v.chat) return;
+  if (v.chat) chatWith = v.chat;
+  if ($(`.tab[data-tab="${v.tab}"]`) && !$(`.tab[data-tab="${v.tab}"]`).hidden) selectTab(v.chat ? "messages" : v.tab);
+}
+
+function saveDraftsSoon() {
+  if (!mobile || restoringDrafts) return;
+  clearTimeout(draftsTimer);
+  draftsTimer = setTimeout(saveDrafts, 300);
+}
+
+function saveDrafts() {
+  const ids = (t) => t.items.filter((x) => x.id).map((x) => x.id);
+  const comments = {};
+  for (const [id, text] of Object.entries(restoredCommentText)) comments[id] = { text };
+  for (const [id, t] of commentTrays) if (t.items.length) (comments[id] ??= {}).photos = ids(t);
+  for (const i of $$("#feed .comment-input")) if (i.value.trim()) (comments[i.dataset.post] ??= {}).text = i.value;
+  const chatOpen = chatWith && !$("#dm-chat-view").hidden;
+  const d = {
+    view: { tab: $(".tab[aria-selected=true]")?.dataset.tab || "feed", chat: chatOpen ? chatWith : null },
+    post: { text: $("#cp-text").value, photos: ids(postTray) },
+    dm: draftFor ? { member: draftFor, text: $("#dm-text").value, photos: ids(dmTray) } : null,
+    comments,
+  };
+  try { localStorage.setItem(DRAFTS_KEY, JSON.stringify(d)); } catch (_) {}
+}
+
+document.addEventListener("input", saveDraftsSoon);
+
+async function restoreDrafts() {
+  let d;
+  try { d = JSON.parse(localStorage.getItem(DRAFTS_KEY) || "null"); } catch (_) { return; }
+  if (!d || !d.post) return;
+  restoredView = d.view || null;
+  restoringDrafts = true;
+  try {
+    const comments = d.comments || {};
+    const all = [...(d.post.photos || []), ...((d.dm && d.dm.photos) || []), ...Object.values(comments).flatMap((c) => c.photos || [])];
+    const views = all.length ? await invoke("staged_photos", { ids: all }) : [];
+    const byId = new Map(all.map((id, i) => [id, views[i]]));
+    const fill = (tray, list) => {
+      tray.items = (list || []).map((id) => byId.get(id)).filter(Boolean).map((v) => ({ id: v.id, preview: v.preview, still: v.still }));
+      tray.render();
+    };
+    if (!$("#cp-text").value) $("#cp-text").value = d.post.text || "";
+    fill(postTray, d.post.photos);
+    if (d.dm) {
+      draftFor = d.dm.member;
+      $("#dm-text").value = d.dm.text || "";
+      fill(dmTray, d.dm.photos);
+    }
+    for (const [id, c] of Object.entries(comments)) {
+      if (c.photos) fill(commentTray(id), c.photos);
+      if (c.text) restoredCommentText[id] = c.text;
+    }
+  } catch (e) {
+    console.warn("restoring drafts", e);
+  } finally {
+    restoringDrafts = false;
+  }
+}
 
 boot();

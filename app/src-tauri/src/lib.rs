@@ -13,6 +13,8 @@
 
 mod account;
 mod alerts;
+#[cfg(target_os = "android")]
+mod android;
 mod api;
 mod db;
 mod dm;
@@ -505,6 +507,26 @@ struct StagedView {
     still: bool,
 }
 
+fn staged_view(id: &str, p: &photo::Processed) -> StagedView {
+    StagedView {
+        id: id.to_string(),
+        preview: format!("data:image/webp;base64,{}", B64.encode(&p.thumb)),
+        width: p.width,
+        height: p.height,
+        bytes: p.full.len(),
+        still: p.still,
+    }
+}
+
+/// Photos still waiting to be sent, for a page that was reloaded with drafts
+/// (Android may rebuild the window, e.g. moving between a flip phone's screens).
+/// `None` for any that are gone.
+#[tauri::command]
+fn staged_photos(app: State<'_, Arc<App>>, ids: Vec<String>) -> Vec<Option<StagedView>> {
+    let staged = app.staged.lock().unwrap_or_else(|e| e.into_inner());
+    ids.iter().map(|id| staged.get(id).map(|p| staged_view(id, p))).collect()
+}
+
 /// Run the photo pipeline on `bytes` and keep the result until it's posted.
 async fn stage(app: &App, bytes: Vec<u8>) -> Res<StagedView> {
     let p = tauri::async_runtime::spawn_blocking(move || photo::process(&bytes))
@@ -514,14 +536,7 @@ async fn stage(app: &App, bytes: Vec<u8>) -> Res<StagedView> {
     let mut idb = [0u8; 9];
     getrandom::getrandom(&mut idb).map_err(|e| e.to_string())?;
     let id: String = idb.iter().map(|b| format!("{b:02x}")).collect();
-    let view = StagedView {
-        id: id.clone(),
-        preview: format!("data:image/webp;base64,{}", B64.encode(&p.thumb)),
-        width: p.width,
-        height: p.height,
-        bytes: p.full.len(),
-        still: p.still,
-    };
+    let view = staged_view(&id, &p);
     app.staged.lock().unwrap_or_else(|e| e.into_inner()).insert(id, p);
     Ok(view)
 }
@@ -564,6 +579,95 @@ async fn download_image(url: &str) -> anyhow::Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+// --- Android: Share → Side Tray, the back button, the camera (A2) ------------------------
+
+/// What another app shared to Side Tray, if anything. Nothing on a computer.
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn take_share() -> Res<Option<android::ShareView>> {
+    android::take_share().map_err(err)
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn take_share() -> Res<Option<()>> {
+    Ok(None)
+}
+
+/// Shared picture number `index`, through the same pipeline as any photo.
+#[tauri::command]
+async fn stage_shared_photo(app: State<'_, Arc<App>>, index: usize) -> Res<StagedView> {
+    #[cfg(target_os = "android")]
+    {
+        let bytes = tauri::async_runtime::spawn_blocking(move || android::take_shared_photo(index))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(err)?;
+        stage(&app, bytes).await
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, index);
+        Err("nothing was shared".into())
+    }
+}
+
+/// Done with what was shared (sent, or set aside): delete what's left of it.
+#[tauri::command]
+fn end_share() {
+    #[cfg(target_os = "android")]
+    android::end_share();
+}
+
+/// The back button with nothing left to close or go back to: background the app.
+#[tauri::command]
+fn leave_app() -> Res<()> {
+    #[cfg(target_os = "android")]
+    android::move_to_background().map_err(err)?;
+    Ok(())
+}
+
+/// How many times the page has started in this run of the app: more than one
+/// means Android rebuilt the window (the page then puts its view back).
+#[tauri::command]
+fn page_boot() -> u32 {
+    static BOOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    BOOTS.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// The phone's system bars and cutouts in CSS pixels (top, right, bottom, left).
+#[tauri::command]
+fn system_insets() -> Option<[f32; 4]> {
+    #[cfg(target_os = "android")]
+    return android::insets().unwrap_or_else(|e| {
+        eprintln!("reading window insets: {e:#}");
+        None
+    });
+    #[cfg(not(target_os = "android"))]
+    None
+}
+
+/// Delete the camera's full-size originals once their photos are staged.
+#[tauri::command]
+fn forget_captures() {
+    #[cfg(target_os = "android")]
+    if let Err(e) = android::clean_captures() {
+        eprintln!("deleting camera originals: {e:#}");
+    }
+}
+
+/// A photo the webview can't show (HEIC on a phone) as WebP, for the profile
+/// photo cropper. Resized and stripped like any photo.
+#[tauri::command]
+async fn photo_preview(request: tauri::ipc::Request<'_>) -> Res<String> {
+    let bytes = body_bytes(&request).ok_or("expected the photo's bytes")?;
+    let p = tauri::async_runtime::spawn_blocking(move || photo::process(&bytes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(err)?;
+    Ok(format!("data:image/webp;base64,{}", B64.encode(&p.full)))
 }
 
 #[tauri::command]
@@ -861,6 +965,15 @@ pub fn run() {
             stage_photo,
             stage_photo_url,
             unstage_photo,
+            staged_photos,
+            take_share,
+            stage_shared_photo,
+            end_share,
+            leave_app,
+            forget_captures,
+            system_insets,
+            page_boot,
+            photo_preview,
             create_post,
             add_comment,
             set_reaction,
@@ -891,6 +1004,8 @@ pub fn run() {
             match event {
                 tauri::RunEvent::Resumed => {
                     tray::set_foreground(true);
+                    // Maybe brought back by "Share → Side Tray": the page checks.
+                    let _ = _handle.emit("resumed", ());
                     if let Some(app) = _handle.try_state::<Arc<App>>() {
                         app.wake.notify_one();
                         app.push_wake.notify_one();
