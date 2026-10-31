@@ -863,6 +863,11 @@ fn open_event(st: &State, authors: &CheckedRoster, e: &Event) -> Result<String> 
         },
         "edit" => format!("{who} edited {target}: {text}"),
         "delete" => format!("{who} deleted {target}"),
+        "profile" => {
+            let name = body["display_name"].as_str().map(|n| format!(", name \"{n}\"")).unwrap_or_default();
+            let photo = if body["avatar"].is_object() { "with a photo" } else { "no photo" };
+            format!("{who} updated their profile ({photo}{name})")
+        }
         other => format!("{who}: ({other} event)"),
     };
     Ok(format!("{what}  [certified author, signature ok, key v{}]", e.key_version))

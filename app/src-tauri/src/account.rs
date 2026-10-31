@@ -36,9 +36,15 @@ fn random_id() -> String {
 
 // --- wizard ------------------------------------------------------------------
 
-pub async fn probe(server: &str, ca_pem: Option<&str>) -> Result<GroupInfo> {
+/// Whether a group of exactly this name (ignoring case) exists on the server.
+/// The server never lists its groups, so the name has to come first.
+pub async fn probe(server: &str, ca_pem: Option<&str>, group_name: &str) -> Result<GroupInfo> {
     let server = normalize_server(server)?;
-    Api::new(&server, ca_pem, None)?.get("/group").await
+    let name = group_name.trim();
+    if name.is_empty() {
+        bail!("enter the group's name");
+    }
+    Api::new(&server, ca_pem, None)?.get(&format!("/group?name={}", crate::invite::encode(name))).await
 }
 
 pub struct Registration<'a> {
@@ -404,6 +410,10 @@ pub async fn refresh_roster(app: &App, id: &Identity, api: &Api) -> Result<Check
     }
     // Promotion: believe it only when a verified Key Master certificate says so.
     if let Some(me) = verified.get(&id.device_id) {
+        // A Key Master accepted the name we chose: our certificate carries it now.
+        if me.display_name != id.display_name {
+            db::set_display_name(&tx, &me.display_name)?;
+        }
         if me.role == Role::Keymaster && id.role != "keymaster" {
             db::set_status(&tx, "active", "keymaster")?;
             db::pin_anchor(&tx, &id.device_id, &id.display_name, &id.sign_pubkey)?;

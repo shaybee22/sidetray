@@ -1,6 +1,6 @@
 [package]
 name = "sidetray-app"
-version = "0.6.0"
+version = "0.6.2"
 edition = "2021"
 rust-version = "1.90"
 description = "Side Tray desktop client"
@@ -42,8 +42,15 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 webpki-roots = "1.0.11"
-# A second launch focuses the running app (it may be hidden in the tray).
-tauri-plugin-single-instance = "2.5.5"
+# A second launch focuses the running app (it may be hidden in the tray), and
+# hands it any sidetray:// invite link it was started with.
+tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
+# sidetray://join?server=...&group=... invite links.
+tauri-plugin-deep-link = "2.6.3"
+# The invite link as a QR code (SVG).
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+# SHA-256 fingerprints of a test server's root certificate.
+sha2 = "0.10.9"
 # "Start with Windows" (login item on macOS, autostart entry on Linux).
 tauri-plugin-autostart = "2.7.0"
 

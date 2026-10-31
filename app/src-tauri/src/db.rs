@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS identity (
     id            INTEGER PRIMARY KEY CHECK (id = 1),
     local_id      TEXT NOT NULL,          -- names this install's keychain entry
     server_url    TEXT NOT NULL,
-    ca_pem        TEXT,                   -- root certificate the user pinned for this server, if any
+    ca_pem        TEXT,                   -- test server: the root certificate the person confirmed (pinned)
     group_id      TEXT NOT NULL,
     group_name    TEXT NOT NULL,
     member_id     TEXT NOT NULL,
@@ -98,6 +98,17 @@ CREATE TABLE IF NOT EXISTS media (
     attempts      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS media_post ON media(post_id, idx);
+-- Phase 6b: each member's latest valid profile event (chosen name, avatar).
+CREATE TABLE IF NOT EXISTS profiles (
+    member_id      TEXT PRIMARY KEY,
+    seq            INTEGER NOT NULL,      -- the profile event; a later one replaces it
+    display_name   TEXT,                  -- NULL: the name in their certificate
+    avatar_id      TEXT,                  -- media id of the encrypted 256 px WebP, NULL: initials
+    avatar_digest  BLOB,
+    key_version    INTEGER NOT NULL,
+    avatar_path    TEXT,                  -- file name in the media folder once downloaded and checked
+    attempts       INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS sync_state (
     id            INTEGER PRIMARY KEY CHECK (id = 1),
     last_seq      INTEGER NOT NULL,
@@ -218,12 +229,25 @@ pub fn set_status(conn: &Connection, status: &str, role: &str) -> Result<()> {
     Ok(())
 }
 
+/// The name a Key Master certified for this device changed (they accepted the
+/// name chosen in the profile).
+pub fn set_display_name(conn: &Connection, name: &str) -> Result<()> {
+    conn.execute("UPDATE identity SET display_name = ?1 WHERE id = 1", params![name])?;
+    Ok(())
+}
+
+/// Pin a (new) root certificate for this test server, after the person confirmed its fingerprint.
+pub fn set_ca_pem(conn: &Connection, pem: &str) -> Result<()> {
+    conn.execute("UPDATE identity SET ca_pem = ?1 WHERE id = 1", params![pem])?;
+    Ok(())
+}
+
 /// Forget everything (used to start over after a denied or abandoned join).
 pub fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM identity; DELETE FROM group_keys; DELETE FROM secrets; DELETE FROM anchors;
          DELETE FROM members; DELETE FROM member_devices; DELETE FROM posts; DELETE FROM comments;
-         DELETE FROM reactions; DELETE FROM media; UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0, missed_at = NULL, missed_days = NULL;",
+         DELETE FROM reactions; DELETE FROM media; DELETE FROM profiles; UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0, missed_at = NULL, missed_days = NULL;",
     )?;
     Ok(())
 }

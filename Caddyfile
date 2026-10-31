@@ -7,6 +7,14 @@
 	# No domain yet: Caddy's own local CA. Swap for a real hostname later and drop this line.
 	tls internal
 
+	# Test mode: Caddy's root certificate (public; never the key), so the app can
+	# show its fingerprint for the person to compare with what install.sh printed.
+	handle /sidetray-root.crt {
+		root * /data/caddy/pki/authorities/local
+		rewrite * /root.crt
+		file_server
+	}
+
 	request_body {
 		max_size 12MB
 	}

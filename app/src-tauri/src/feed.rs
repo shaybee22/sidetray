@@ -9,6 +9,7 @@
 //! | reaction | `{"post": event_id, "emoji": str}` (empty emoji removes yours) |
 //! | edit     | `{"post": event_id, "text": str}` |
 //! | delete   | `{"post": event_id}` |
+//! | profile  | `{"display_name"?: str, "avatar": {"id", "digest"} \| null}` (see profile.rs) |
 //!
 //! An event's id is `crypto::event_id(ciphertext)`. Edits and deletes only
 //! count when they come from the post's author.
@@ -59,7 +60,7 @@ struct RefBody {
 }
 
 /// Media ids become file names, so only allow what the relay hands out.
-fn safe_media_id(id: &str) -> bool {
+pub fn safe_media_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
@@ -89,6 +90,8 @@ pub struct SyncReport {
     pub missed: bool,
     /// Key Master: this sync finished a pending key rotation (the new version).
     pub rotated: Option<u32>,
+    /// Avatars that became available (downloaded and checked) in this sync.
+    pub avatars: usize,
 }
 
 /// Who may author events: verified devices in the roster now, and former
@@ -185,6 +188,7 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
         }
     }
     download_media(app, &id, &s, &api).await;
+    report.avatars = crate::profile::download(app, &id, &s, &api).await;
     if let Some(keys) = &km_keys {
         match manage::rotate_if_pending(app, keys).await {
             Some(Ok(r)) if r.devices > 0 => report.rotated = Some(r.key_version),
@@ -246,6 +250,8 @@ fn apply_event(
     let event_id = crypto::event_id(&ct);
     let member = &author.member_id;
     let by_other = *member != id.member_id;
+    // Posts and notifications use the name the author chose, if any.
+    let author_name = || crate::profile::chosen_name(conn, member).unwrap_or_else(|| author.display_name.clone());
     match e.kind.as_str() {
         "post" => {
             let body: PostBody = serde_json::from_slice(&plain).context("bad post payload")?;
@@ -272,7 +278,7 @@ fn apply_event(
             }
             Ok((inserted > 0 && by_other).then(|| Notice {
                 post_id: event_id.clone(),
-                author: author.display_name.clone(),
+                author: author_name(),
                 text: snippet(&body.text, body.photos.len()),
                 comment: false,
                 notify: true,
@@ -295,7 +301,7 @@ fn apply_event(
                 .optional()?;
             Ok(Some(Notice {
                 post_id: b.post.clone(),
-                author: author.display_name.clone(),
+                author: author_name(),
                 text: snippet(&b.text, 0),
                 comment: true,
                 notify: post_author.as_deref() == Some(id.member_id.as_str()),
@@ -339,6 +345,10 @@ fn apply_event(
                 conn.execute("DELETE FROM reactions WHERE post_id = ?1", params![b.post])?;
                 // The files are removed by the next media pass (rows with no live post).
             }
+            Ok(None)
+        }
+        "profile" => {
+            crate::profile::apply(conn, member, e.seq, e.key_version, &plain)?;
             Ok(None)
         }
         other => bail!("unknown event kind {other}"),
@@ -423,7 +433,7 @@ async fn fetch_one(app: &App, api: &Api, gk: &GroupKey, ad: &[u8], row: &str, me
     }
 }
 
-fn write_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub fn write_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("part");
     std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path)?;
@@ -448,7 +458,7 @@ fn remove_deleted_media(app: &App, conn: &Connection) -> Result<()> {
 // --- posting ----------------------------------------------------------------------
 
 /// Encrypt, sign and append one event. Returns its event id.
-async fn send_event(app: &App, kind: &str, body: &serde_json::Value, gk: &GroupKey, media_ids: Vec<String>) -> Result<String> {
+pub async fn send_event(app: &App, kind: &str, body: &serde_json::Value, gk: &GroupKey, media_ids: Vec<String>) -> Result<String> {
     let id = app.require_active()?;
     let s = app.secrets(&id)?;
     let me = s.device_keys()?;
@@ -465,7 +475,7 @@ async fn send_event(app: &App, kind: &str, body: &serde_json::Value, gk: &GroupK
     Ok(crypto::event_id(&ct))
 }
 
-fn latest_key(app: &App, id: &Identity) -> Result<GroupKey> {
+pub fn latest_key(app: &App, id: &Identity) -> Result<GroupKey> {
     let s = app.secrets(id)?;
     secrets::latest_group_key(&app.db(), &s)
 }
@@ -620,6 +630,7 @@ pub struct PostView {
     pub id: String,
     pub seq: i64,
     pub author: String,
+    pub author_avatar: Option<String>,
     pub author_keymaster: bool,
     pub mine: bool,
     pub text: String,
@@ -642,6 +653,7 @@ pub struct PhotoView {
 pub struct CommentView {
     pub id: String,
     pub author: String,
+    pub author_avatar: Option<String>,
     pub mine: bool,
     pub text: String,
     pub created_at: i64,
@@ -669,9 +681,9 @@ const UNKNOWN: &str = "Unknown member";
 /// Newest first, `limit` posts older than `before` (a seq), or the latest.
 pub fn feed(conn: &Connection, me: &str, before: Option<i64>, limit: i64) -> Result<Vec<PostView>> {
     let mut st = conn.prepare(
-        "SELECT p.id, p.seq, p.author_id, COALESCE(m.display_name, ?1), COALESCE(m.role, 'member'), p.body,
-                p.created_at, p.edited_at IS NOT NULL
-         FROM posts p LEFT JOIN members m ON m.id = p.author_id
+        "SELECT p.id, p.seq, p.author_id, COALESCE(pr.display_name, m.display_name, ?1), COALESCE(m.role, 'member'), p.body,
+                p.created_at, p.edited_at IS NOT NULL, pr.avatar_path
+         FROM posts p LEFT JOIN members m ON m.id = p.author_id LEFT JOIN profiles pr ON pr.member_id = p.author_id
          WHERE p.deleted = 0 AND p.seq < ?2 ORDER BY p.seq DESC LIMIT ?3",
     )?;
     let rows = st.query_map(params![UNKNOWN, before.unwrap_or(i64::MAX), limit], |r| {
@@ -682,6 +694,7 @@ pub fn feed(conn: &Connection, me: &str, before: Option<i64>, limit: i64) -> Res
             seq: r.get(1)?,
             mine: author_id == me,
             author: r.get(3)?,
+            author_avatar: r.get::<_, Option<String>>(8)?.as_deref().map(media_url),
             author_keymaster: role == Role::Keymaster.as_str(),
             text: r.get(5)?,
             created_at: r.get(6)?,
@@ -695,12 +708,14 @@ pub fn feed(conn: &Connection, me: &str, before: Option<i64>, limit: i64) -> Res
 
     let mut photos = conn.prepare("SELECT thumb_path, local_path, width, height FROM media WHERE post_id = ?1 ORDER BY idx")?;
     let mut comments = conn.prepare(
-        "SELECT c.id, c.author_id, COALESCE(m.display_name, ?2), c.body, c.created_at
-         FROM comments c LEFT JOIN members m ON m.id = c.author_id WHERE c.post_id = ?1 ORDER BY c.seq",
+        "SELECT c.id, c.author_id, COALESCE(pr.display_name, m.display_name, ?2), c.body, c.created_at, pr.avatar_path
+         FROM comments c LEFT JOIN members m ON m.id = c.author_id LEFT JOIN profiles pr ON pr.member_id = c.author_id
+         WHERE c.post_id = ?1 ORDER BY c.seq",
     )?;
     let mut reactions = conn.prepare(
-        "SELECT r.emoji, r.author_id, COALESCE(m.display_name, ?2) FROM reactions r
-         LEFT JOIN members m ON m.id = r.author_id WHERE r.post_id = ?1 ORDER BY r.seq",
+        "SELECT r.emoji, r.author_id, COALESCE(pr.display_name, m.display_name, ?2) FROM reactions r
+         LEFT JOIN members m ON m.id = r.author_id LEFT JOIN profiles pr ON pr.member_id = r.author_id
+         WHERE r.post_id = ?1 ORDER BY r.seq",
     )?;
     for p in &mut posts {
         p.photos = photos
@@ -718,7 +733,14 @@ pub fn feed(conn: &Connection, me: &str, before: Option<i64>, limit: i64) -> Res
         p.comments = comments
             .query_map(params![p.id, UNKNOWN], |r| {
                 let author_id: String = r.get(1)?;
-                Ok(CommentView { id: r.get(0)?, mine: author_id == me, author: r.get(2)?, text: r.get(3)?, created_at: r.get(4)? })
+                Ok(CommentView {
+                    id: r.get(0)?,
+                    mine: author_id == me,
+                    author: r.get(2)?,
+                    author_avatar: r.get::<_, Option<String>>(5)?.as_deref().map(media_url),
+                    text: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
             })?
             .collect::<rusqlite::Result<_>>()?;
         let mut grouped: Vec<ReactionView> = Vec::new();
@@ -924,6 +946,24 @@ mod tests {
         assert!(f.apply(&before).unwrap().is_some());
         let err = f.apply(&after).unwrap_err();
         assert!(format!("{err}").contains("removed"), "{err}");
+    }
+
+    #[test]
+    fn profile_names_show_on_posts_and_notices() {
+        let mut f = fixture();
+        let (pr, _) = f.event("profile", serde_json::json!({ "display_name": "Ana Banana", "avatar": null }));
+        assert!(f.apply(&pr).unwrap().is_none());
+        let (post, pid) = f.event("post", serde_json::json!({ "text": "hi" }));
+        assert_eq!(f.apply(&post).unwrap().unwrap().author, "Ana Banana");
+        let (c, _) = f.event("comment", serde_json::json!({ "post": pid, "text": "me again" }));
+        f.apply(&c).unwrap();
+        let view = feed(&f.conn, "m_me", None, 50).unwrap();
+        assert_eq!(view[0].author, "Ana Banana");
+        assert_eq!(view[0].comments[0].author, "Ana Banana");
+        assert_eq!(view[0].author_avatar, None);
+        // A malformed profile event is rejected like any other bad event.
+        let (bad, _) = f.event("profile", serde_json::json!({ "display_name": "" }));
+        assert!(f.apply(&bad).is_err());
     }
 
     #[test]

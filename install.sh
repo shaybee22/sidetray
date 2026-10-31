@@ -316,6 +316,8 @@ caddy_site() {
 }
 EOF
 }
+caddyfile_before=""
+[ -f "$DIR/Caddyfile" ] && caddyfile_before=$(sha256sum <"$DIR/Caddyfile")
 if [ "$MODE" = production ]; then
   { cat <<'EOF'
 # Written by install.sh (production mode). Re-running it rewrites this file and keeps a .bak.
@@ -336,8 +338,17 @@ else
 }
 
 {$SIDETRAY_HOST} {
-	# No domain: Caddy's own local CA. Apps need its root certificate (sidetray-root.crt).
+	# No domain: Caddy's own local CA. Apps pin its root certificate after the
+	# person confirms its fingerprint (the one printed at the end of install.sh).
 	tls internal
+
+	# Test mode: Caddy's root certificate (public; never the key), so the app can
+	# show its fingerprint for the person to compare with what install.sh printed.
+	handle /sidetray-root.crt {
+		root * /data/caddy/pki/authorities/local
+		rewrite * /root.crt
+		file_server
+	}
 
 EOF
     caddy_site; } | put "$DIR/Caddyfile"
@@ -402,6 +413,12 @@ fi
 
 step "Building and starting the relay (the first build takes a minute or two)"
 compose up -d --build --remove-orphans
+# The Caddyfile is bind-mounted as a single file, and put() replaces it, so a
+# running Caddy still sees the old one: restart it when the file changed.
+if [ -n "$caddyfile_before" ] && [ "$caddyfile_before" != "$(sha256sum <"$DIR/Caddyfile")" ]; then
+  say "  the Caddyfile changed: restarting Caddy"
+  compose restart caddy >/dev/null
+fi
 
 step "Waiting for https://$HOST/api/v1/health"
 ok=0
@@ -452,7 +469,7 @@ else
   say "Mode:            TEST (Caddy's own certificate authority)"
   say "Root certificate: $DIR/sidetray-root.crt"
   command -v openssl >/dev/null && say "                 $(openssl x509 -noout -fingerprint -sha256 -in "$DIR/sidetray-root.crt" | sed 's/^.*Fingerprint=/SHA-256 /')"
-  say "                 Paste it into the app's wizard under Advanced, or curl with --cacert."
+  say "                 The app shows this fingerprint when someone first connects; it must match."
 fi
 say "Retention:       $RETENTION days"
 say "Settings:        $DIR/.env, $DIR/Caddyfile; data in Docker volumes sidetray_api_data and sidetray_caddy_data"

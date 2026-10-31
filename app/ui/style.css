@@ -212,7 +212,7 @@ button.ghost.danger:hover { border-color: var(--danger); }
 
 /* Phase 6: members, confirmations, removal, missed posts */
 .banner { display: flex; align-items: center; gap: 12px; }
-.banner > span { flex: 1; }
+.banner > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .banner.warn { background: var(--code-bg); border: 1px solid var(--code-line); width: 100%; margin: 0 0 16px; }
 #readonly-banner { background: var(--surface-2); border: 1px solid var(--line); }
 .member { border-top: 1px solid var(--line); padding: 14px 0; }
@@ -236,3 +236,47 @@ button.primary.danger { background: var(--danger); border-color: var(--danger); 
 .readonly .react.add, .readonly .post-delete, .readonly #missed-banner { display: none !important; }
 .readonly .react { pointer-events: none; }
 @media (max-width: 560px) { .devices { margin-left: 0; } .member-head { flex-wrap: wrap; } }
+
+/* Phase 6b: test-server fingerprints, invites, avatars, the photo cropper */
+.warn-text { color: var(--danger); }
+#wz-invite-note { margin-bottom: 14px; }
+.fingerprint {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .92rem; font-weight: 600;
+  letter-spacing: .02em; line-height: 1.7; background: var(--code-bg); border: 1px solid var(--code-line);
+  border-radius: 8px; padding: 10px 12px; overflow-wrap: anywhere; user-select: all;
+}
+.fingerprint.small { font-size: .8rem; margin: 8px 0; }
+.actions.start { justify-content: flex-start; }
+.banner.danger { background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger); }
+.banner.danger button { color: var(--danger); }
+.invite { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+.invite-link { display: flex; gap: 8px; width: 100%; }
+.invite-link input { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .8rem; }
+.qr { width: 200px; height: 200px; border-radius: 8px; background: #fff; padding: 6px; border: 1px solid var(--line); image-rendering: pixelated; }
+.invite .hint { margin: 0; }
+.avatar { overflow: hidden; }
+.avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.avatar.big { width: 88px; height: 88px; font-size: 2.2rem; }
+.avatar.tiny { width: 24px; height: 24px; font-size: .72rem; }
+.comment { display: flex; gap: 8px; align-items: flex-start; }
+.comment .avatar.tiny { margin-top: 1px; }
+.comment-body { min-width: 0; flex: 1; }
+.profile { display: flex; gap: 16px; align-items: center; margin-bottom: 14px; }
+.profile-photo { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex: 1; min-width: 0; }
+.profile-photo .hint { flex-basis: 100%; margin: 0; }
+.inline-field { display: flex; gap: 8px; }
+.m-chosen { margin-top: 2px; }
+dialog#crop { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); box-shadow: var(--shadow); padding: 22px; width: min(360px, calc(100% - 32px)); }
+dialog#crop::backdrop { background: rgba(10, 10, 10, .55); }
+dialog#crop p { margin: 0; }
+.crop-frame {
+  position: relative; width: 280px; aspect-ratio: 1; max-width: 100%; margin: 0 auto; overflow: hidden;
+  border-radius: 12px; background: #111; cursor: grab; touch-action: none; user-select: none;
+}
+.crop-frame.dragging { cursor: grabbing; }
+.crop-frame:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.crop-frame img { position: absolute; left: 0; top: 0; max-width: none; transform-origin: 0 0; pointer-events: none; }
+/* The circle that's kept; everything outside it is dimmed. */
+.crop-frame::after { content: ""; position: absolute; inset: 0; border-radius: 50%; box-shadow: 0 0 0 999px rgba(0, 0, 0, .55); outline: 2px solid rgba(255, 255, 255, .85); pointer-events: none; }
+.zoom { flex-direction: row; align-items: center; gap: 10px; }
+.zoom input { flex: 1; padding: 0; }

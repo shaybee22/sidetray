@@ -4,15 +4,19 @@
 //! Side Tray desktop client (SPEC.md Phases 4-6): first-run wizard, join and
 //! Key Master screens, the feed, photo upload; sync on WebSocket pushes, a
 //! tray icon with an unread badge, and native notifications; the member list,
-//! removal, device revocation and group key rotation.
+//! removal, device revocation and group key rotation. Phase 6b: per-server
+//! certificate trust (public roots, or a test server's pinned root), invite
+//! links (`sidetray://join?...`), avatars and chosen display names.
 
 mod account;
 mod alerts;
 mod api;
 mod db;
 mod feed;
+mod invite;
 mod manage;
 mod photo;
+mod profile;
 mod push;
 mod secrets;
 mod state;
@@ -27,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_deep_link::DeepLinkExt as _;
 
 /// Sync interval while the push socket is down.
 const POLL_EVERY: Duration = Duration::from_secs(30);
@@ -68,6 +73,15 @@ struct AppView {
     live: bool,
     /// The relay pruned posts this device never got: (when noticed, retention days).
     missed: Option<(i64, f64)>,
+    /// A test server (bare IP, or a pinned root): labelled as such on This device.
+    test_server: bool,
+    /// SHA-256 of the pinned root certificate, for a test server.
+    cert_fingerprint: Option<String>,
+    /// The server's certificate was refused on the last try (what to tell the person).
+    cert_problem: Option<String>,
+    /// What the group sees: the chosen name, or the certified one.
+    shown_name: Option<String>,
+    avatar: Option<String>,
 }
 
 #[tauri::command]
@@ -80,6 +94,9 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
     let unread = db::unread(&conn).map_err(err)?;
     let live = app.push_connected.load(Ordering::SeqCst);
     let missed = db::missed(&conn).map_err(err)?;
+    drop(conn);
+    let cert_problem = app.cert_problem.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mine = id.as_ref().filter(|i| i.status != "pending" && i.status != "denied").and_then(|_| profile::mine(&app).ok());
     Ok(match id {
         None => AppView {
             stage: "setup".into(),
@@ -98,8 +115,18 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             unread,
             live,
             missed: None,
+            test_server: false,
+            cert_fingerprint: None,
+            cert_problem: None,
+            shown_name: None,
+            avatar: None,
         },
         Some(id) => AppView {
+            test_server: id.ca_pem.is_some() || api::is_ip_server(&id.server_url),
+            cert_fingerprint: id.ca_pem.as_deref().and_then(|p| api::fingerprint(p).ok()),
+            cert_problem,
+            shown_name: mine.as_ref().map(|m| m.display_name.clone()),
+            avatar: mine.and_then(|m| m.avatar),
             stage: id.status.clone(),
             keymaster: id.is_keymaster(),
             safety_code: Some(crypto::safety_code(&id.public())),
@@ -120,40 +147,92 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
     })
 }
 
-#[derive(Serialize)]
-struct Defaults {
-    server: &'static str,
-    has_pinned_root: bool,
-}
-
-#[tauri::command]
-fn wizard_defaults() -> Defaults {
-    Defaults { server: "https://10.1.1.188", has_pinned_root: !api::PINNED_ROOTS.trim().is_empty() }
-}
-
 // --- wizard and join -----------------------------------------------------------------
 
+#[derive(Serialize)]
+struct ServerCheck {
+    server: String,
+    /// A test server: the person must compare `fingerprint` with what the
+    /// server's installer printed before the app trusts it.
+    test_mode: bool,
+    fingerprint: Option<String>,
+}
+
+/// Step 1: work out how to trust the server. A domain uses the public web
+/// roots (checked by connecting); a bare IP address, or a pasted root, is a
+/// test server whose root waits for the person to confirm its fingerprint.
 #[tauri::command]
-async fn probe_server(server: String, ca_pem: Option<String>) -> Res<api::GroupInfo> {
-    account::probe(&server, ca_pem.as_deref()).await.map_err(err)
+async fn check_server(app: State<'_, Arc<App>>, server: String, ca_pem: Option<String>) -> Res<ServerCheck> {
+    let server = api::normalize_server(&server).map_err(err)?;
+    let pasted = ca_pem.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    let root_pem = match pasted {
+        Some(pem) => {
+            api::check_pinned(&server, &pem).await.map_err(err)?;
+            Some(pem + "\n")
+        }
+        None if api::is_https(&server) && api::is_ip_server(&server) => Some(api::fetch_root(&server).await.map_err(err)?),
+        None => {
+            // A domain (or plain http to this computer): the normal checks, now.
+            let health: anyhow::Result<serde_json::Value> = api::Api::new(&server, None, None).map_err(err)?.get("/health").await;
+            match health {
+                Ok(_) => {}
+                Err(e) if e.chain().any(|c| c.downcast_ref::<api::HttpError>().is_some()) => {
+                    return Err(format!("{server} answered, but it isn't a Side Tray server. Check the address."));
+                }
+                Err(e) => return Err(err(e)),
+            }
+            None
+        }
+    };
+    let fingerprint = root_pem.as_deref().map(api::fingerprint).transpose().map_err(err)?;
+    let trust =
+        state::ServerTrust { server: server.clone(), confirmed: root_pem.is_none(), root_pem, fingerprint: fingerprint.clone() };
+    *app.wizard_server.lock().unwrap_or_else(|e| e.into_inner()) = Some(trust);
+    Ok(ServerCheck { server, test_mode: fingerprint.is_some(), fingerprint })
+}
+
+/// The person compared the fingerprint and it matches.
+#[tauri::command]
+fn trust_server(app: State<'_, Arc<App>>, fingerprint: String) -> Res<()> {
+    let mut w = app.wizard_server.lock().unwrap_or_else(|e| e.into_inner());
+    let t = w.as_mut().ok_or("check the server first")?;
+    match &t.fingerprint {
+        Some(fp) if api::same_fingerprint(fp, &fingerprint) => {
+            t.confirmed = true;
+            Ok(())
+        }
+        _ => Err("that isn't the certificate that was checked; start again".into()),
+    }
+}
+
+fn confirmed_server(app: &App) -> Res<state::ServerTrust> {
+    match app.wizard_server.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        Some(t) if t.confirmed => Ok(t),
+        Some(_) => Err("confirm the server's certificate first".into()),
+        None => Err("check the server first".into()),
+    }
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
+async fn probe_group(app: State<'_, Arc<App>>, group_name: String) -> Res<api::GroupInfo> {
+    let t = confirmed_server(&app)?;
+    account::probe(&t.server, t.root_pem.as_deref(), &group_name).await.map_err(err)
+}
+
+#[tauri::command]
 async fn register(
     app: State<'_, Arc<App>>,
-    server: String,
-    ca_pem: Option<String>,
     group_name: String,
     display_name: String,
     email: String,
     setup_token: Option<String>,
 ) -> Res<String> {
+    let t = confirmed_server(&app)?;
     let code = account::register(
         &app,
         account::Registration {
-            server: &server,
-            ca_pem: ca_pem.as_deref(),
+            server: &t.server,
+            ca_pem: t.root_pem.as_deref(),
             group_name: &group_name,
             display_name: &display_name,
             email: &email,
@@ -165,6 +244,23 @@ async fn register(
     app.wake.notify_one();
     app.push_wake.notify_one();
     Ok(code)
+}
+
+/// The invite link that opened the app, if the wizard hasn't taken it yet.
+#[tauri::command]
+fn take_invite(app: State<'_, Arc<App>>) -> Option<state::InviteMsg> {
+    app.pending_invite.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// A `sidetray://` link reached the app (at launch, or from a second launch).
+fn got_link(handle: &AppHandle, app: &App, url: &str) {
+    let msg = match invite::parse(url) {
+        Ok(i) => state::InviteMsg { invite: Some(i), error: None },
+        Err(e) => state::InviteMsg { invite: None, error: Some(format!("{e:#}")) },
+    };
+    *app.pending_invite.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+    let _ = handle.emit("invite", ());
+    tray::show_main(handle);
 }
 
 #[tauri::command]
@@ -200,6 +296,96 @@ async fn approve(app: State<'_, Arc<App>>, device_id: String, code: String, as_k
 #[tauri::command]
 async fn deny(app: State<'_, Arc<App>>, device_id: String) -> Res<()> {
     account::deny(&app, &device_id).await.map_err(err)
+}
+
+#[derive(Serialize)]
+struct InviteView {
+    link: String,
+    qr: String,
+}
+
+#[tauri::command]
+fn invite_link(app: State<'_, Arc<App>>) -> Res<InviteView> {
+    let id = app.require_keymaster().map_err(err)?;
+    let link = invite::link(&id.server_url, &id.group_name).map_err(err)?;
+    Ok(InviteView { qr: invite::qr_data_url(&link).map_err(err)?, link })
+}
+
+// --- profile (Phase 6b) --------------------------------------------------------------
+
+#[tauri::command]
+fn get_profile(app: State<'_, Arc<App>>) -> Res<profile::MyProfile> {
+    profile::mine(&app).map_err(err)
+}
+
+#[tauri::command]
+async fn set_display_name(app: State<'_, Arc<App>>, name: String) -> Res<profile::MyProfile> {
+    profile::save(&app, Some(&name), profile::AvatarChange::Keep).await.map_err(err)?;
+    profile::mine(&app).map_err(err)
+}
+
+/// The cropped photo from the app's canvas as the raw request body (a PNG).
+#[tauri::command]
+async fn set_avatar(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) -> Res<profile::MyProfile> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected the cropped photo".into());
+    };
+    profile::save(&app, None, profile::AvatarChange::New(bytes.clone())).await.map_err(err)?;
+    profile::mine(&app).map_err(err)
+}
+
+#[tauri::command]
+async fn remove_avatar(app: State<'_, Arc<App>>) -> Res<profile::MyProfile> {
+    profile::save(&app, None, profile::AvatarChange::Remove).await.map_err(err)?;
+    profile::mine(&app).map_err(err)
+}
+
+#[tauri::command]
+async fn accept_name(app: State<'_, Arc<App>>, member_id: String) -> Res<String> {
+    let name = manage::accept_name(&app, &member_id).await.map_err(err)?;
+    app.wake.notify_one();
+    Ok(name)
+}
+
+// --- the server's certificate (test servers) -------------------------------------------
+
+#[derive(Serialize)]
+struct CertCheck {
+    pinned: Option<String>,
+    current: String,
+    same: bool,
+}
+
+/// Fetch a test server's current root certificate to compare with the pinned one.
+#[tauri::command]
+async fn check_server_cert(app: State<'_, Arc<App>>) -> Res<CertCheck> {
+    let id = app.require_identity().map_err(err)?;
+    if id.ca_pem.is_none() && !api::is_ip_server(&id.server_url) {
+        return Err("this server uses a publicly trusted certificate; there's nothing to pin".into());
+    }
+    let pem = api::fetch_root(&id.server_url).await.map_err(err)?;
+    let current = api::fingerprint(&pem).map_err(err)?;
+    let pinned = id.ca_pem.as_deref().and_then(|p| api::fingerprint(p).ok());
+    let same = pinned.as_deref().is_some_and(|p| api::same_fingerprint(p, &current));
+    *app.repin.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(state::ServerTrust { server: id.server_url, root_pem: Some(pem), fingerprint: Some(current.clone()), confirmed: false });
+    Ok(CertCheck { pinned, current, same })
+}
+
+/// The server's operator confirmed the new fingerprint: pin that root instead.
+#[tauri::command]
+fn repin_server_cert(app: State<'_, Arc<App>>, fingerprint: String) -> Res<()> {
+    let id = app.require_identity().map_err(err)?;
+    let t = app.repin.lock().unwrap_or_else(|e| e.into_inner()).take().ok_or("check the certificate first")?;
+    let (Some(pem), Some(fp)) = (t.root_pem, t.fingerprint) else { return Err("check the certificate first".into()) };
+    if t.server != id.server_url || !api::same_fingerprint(&fp, &fingerprint) {
+        return Err("that isn't the certificate that was checked; check again".into());
+    }
+    db::set_ca_pem(&app.db(), &pem).map_err(err)?;
+    app.set_cert_problem(None);
+    app.wake.notify_one();
+    app.push_wake.notify_one();
+    Ok(())
 }
 
 // --- members (Phase 6) ------------------------------------------------------------------
@@ -263,10 +449,13 @@ pub async fn removed_check(handle: &AppHandle, app: &App) {
 async fn sync_now(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<feed::SyncReport> {
     match feed::sync_once(&app).await {
         Ok(r) => {
+            app.set_cert_problem(None);
             let _ = handle.emit("synced", &r);
             Ok(r)
         }
         Err(e) => {
+            note_sync_error(&app, &e);
+            let _ = handle.emit("sync-error", format!("{e:#}"));
             if api::is_status(&e, 401) {
                 removed_check(&handle, &app).await;
             }
@@ -393,6 +582,13 @@ fn serve_media(app: &App, path: &str) -> tauri::http::Response<Vec<u8>> {
 
 // --- background sync ---------------------------------------------------------------------
 
+/// Remember a refused certificate, so the app can say so plainly (and keep saying it).
+fn note_sync_error(app: &App, e: &anyhow::Error) {
+    if let Some(c) = e.chain().find_map(|c| c.downcast_ref::<api::CertError>()) {
+        app.set_cert_problem(Some(c.to_string()));
+    }
+}
+
 fn spawn_sync_loop(handle: AppHandle, app: Arc<App>) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -400,9 +596,11 @@ fn spawn_sync_loop(handle: AppHandle, app: Arc<App>) {
             if active {
                 match feed::sync_once(&app).await {
                     Ok(r) => {
+                        app.set_cert_problem(None);
                         let _ = handle.emit("synced", &r);
                     }
                     Err(e) => {
+                        note_sync_error(&app, &e);
                         if api::is_status(&e, 401) {
                             // Token refused: removed or revoked while we weren't connected?
                             removed_check(&handle, &app).await;
@@ -426,8 +624,10 @@ fn main() {
     let side_by_side = std::env::var_os("SIDETRAY_DATA_DIR").is_some();
     let mut builder = tauri::Builder::default();
     if !side_by_side {
+        // With the deep-link feature, a second launch's sidetray:// link reaches this copy's on_open_url.
         builder = builder.plugin(tauri_plugin_single_instance::init(|handle, _args, _cwd| tray::show_main(handle)));
     }
+    builder = builder.plugin(tauri_plugin_deep_link::init());
     #[cfg(not(windows))]
     {
         builder = builder.plugin(tauri_plugin_notification::init());
@@ -467,15 +667,44 @@ fn main() {
             if !std::env::args().any(|a| a == MINIMIZED_ARG) {
                 tray::show_main(&handle);
             }
+            // No installer until Phase 7: register sidetray:// for this user (HKCU on Windows) at every start.
+            #[cfg(any(windows, target_os = "linux"))]
+            if let Err(e) = tauri_app.deep_link().register_all() {
+                eprintln!("registering sidetray:// links: {e}");
+            }
+            {
+                let (h, a) = (handle.clone(), app.clone());
+                tauri_app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        got_link(&h, &a, url.as_str());
+                    }
+                });
+            }
+            // Started by clicking a link.
+            if let Ok(Some(urls)) = tauri_app.deep_link().get_current() {
+                for url in urls {
+                    got_link(&handle, &app, url.as_str());
+                }
+            }
             spawn_sync_loop(handle.clone(), app.clone());
             push::spawn(handle, app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
-            wizard_defaults,
-            probe_server,
+            check_server,
+            trust_server,
+            probe_group,
             register,
+            take_invite,
+            invite_link,
+            get_profile,
+            set_display_name,
+            set_avatar,
+            remove_avatar,
+            accept_name,
+            check_server_cert,
+            repin_server_cert,
             join_progress,
             confirm_approval,
             reset,

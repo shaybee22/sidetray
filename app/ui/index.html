@@ -20,24 +20,39 @@
     <h1>Welcome</h1>
     <p class="lede">A private feed for one group of friends and family. Posts are encrypted on this computer before they leave it.</p>
 
+    <p class="note" id="wz-invite-note" hidden>Opened from an invite link.</p>
+
     <form id="wz-server" class="stack" novalidate>
       <label>Server address
-        <input id="wz-url" required autocomplete="off" spellcheck="false" placeholder="https://example.org">
+        <input id="wz-url" required autocomplete="off" spellcheck="false" placeholder="tray.example.org">
+      </label>
+      <label>Group name <span class="hint">exactly as you were told: servers don't list their groups</span>
+        <input id="wz-group" required autocomplete="off" maxlength="100">
       </label>
       <details>
-        <summary>Advanced: server certificate</summary>
-        <p class="hint">This app trusts the root certificate built into it for your server. If your server uses a different private certificate authority, paste its root certificate (PEM) here.</p>
+        <summary>Advanced: test server certificate</summary>
+        <p class="hint">A server on a domain needs nothing here. A test server reached by its IP address offers its own root certificate, and you'll be asked to check its fingerprint. You can paste that root certificate (PEM) here instead.</p>
         <textarea id="wz-ca" rows="5" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
       </details>
       <p class="error" id="wz-server-err" hidden></p>
       <div class="actions"><button class="primary" id="wz-continue">Continue</button></div>
     </form>
 
+    <div id="wz-trust" class="stack" hidden>
+      <p class="eyebrow warn-text">Test server</p>
+      <h2>Check the server's certificate</h2>
+      <p><b id="wz-trust-server"></b> uses its own certificate instead of a public one. Ask whoever set it up for the SHA-256 fingerprint the installer printed, and check that every pair matches:</p>
+      <div class="fingerprint" id="wz-fp"></div>
+      <p class="hint">If anything differs, stop here: someone could be intercepting the connection. Once you confirm, this app trusts that certificate for this server and refuses any other.</p>
+      <p class="error" id="wz-trust-err" hidden></p>
+      <div class="actions">
+        <button type="button" class="ghost" id="wz-trust-back">Back</button>
+        <button type="button" class="primary" id="wz-trust-ok">It matches</button>
+      </div>
+    </div>
+
     <form id="wz-details" class="stack" novalidate hidden>
       <p class="note" id="wz-found"></p>
-      <label>Group name
-        <input id="wz-group" required autocomplete="off" maxlength="100">
-      </label>
       <label>Your name <span class="hint">as the group will see it</span>
         <input id="wz-name" required autocomplete="name" maxlength="100">
       </label>
@@ -123,6 +138,11 @@
     </div>
   </header>
 
+  <div class="banner danger" id="cert-banner" role="alert" hidden>
+    <span id="cert-text"></span>
+    <button class="ghost small" id="cert-review">Details</button>
+  </div>
+
   <div class="banner" id="readonly-banner" hidden>
     <span id="readonly-text">Saved posts from a group you're no longer in. Read only.</span>
     <button class="ghost small" id="readonly-back">Back</button>
@@ -161,6 +181,20 @@
 
   <section class="panel" id="panel-km" hidden>
     <div class="card">
+      <h2>Invite someone</h2>
+      <p class="hint">An invite link opens Side Tray with this server and group filled in; they only type their name and email. It grants nothing by itself: you still approve them here after the phone call.</p>
+      <div class="actions start"><button class="primary" id="inv-make">Invite</button></div>
+      <div id="inv-box" class="invite" hidden>
+        <div class="invite-link">
+          <input id="inv-link" readonly spellcheck="false" aria-label="Invite link">
+          <button class="ghost" id="inv-copy">Copy</button>
+        </div>
+        <img id="inv-qr" class="qr" alt="QR code of the invite link">
+        <p class="hint">Send the link by message or email, or let them scan the code. Side Tray has to be installed first.</p>
+      </div>
+      <p class="error" id="inv-err" hidden></p>
+    </div>
+    <div class="card">
       <h2>Join requests</h2>
       <p class="hint">For each request, phone the person and have them read you their code. Type what you hear. The app only approves it if it matches.</p>
       <div id="pending"></div>
@@ -175,11 +209,37 @@
   </section>
 
   <section class="panel" id="panel-device" hidden>
+    <div class="card" id="profile-card">
+      <h2>Profile</h2>
+      <div class="profile">
+        <span class="avatar big" id="pf-avatar" aria-hidden="true"></span>
+        <div class="profile-photo">
+          <label class="button ghost">Choose photo<input id="pf-file" type="file" accept="image/*" hidden></label>
+          <button class="ghost danger" id="pf-remove" hidden>Remove photo</button>
+          <p class="hint">Optional. Everyone in the group sees it next to your posts. Without one, your initial is shown.</p>
+        </div>
+      </div>
+      <form id="pf-name-form" class="stack" novalidate>
+        <label>Your name
+          <span class="inline-field"><input id="pf-name" maxlength="100" autocomplete="name"><button class="ghost" id="pf-name-save">Save name</button></span>
+        </label>
+      </form>
+      <p class="note" id="pf-note" hidden></p>
+      <p class="error" id="pf-err" hidden></p>
+    </div>
     <div class="card">
       <h2>Settings</h2>
       <label class="check"><input type="checkbox" id="set-autostart"> Start Side Tray when I sign in <span class="hint">It opens quietly in the tray.</span></label>
       <p class="hint">Closing the window keeps Side Tray running in the tray so it can tell you about new posts. To stop it, right-click the tray icon and choose Quit.</p>
       <p class="error" id="set-err" hidden></p>
+    </div>
+    <div class="card" id="cert-card">
+      <h2>Server certificate</h2>
+      <p id="srv-mode"></p>
+      <div class="fingerprint small" id="srv-fp" hidden></div>
+      <div class="actions start"><button class="ghost" id="srv-check" hidden>Check it again</button></div>
+      <div id="srv-result" class="stack" hidden></div>
+      <p class="error" id="srv-err" hidden></p>
     </div>
     <div class="card">
       <h2>This device</h2>
@@ -221,8 +281,10 @@
       <div class="member-who">
         <div><b class="m-name"></b> <span class="tag m-role" hidden>Key Master</span> <span class="muted small m-you" hidden>you</span></div>
         <div class="small m-cert"></div>
+        <div class="small muted m-chosen" hidden></div>
       </div>
       <div class="member-actions">
+        <button class="ghost small m-accept" hidden>Accept new name</button>
         <button class="ghost small m-promote" hidden>Make Key Master</button>
         <button class="ghost small danger m-remove" hidden>Remove</button>
       </div>
@@ -230,6 +292,22 @@
     <ul class="devices"></ul>
   </div>
 </template>
+
+<dialog id="crop" aria-labelledby="crop-title">
+  <form method="dialog" class="stack">
+    <h2 id="crop-title">Position your photo</h2>
+    <p class="hint">Drag to move it, and zoom with the slider or the mouse wheel. Only what's inside the circle is kept.</p>
+    <div class="crop-frame" id="crop-frame" tabindex="0" aria-label="Photo position: arrow keys move it, plus and minus zoom">
+      <img id="crop-img" alt="" draggable="false">
+    </div>
+    <label class="zoom">Zoom <input type="range" id="crop-zoom" min="1" max="4" step="0.01" value="1"></label>
+    <p class="error" id="crop-err" hidden></p>
+    <div class="actions">
+      <button value="cancel" class="ghost" id="crop-cancel">Cancel</button>
+      <button type="button" class="primary" id="crop-save">Save photo</button>
+    </div>
+  </form>
+</dialog>
 
 <dialog id="confirm" aria-labelledby="cf-title">
   <form method="dialog" class="stack">

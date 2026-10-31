@@ -1,25 +1,31 @@
 //! Async client for the relay's /api/v1 (same wire types as the CLI's api.rs).
 //!
-//! TLS trust: if this build pins root certificates (`pinned-roots.pem`), or the
-//! user gave one for their server in the wizard, the client trusts exactly
-//! those roots and nothing else. With neither, it uses the public web roots.
-//! Verification is never turned off.
+//! TLS trust is per server (SPEC "Production certificate mode"):
+//! - a server on a domain is checked against the public web roots (webpki
+//!   roots, as browsers do), so a Let's Encrypt certificate just works;
+//! - a test server (a bare IP address, or a root pasted under Advanced) has
+//!   its own root certificate pinned in the identity, after the person
+//!   confirmed its SHA-256 fingerprint. Then that root and nothing else is
+//!   trusted, and a server presenting anything else is refused.
+//!
+//! Verification is never turned off, except to download a test server's root
+//! certificate for that confirmation (`fetch_root`), which trusts nothing it
+//! fetches until the person has compared the fingerprint.
 
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, RequestBuilder};
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
-
-/// Roots compiled into this build: Caddy's internal CA for the test relay.
-/// Empty the file to fall back to the public web roots (e.g. once the server
-/// has a real domain and a Let's Encrypt certificate).
-pub const PINNED_ROOTS: &str = include_str!("../pinned-roots.pem");
 
 #[derive(Clone)]
 pub struct Api {
     http: Client,
     base: String,
     token: Option<String>,
+    /// Fingerprint of the pinned root, for a test server.
+    pinned: Option<String>,
 }
 
 /// Normalise a server address. HTTPS only, except plain HTTP to this computer
@@ -39,36 +45,107 @@ pub fn normalize_server(url: &str) -> Result<String> {
     if u.query().is_some() || u.fragment().is_some() {
         bail!("the server address shouldn't have ? or # in it");
     }
+    if u.path() != "/" {
+        bail!("the server address is just the name or IP address, with nothing after it");
+    }
     Ok(u.as_str().trim_end_matches('/').to_string())
 }
 
-fn roots(ca_pem: Option<&str>) -> Result<Vec<reqwest::Certificate>> {
-    let pem = ca_pem.filter(|p| !p.trim().is_empty()).unwrap_or(PINNED_ROOTS);
-    if pem.trim().is_empty() {
-        return Ok(Vec::new());
+/// A bare IP address can't have a public certificate, so it's a test server.
+pub fn is_ip_server(server: &str) -> bool {
+    reqwest::Url::parse(server)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok()))
+        .unwrap_or(false)
+}
+
+pub fn is_https(server: &str) -> bool {
+    server.starts_with("https://")
+}
+
+/// The single certificate in `pem`, DER-encoded.
+fn one_cert(pem: &str) -> Result<CertificateDer<'static>> {
+    let mut certs = CertificateDer::pem_slice_iter(pem.as_bytes());
+    let first = certs
+        .next()
+        .context("that isn't a certificate (expected -----BEGIN CERTIFICATE-----)")?
+        .context("reading the certificate")?;
+    if certs.next().is_some() {
+        bail!("expected one root certificate, found several");
     }
-    let certs = reqwest::Certificate::from_pem_bundle(pem.as_bytes()).context("reading the pinned root certificate")?;
-    if certs.is_empty() {
-        bail!("the pinned root certificate file has no certificates in it");
+    Ok(first)
+}
+
+/// SHA-256 of the certificate, as `openssl x509 -fingerprint -sha256` prints
+/// it (and so install.sh): `AB:CD:...`, 32 bytes.
+pub fn fingerprint(pem: &str) -> Result<String> {
+    let der = one_cert(pem)?;
+    Ok(Sha256::digest(der.as_ref()).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":"))
+}
+
+/// Fingerprints compare ignoring case, spaces and colons.
+pub fn same_fingerprint(a: &str, b: &str) -> bool {
+    let n = |s: &str| -> String { s.chars().filter(|c| c.is_ascii_hexdigit()).map(|c| c.to_ascii_uppercase()).collect() };
+    n(a).len() == 64 && n(a) == n(b)
+}
+
+/// Download a test server's root certificate (Caddy serves it at
+/// `/sidetray-root.crt`). The connection is NOT verified: what comes back is
+/// only shown as a fingerprint for the person to compare with what the
+/// server's installer printed. It also checks that the server's own
+/// certificate chains to that root, so the fingerprint describes this server.
+pub async fn fetch_root(server: &str) -> Result<String> {
+    if !is_https(server) {
+        bail!("only an https:// server has a certificate to check");
     }
-    Ok(certs)
+    let http = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)
+        .user_agent(concat!("sidetray-app/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("setting up HTTPS")?;
+    let resp = http
+        .get(format!("{}/sidetray-root.crt", server.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|e| describe_send_error(e, None))?;
+    if !resp.status().is_success() {
+        bail!(
+            "this server doesn't offer its root certificate (it answered {}). A test server set up \
+             before Side Tray 0.6.2 needs install.sh run again; or paste its root certificate under Advanced.",
+            resp.status()
+        );
+    }
+    let body = resp.bytes().await.context("downloading the root certificate")?;
+    if body.len() > 16 * 1024 {
+        bail!("the server's root certificate is suspiciously large");
+    }
+    let pem = String::from_utf8(body.to_vec()).context("the server's root certificate isn't text")?;
+    check_pinned(server, &pem).await?;
+    Ok(pem.trim().to_string() + "\n")
+}
+
+/// Connect with exactly `pem` trusted, to check the server's chain ends there.
+pub async fn check_pinned(server: &str, pem: &str) -> Result<()> {
+    fingerprint(pem)?;
+    let r: Result<serde_json::Value> = Api::new(server, Some(pem), None)?.get("/health").await;
+    match r {
+        Ok(_) => Ok(()),
+        Err(e) if is_cert_error(&e) => {
+            bail!("the server's certificate isn't issued by that root certificate, so it isn't this server's root")
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// rustls config for the push socket, trusting exactly what `Api` trusts:
-/// the user's root, else the pinned roots, else the public web roots.
+/// the pinned root for a test server, else the public web roots.
 pub fn tls_config(ca_pem: Option<&str>) -> Result<std::sync::Arc<rustls::ClientConfig>> {
-    use rustls_pki_types::{pem::PemObject, CertificateDer};
-    let pem = ca_pem.filter(|p| !p.trim().is_empty()).unwrap_or(PINNED_ROOTS);
     let mut store = rustls::RootCertStore::empty();
-    if pem.trim().is_empty() {
-        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    } else {
-        for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
-            store.add(cert.context("reading the pinned root certificate")?).context("adding the pinned root certificate")?;
-        }
-        if store.is_empty() {
-            bail!("the pinned root certificate file has no certificates in it");
-        }
+    match ca_pem.filter(|p| !p.trim().is_empty()) {
+        None => store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        Some(pem) => store.add(one_cert(pem)?).context("adding the pinned root certificate")?,
     }
     let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
@@ -92,22 +169,23 @@ pub fn ws_url(server: &str) -> Result<String> {
 }
 
 impl Api {
+    /// `ca_pem`: the pinned root of a test server, or None for the public web roots.
     pub fn new(server: &str, ca_pem: Option<&str>, token: Option<&str>) -> Result<Self> {
         let mut builder = Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .user_agent(concat!("sidetray-app/", env!("CARGO_PKG_VERSION")));
-        let pinned = roots(ca_pem)?;
-        if !pinned.is_empty() {
-            builder = builder.tls_built_in_root_certs(false);
-            for c in pinned {
-                builder = builder.add_root_certificate(c);
-            }
+        let mut pinned = None;
+        if let Some(pem) = ca_pem.filter(|p| !p.trim().is_empty()) {
+            let cert = reqwest::Certificate::from_der(one_cert(pem)?.as_ref()).context("reading the pinned root certificate")?;
+            builder = builder.tls_built_in_root_certs(false).add_root_certificate(cert);
+            pinned = Some(fingerprint(pem)?);
         }
         Ok(Api {
             http: builder.build().context("setting up HTTPS")?,
             base: format!("{}/api/v1", server.trim_end_matches('/')),
             token: token.map(str::to_string),
+            pinned,
         })
     }
 
@@ -118,8 +196,8 @@ impl Api {
         }
     }
 
-    async fn checked(req: RequestBuilder) -> Result<reqwest::Response> {
-        let resp = req.send().await.map_err(describe_send_error)?;
+    async fn checked(&self, req: RequestBuilder) -> Result<reqwest::Response> {
+        let resp = req.send().await.map_err(|e| describe_send_error(e, self.pinned.as_deref()))?;
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
@@ -132,18 +210,18 @@ impl Api {
         Err(HttpError { status: status.as_u16(), detail }.into())
     }
 
-    async fn json<T: DeserializeOwned>(req: RequestBuilder) -> Result<T> {
-        let resp = Self::checked(req).await?;
+    async fn json<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T> {
+        let resp = self.checked(req).await?;
         let body = resp.text().await.context("reading response")?;
         serde_json::from_str(&body).with_context(|| format!("unexpected response: {body}"))
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        Self::json(self.auth(self.http.get(format!("{}{path}", self.base)))).await
+        self.json(self.auth(self.http.get(format!("{}{path}", self.base)))).await
     }
 
     pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        Self::json(self.auth(self.http.post(format!("{}{path}", self.base)).json(body))).await
+        self.json(self.auth(self.http.post(format!("{}{path}", self.base)).json(body))).await
     }
 
     /// Upload an encrypted blob; returns its media id.
@@ -154,13 +232,13 @@ impl Api {
             .header("content-type", "application/octet-stream")
             .timeout(Duration::from_secs(300))
             .body(blob);
-        let r: MediaResp = Self::json(self.auth(req)).await?;
+        let r: MediaResp = self.json(self.auth(req)).await?;
         Ok(r.id)
     }
 
     pub async fn download_media(&self, id: &str) -> Result<Vec<u8>> {
         let req = self.http.get(format!("{}/media/{id}", self.base)).timeout(Duration::from_secs(300));
-        let resp = Self::checked(self.auth(req)).await?;
+        let resp = self.checked(self.auth(req)).await?;
         Ok(resp.bytes().await.context("downloading media")?.to_vec())
     }
 }
@@ -190,7 +268,47 @@ pub fn is_stale_key(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<HttpError>().is_some_and(|h| h.status == 409 && h.detail.contains("out of date")))
 }
 
-fn describe_send_error(e: reqwest::Error) -> anyhow::Error {
+/// The server's certificate wasn't accepted.
+#[derive(Debug)]
+pub struct CertError {
+    /// The fingerprint of the root this app pinned for a test server, if any.
+    pub pinned: Option<String>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for CertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.pinned {
+            Some(fp) => write!(
+                f,
+                "This server's certificate has changed: it isn't issued by the root certificate you confirmed \
+                 (SHA-256 {fp}), so Side Tray refused to connect. Either the server was set up again, or \
+                 someone is intercepting the connection. Ask whoever runs the server before trusting it again.\n({})",
+                self.detail
+            ),
+            None => write!(
+                f,
+                "The server's HTTPS certificate isn't valid or isn't publicly trusted, so Side Tray refused \
+                 to connect. A test server's root certificate can be pasted under Advanced.\n({})",
+                self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CertError {}
+
+/// Whether `e` is a refused certificate.
+pub fn is_cert_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<CertError>().is_some())
+}
+
+/// Whether an error message is about the certificate.
+fn mentions_certificate(text: &str) -> bool {
+    text.contains("certificate") || text.contains("UnknownIssuer") || text.contains("BadSignature")
+}
+
+fn describe_send_error(e: reqwest::Error, pinned: Option<&str>) -> anyhow::Error {
     // Walk the source chain: certificate problems are buried a few levels down.
     let mut chain = String::new();
     let mut src: Option<&dyn std::error::Error> = Some(&e);
@@ -198,12 +316,8 @@ fn describe_send_error(e: reqwest::Error) -> anyhow::Error {
         chain.push_str(&format!(" {s}"));
         src = s.source();
     }
-    if chain.contains("certificate") || chain.contains("UnknownIssuer") {
-        anyhow::anyhow!(
-            "the server's HTTPS certificate isn't one this app trusts. If your server uses its own \
-             certificate authority, paste its root certificate under Advanced.\n({})",
-            chain.trim()
-        )
+    if mentions_certificate(&chain) {
+        CertError { pinned: pinned.map(str::to_string), detail: chain.trim().to_string() }.into()
     } else if e.is_timeout() {
         anyhow::anyhow!("the server didn't answer in time")
     } else if e.is_connect() {
@@ -437,12 +551,32 @@ mod tests {
         assert!(normalize_server("ftp://example.org").is_err());
     }
 
+    /// A throwaway self-signed root made with openssl, only for these tests.
+    const ROOT: &str = include_str!("../tests-data/test-root.pem");
+    /// `openssl x509 -noout -fingerprint -sha256 -in tests-data/test-root.pem`
+    const ROOT_FP: &str = include_str!("../tests-data/test-root.sha256");
+
     #[test]
-    fn pinned_roots_parse() {
-        assert!(!roots(None).unwrap().is_empty());
-        assert!(roots(Some("not a pem")).is_err());
+    fn fingerprints_and_pinned_roots() {
+        let fp = fingerprint(ROOT).unwrap();
+        assert_eq!(fp, ROOT_FP.trim().trim_start_matches("sha256 Fingerprint="));
+        assert!(fp.chars().all(|c| c == ':' || c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        assert!(same_fingerprint(&fp, &fp.to_lowercase().replace(':', " ")));
+        assert!(!same_fingerprint(&fp, &fp[..60]));
+        assert!(fingerprint("not a pem").is_err());
+        assert!(fingerprint(&format!("{ROOT}{ROOT}")).is_err());
         assert!(tls_config(None).is_ok());
         assert!(tls_config(Some("not a pem")).is_err());
+        assert!(Api::new("https://10.1.1.191", Some(ROOT), None).unwrap().pinned.is_some());
+        assert!(Api::new("https://tray.example.org", None, None).unwrap().pinned.is_none());
+    }
+
+    #[test]
+    fn test_servers_are_ip_addresses() {
+        assert!(is_ip_server("https://10.1.1.191"));
+        assert!(is_ip_server("https://[::1]:8443"));
+        assert!(!is_ip_server("https://tray.example.org"));
+        assert!(normalize_server("https://tray.example.org/api").is_err());
     }
 
     #[test]

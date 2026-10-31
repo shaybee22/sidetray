@@ -56,7 +56,7 @@ fn fit(img: &DynamicImage, side: u32) -> DynamicImage {
     }
 }
 
-fn encode_webp(img: &DynamicImage, quality: f32) -> Vec<u8> {
+pub fn encode_webp(img: &DynamicImage, quality: f32) -> Vec<u8> {
     let (w, h) = (img.width(), img.height());
     if img.color().has_alpha() {
         let rgba = img.to_rgba8();

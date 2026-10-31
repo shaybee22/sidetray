@@ -212,7 +212,7 @@ Private one-to-one conversations (text and photos) between two members, relayed 
 
 ## Phase 6b: Real servers, invites, avatars, more groups
 
-Everything so far runs against a test relay on a LAN IP with Caddy's private CA. This phase makes a server something a non-developer can stand up on a domain, makes joining one click from a link, gives people faces, and lets one server host several groups. Documented here; not built yet.
+Everything so far runs against a test relay on a LAN IP with Caddy's private CA. This phase makes a server something a non-developer can stand up on a domain, makes joining one click from a link, gives people faces, and lets one server host several groups. Built in two steps: 6b-1 (server: installer, several groups, rate limits) and 6b-2 (app: certificates, invite links, avatars). Where the build differs from the first plan, the text below says what was built.
 
 **`install.sh` server installer**
 
@@ -228,23 +228,25 @@ Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, 
 
 **Production certificate mode**
 
-- For a server on a domain, the app trusts the normal public certificate roots (webpki roots, as browsers do), so a Let's Encrypt certificate just works. Release builds ship with an empty `pinned-roots.pem`.
-- The pinned Caddy CA becomes a **test mode**: used when the wizard is pointed at a bare IP address, or when someone pastes a root certificate under *Advanced*. The app labels such servers "test server" on *This device*.
+- For a server on a domain, the app trusts the normal public certificate roots (webpki roots, as browsers do), so a Let's Encrypt certificate just works. No root certificate is compiled into the app any more.
+- A **test server** is one the wizard reaches by a bare IP address, or one whose root certificate someone pastes under *Advanced*. In test mode Caddy serves its root certificate (never the key) at `/sidetray-root.crt`; the app downloads it, checks that the server's own certificate chains to it, and shows its SHA-256 fingerprint, which `install.sh` prints too. Only after the person confirms that the two match does the app pin that root for this server (stored with the identity) and trust it, and nothing else, from then on. The app labels such servers "test server" on *This device*.
+- A test server presenting a certificate that doesn't chain to the pinned root is refused, with a warning that says the certificate changed and why that matters. *This device → Server certificate → Check it again* shows the server's current fingerprint next to the pinned one; replacing the pin takes a second, explicit confirmation ("the operator read me this fingerprint").
 - The choice is stored per server. Verification is never turned off, and plain `http://` stays limited to `localhost`.
 
 **Invite links**
 
 - Format: `sidetray://join?server=https%3A%2F%2Ftray.example.org&group=Smith%20Family`. Both values are URL-encoded; nothing else is accepted.
-- The installer registers the `sidetray://` scheme (Phase 7; `tauri-plugin-deep-link`). Opening a link starts the app, or hands the link to the running copy, and opens the wizard with the server and group name filled in and checked. The person still types their name and email.
+- The `sidetray://` scheme is registered with `tauri-plugin-deep-link`. Until the Phase 7 installer does it, the app registers it for the current user (on Windows under `HKCU\Software\Classes\sidetray`) each time it starts. Opening a link starts the app, or hands the link to the running copy, and opens the wizard with the server and group name filled in and checked (including the fingerprint step for a test server). The person still types their name and email. An app that already belongs to a group says so instead.
 - Links carry no secrets and grant nothing: the join is still `pending` until a Key Master compares safety codes on the phone. A link for a server that isn't `https://` is refused.
-- Key Masters get a *Copy invite link* button on the Key Master tab; the installer prints the first one.
+- Key Masters get an *Invite* button on the Key Master tab: the link, a *Copy* button and a QR code. (The installer doesn't print a link: before the first group exists there's no group name to put in it.)
 
 **Avatars and display names**
 
 - Optional. *This device → Profile* lets you pick a photo, then drag and zoom it inside a circle (like Discord) and save. The crop happens in the app: a 256×256 WebP, metadata stripped like post photos.
-- The image is encrypted with the group key, uploaded with `POST /media`, and announced in a new signed event, `kind: profile`, payload `{"display_name"?, "avatar"?: {"id", "digest"} | null}`. The media id also goes in the event's clear `media_ids`. `null` removes the avatar.
+- The image is encrypted with the group key, uploaded with `POST /media`, and announced in a new signed event, `kind: profile`, payload `{"display_name"?, "avatar": {"id", "digest"} | null}`. The media id also goes in the event's clear `media_ids`. `null` removes the avatar.
+- Every profile event states the whole profile (an absent `display_name` means the certified name), because the latest one wins outright and is all the relay keeps. So changing only the name sends the current photo again, re-encrypted under the current group key.
 - Clients use the latest valid profile event per member. Initials on a coloured circle remain the fallback whenever there's no avatar, it hasn't downloaded yet, or it fails its digest check.
-- A display name change rides the same event. Member certificates still carry the name a Key Master certified, so the Members screen shows both until a Key Master accepts the new name (one click, which re-signs that member's certificates). Posts show the new name straight away.
+- A display name change rides the same event. Member certificates still carry the name a Key Master certified, so the Members screen shows both until a Key Master accepts the new name (one click, which re-signs that member's certificates: `POST /members/{id}/name`). Posts show the new name straight away.
 - The relay never prunes a member's latest profile event or its avatar, so devices that join later still see everyone's face; older profile events prune normally.
 
 **Multiple groups per server**

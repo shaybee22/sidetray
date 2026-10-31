@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS sealed_keys (
 CREATE TABLE IF NOT EXISTS events (
     seq               INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id          TEXT NOT NULL REFERENCES groups(id),
-    kind              TEXT NOT NULL CHECK (kind IN ('post', 'comment', 'reaction', 'edit', 'delete')),
+    kind              TEXT NOT NULL CHECK (kind IN ('post', 'comment', 'reaction', 'edit', 'delete', 'profile')),
     author_device_id  TEXT NOT NULL REFERENCES devices(id),
     key_version       INTEGER NOT NULL,
     ciphertext        BLOB NOT NULL,
@@ -224,6 +224,29 @@ def drop_legacy_test_group(conn: sqlite3.Connection) -> None:
         legacy_dir.rmdir()
 
 
+def allow_profile_events(conn: sqlite3.Connection) -> None:
+    """Phase 6b: `profile` events. SQLite can't change a CHECK constraint in
+    place, so a database from before rebuilds its events table once, keeping
+    every row, its numbers and the AUTOINCREMENT counter. Indexes and the
+    numbering trigger are recreated by init_db right after."""
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'").fetchone()[0]
+    if "'profile'" in sql or "'delete')" not in sql:
+        return  # already allowed, or no kind constraint at all
+    cols = ", ".join(r["name"] for r in conn.execute("PRAGMA table_info(events)"))
+    counter = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events'").fetchone()
+    conn.execute("DROP TRIGGER IF EXISTS events_number")
+    conn.execute("ALTER TABLE events RENAME TO events_old")
+    # The same table as before (its own columns and constraints), one more kind allowed.
+    conn.execute(sql.replace("'delete')", "'delete', 'profile')", 1))
+    conn.execute(f"INSERT INTO events ({cols}) SELECT {cols} FROM events_old")
+    conn.execute("DROP TABLE events_old")
+    if counter:
+        # The renamed table took its counter row with it; give the new one the old high-water mark.
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'events'")
+        conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('events', ?)", (counter[0],))
+    conn.execute("CREATE INDEX IF NOT EXISTS events_group_seq ON events (group_id, seq)")
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -260,6 +283,7 @@ def init_db() -> None:
             conn.execute("UPDATE events SET gseq = seq")
             hw = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events'").fetchone()
             conn.execute("UPDATE groups SET event_seq = ?", (hw[0] if hw else 0,))
+        allow_profile_events(conn)
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_group_gseq ON events (group_id, gseq)")
         # Numbers each new event within its group, inside the inserting transaction.
         conn.execute(
@@ -273,6 +297,14 @@ def init_db() -> None:
             " (SELECT COALESCE(MAX(key_version), 1) FROM sealed_keys WHERE group_id = groups.id),"
             " (SELECT COALESCE(MAX(key_version), 1) FROM events WHERE group_id = groups.id))"
         )
+
+
+# The latest profile event of each active member of one group (parameter: group id).
+KEPT_PROFILES = (
+    "SELECT MAX(e.seq) FROM events e JOIN devices d ON d.id = e.author_device_id"
+    " JOIN members m ON m.id = d.member_id"
+    " WHERE e.group_id = ? AND e.kind = 'profile' AND m.status = 'active' GROUP BY d.member_id"
+)
 
 
 def prune(t: int | None = None) -> dict:
@@ -297,8 +329,11 @@ def prune(t: int | None = None) -> dict:
                 (gid,),
             ).fetchone()
             acked = row["low"] if row["n"] else 0
-            where = "group_id = ? AND (gseq <= ? OR created_at < ?)"
-            args = (gid, acked, cutoff)
+            # Each active member's latest profile event (name, avatar) stays, so
+            # devices that join later still see everyone's face.
+            where = ("group_id = ? AND (gseq <= ? OR created_at < ?)"
+                     f" AND seq NOT IN ({KEPT_PROFILES})")
+            args = (gid, acked, cutoff, gid)
             top = conn.execute(f"SELECT MAX(gseq) FROM events WHERE {where}", args).fetchone()[0]
             if top is None:
                 continue
@@ -307,13 +342,19 @@ def prune(t: int | None = None) -> dict:
             out["events"] += conn.execute(f"DELETE FROM events WHERE {where}", args).rowcount
             conn.execute("UPDATE groups SET pruned_through = MAX(pruned_through, ?) WHERE id = ?", (top, gid))
         # Media: referenced by a deleted event, past retention, or never referenced.
+        # Avatars of the kept profile events stay whatever their age.
         live: set[str] = set()
         for r in conn.execute("SELECT media_ids FROM events WHERE media_ids != ''"):
             live.update(m for m in r["media_ids"].split(",") if m)
+        kept: set[str] = set()
+        for g in conn.execute("SELECT id FROM groups").fetchall():
+            for r in conn.execute(f"SELECT media_ids FROM events WHERE seq IN ({KEPT_PROFILES})", (g["id"],)):
+                kept.update(m for m in r["media_ids"].split(",") if m)
         doomed = [
             r for r in conn.execute("SELECT id, path, created_at FROM media").fetchall()
-            if r["id"] in doomed_media or r["created_at"] < cutoff
-            or (r["id"] not in live and r["created_at"] < t - ORPHAN_MEDIA_SECONDS)
+            if r["id"] not in kept and (
+                r["id"] in doomed_media or r["created_at"] < cutoff
+                or (r["id"] not in live and r["created_at"] < t - ORPHAN_MEDIA_SECONDS))
         ]
         for r in doomed:
             conn.execute("DELETE FROM media WHERE id = ?", (r["id"],))
@@ -675,8 +716,22 @@ class RoleIn(BaseModel):
     certs: list[CertIn] = Field(min_length=1, max_length=100)
 
 
+class NameIn(BaseModel):
+    """A Key Master accepts the name a member chose in their profile."""
+    display_name: str = Field(min_length=1, max_length=100)
+    certs: list[CertIn] = Field(min_length=1, max_length=100)
+
+    @field_validator("display_name")
+    @classmethod
+    def strip(cls, v: str):
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+
 class EventIn(BaseModel):
-    kind: Literal["post", "comment", "reaction", "edit", "delete"]
+    kind: Literal["post", "comment", "reaction", "edit", "delete", "profile"]
     key_version: int = Field(ge=1)
     ciphertext: str  # base64
     signature: str  # base64
@@ -1122,6 +1177,34 @@ def set_role(member_id: str, body: RoleIn, km: Device = Depends(keymaster_device
             store_cert(conn, km, c, body.role)
         conn.execute("UPDATE members SET role = ? WHERE id = ?", (body.role, member_id))
     return {"member_id": member_id, "role": body.role}
+
+
+@api.post("/members/{member_id}/name")
+def set_name(member_id: str, body: NameIn, km: Device = Depends(keymaster_device)):
+    """Accept a member's new display name (from their signed profile event).
+    Needs a certificate with that name, signed by the calling Key Master, for
+    every active device of the member. Certificates under the old name are
+    dropped, so clients don't keep showing it."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        m = conn.execute(
+            "SELECT role FROM members WHERE id = ? AND group_id = ? AND status = 'active'",
+            (member_id, km.group_id),
+        ).fetchone()
+        if m is None:
+            raise HTTPException(404, "no such member")
+        devices = {r["id"] for r in conn.execute(
+            "SELECT id FROM devices WHERE member_id = ? AND status = 'active'", (member_id,))}
+        if {c.device_id for c in body.certs} != devices or len(body.certs) != len(devices):
+            raise HTTPException(422, "need exactly one certificate per active device of the member")
+        if any(c.display_name != body.display_name for c in body.certs):
+            raise HTTPException(422, "certificate display_name doesn't match the new name")
+        conn.execute("UPDATE members SET display_name = ? WHERE id = ?", (body.display_name, member_id))
+        for c in body.certs:
+            store_cert(conn, km, c, m["role"])
+            conn.execute("DELETE FROM member_certs WHERE device_id = ? AND display_name != ?",
+                         (c.device_id, body.display_name))
+    return {"member_id": member_id, "display_name": body.display_name}
 
 
 @api.post("/members/{member_id}/remove")

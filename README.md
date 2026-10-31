@@ -2,7 +2,7 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: Phase 6b-1 (server side of real servers and more groups).** A Tauri 2 desktop app
+**Status: Phase 6b (real servers, invites, avatars, more groups).** A Tauri 2 desktop app
 (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
 comments and reactions. It keeps a local SQLite archive and syncs the moment the
@@ -16,9 +16,12 @@ for everyone left. The relay prunes what every device has fetched, and anything
 past 90 days. The dev CLI (`cli/`) speaks the same formats. A server can host
 several groups that can't see or find each other, `install.sh` sets one up on
 a fresh Debian or Ubuntu machine, and the relay enforces rate limits (see
-[Run your own server](#run-your-own-server)). Still to come: the app's side of
-6b (public certificates, invite links, avatars, asking for the group name
-first) and direct messages (5b), both specified in SPEC.md.
+[Run your own server](#run-your-own-server)). The app trusts a server on a
+domain through the public certificate roots, and a test server only after its
+person confirmed the root certificate's fingerprint. Key Masters invite people
+with a `sidetray://` link or QR code, and everyone can set a photo and the name
+the group sees. Still to come: direct messages (5b) and release builds (7),
+specified in SPEC.md.
 
 ## Layout
 
@@ -52,9 +55,9 @@ It asks:
 1. **How people reach the server.** Either a **domain name** plus an email
    address for Let's Encrypt (production: a publicly trusted certificate,
    renewed automatically), or a **LAN IP address** (test mode: Caddy signs
-   with its own CA, so each app needs that root certificate pasted under
-   *Advanced* in the wizard). For a domain, it checks that the name resolves
-   to this machine before going on.
+   with its own CA; the app shows that CA's fingerprint when someone first
+   connects, and they compare it with what the installer printed). For a
+   domain, it checks that the name resolves to this machine before going on.
 2. **Retention**: how many days the relay keeps posts and photos that not
    every device has fetched yet (default 90).
 
@@ -63,10 +66,12 @@ repository (if missing), writes `/opt/sidetray` (`compose.yaml`, `Caddyfile`,
 `.env`, `server/`), builds and starts the stack, waits until
 `https://<address>/api/v1/health` answers, and prints a **setup token**. Give
 the token to whoever will run the group: in the app's wizard they enter the
-server address, a name for the group, their name and email, and the token,
-and they become the group's first Key Master. In test mode it also saves the
-root certificate as `/opt/sidetray/sidetray-root.crt` and prints its SHA-256
-fingerprint.
+server address and a name for the group, then their name and email and the
+token, and they become the group's first Key Master. In test mode it also
+saves the root certificate as `/opt/sidetray/sidetray-root.crt` and prints its
+SHA-256 fingerprint: tell it to everyone who connects, by a channel you trust
+(the app shows the same fingerprint and asks them to compare). If the
+Caddyfile changed, re-running the installer restarts Caddy so it takes effect.
 
 For unattended runs, every question has a flag:
 `--domain tray.example.org --email you@example.org` or `--ip 10.1.1.191`,
@@ -143,12 +148,15 @@ project is named `sidetray` either way).
 ## Trusting the test certificate
 
 In test mode (a LAN IP, no domain), Caddy signs a cert for the IP with its own
-local CA. `install.sh` saves the root as `/opt/sidetray/sidetray-root.crt`; in a
-dev checkout, export it and point curl at it:
+local CA, and serves that CA's root certificate (not its key) at
+`https://<ip>/sidetray-root.crt`. The app fetches it there, shows its SHA-256
+fingerprint and pins it once the person confirms it matches what `install.sh`
+printed. `install.sh` also saves the root as `/opt/sidetray/sidetray-root.crt`;
+in a dev checkout, export it and point curl at it:
 
 ```sh
 docker compose exec -T caddy cat /data/caddy/pki/authorities/local/root.crt > sidetray-root.crt
-curl --cacert sidetray-root.crt https://10.1.1.188/api/v1/health
+curl --cacert sidetray-root.crt https://10.1.1.191/api/v1/health
 ```
 
 For a Let's Encrypt cert, run `install.sh` with a domain (production mode).
@@ -162,6 +170,7 @@ base64. The server never decrypts.
 | Method | Path | Who | Body / params | Returns |
 | --- | --- | --- | --- | --- |
 | GET | /health | anyone | | `{ok}` |
+| GET | /sidetray-root.crt | anyone | served by Caddy, test mode only (not under /api/v1) | Caddy's root certificate (PEM) |
 | GET | /group | anyone | `?name=<group name>` (required; 400 without) | `{exists, name?}` |
 | POST | /join | anyone | `{group_name, display_name, email, enc_pubkey, sign_pubkey, setup_token?}` | `{group_id, group_name, member_id, device_id, token, status, role}` |
 | GET | /join/status | any device token | | `{status: pending\|active\|denied\|removed\|revoked, role?, sealed_keys[]?}` |
@@ -173,6 +182,7 @@ base64. The server never decrypts.
 | GET | /members | member | | `{members: [{id, display_name, role, devices: [{id, enc_pubkey, sign_pubkey, certs[], last_seen?, joined_at?}]}], former: [...]}` |
 | POST | /certs | Key Master | `{certs: [{device_id, role, display_name, signature}]}` | `{stored}` |
 | POST | /members/{id}/role | Key Master | `{role: "keymaster", certs[]}`, one per active device | `{role}` |
+| POST | /members/{id}/name | Key Master | `{display_name, certs[]}`, one per active device, carrying the new name | `{member_id, display_name}` |
 | POST | /members/{id}/remove | Key Master | | `{revoked_devices[], rotation_pending}` |
 | POST | /devices/{id}/revoke | Key Master | | `{status: revoked, rotation_pending}` |
 | POST | /events | member | `{kind, key_version, ciphertext, signature, media_ids[]}` | `{seq}` |
@@ -258,7 +268,9 @@ proxies the upgrade with no extra configuration.
   that every active device has acked, and anything older than
   `SIDETRAY_RETENTION_DAYS`. Revoked devices and removed members don't hold
   anything back; a device that has never acked holds everything back.
-  Uploads no event refers to go after a day. The relay records the highest seq
+  Uploads no event refers to go after a day. Each active member's latest
+  `profile` event and its avatar are never pruned, so devices that join later
+  still see names and faces. The relay records the highest seq
   it pruned; `GET /events` returns it as `pruned_through`, and a returning
   device whose cursor is below it shows "You missed some posts".
 - Known limits: a key version granted by a Key Master who has since been
@@ -293,31 +305,50 @@ the UI is plain files in `app/ui/`, embedded at build time.
 ```sh
 cd app/src-tauri
 cargo build --release          # target/release/sidetray-app(.exe)
-cargo test                     # photo stripping, event checks, notices, key storage, badge
+cargo test                     # photos, events, notices, keys, badge, invites, fingerprints, profiles
 ```
 
 Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
 `cargo tauri build`.
 
-- **First run.** The wizard asks for the server address and checks `GET /group`.
-  If the group exists, it asks for the group name, your display name and email,
-  then sends the join request. It shows the safety code big, and polls until a
+- **First run.** The wizard asks for the server address and the group's name
+  (servers don't list their groups). For a test server it first shows the root
+  certificate's fingerprint to confirm (see HTTPS below). Then it checks
+  `GET /group?name=`: if the group exists, you type your display name and email
+  and it sends the join request. It shows the safety code big, and polls until a
   Key Master approves. You then type the code that Key Master reads back to you,
   the same check as the CLI's `status --km-code`. Nothing is stored or trusted
-  until it matches. On a server with no group, the wizard offers to create one
-  with the operator's setup token, and you become its Key Master.
-  **Not yet updated for 6b-1:** the wizard still calls `GET /group` without a
-  name, which a 6b-1 relay refuses (`400`), so it can't join a 6b-1 server
-  until the app asks for the group name first (6b-2). The CLI works.
+  until it matches. If there's no group of that name, the wizard offers to
+  create it with a setup token, and you become its Key Master.
+- **Invite links.** The Key Master tab has an *Invite* button: a
+  `sidetray://join?server=...&group=...` link with *Copy*, and the same link as
+  a QR code. The app registers `sidetray://` for the current user at every
+  start (`tauri-plugin-deep-link`; on Windows `HKCU\Software\Classes\sidetray`),
+  until the Phase 7 installer does it. Opening a link starts the app, or hands
+  it to the running copy, and fills in and checks server and group, so the new
+  member types only their name and email. Links carry no secret; anything but
+  an `https://` server and a group name is refused, and an app that's already
+  in a group says so.
+- **Profile.** *This device → Profile*: pick a photo, drag and zoom it inside a
+  circle, save. The app crops it to 256x256 in a canvas, re-encodes it as WebP
+  (no metadata), encrypts it with the group key, uploads it and publishes a
+  signed `profile` event; the name the group sees changes the same way.
+  Others' apps check the photo against the digest in the event before showing
+  it; until then, or without one, the initial on a coloured circle stays.
+  Photos show in the feed, on comments and in the member list.
 - **Key Master screen.** Lists pending joins without their codes: you type the
   code you heard, and the app approves only if it matches the keys the server
   relayed. It then shows your own code to read back. You can also deny.
-- **Members.** Everyone sees the member list: name, Key Master tag and
+- **Members.** Everyone sees the member list: photo, name, Key Master tag and
   certificate status (verified, partly verified, unverified) for each member,
   and each device with who certified it. Key Masters also see when each device
   was last seen and get *Make Key Master*, *Remove* and, per device, *Revoke*.
   Each asks for confirmation in a dialog (Cancel has the focus). Remove and
-  Revoke then rotate the group key and say how many devices got it.
+  Revoke then rotate the group key and say how many devices got it. Someone
+  who chose a new name is listed under their certified name with "goes by ..."
+  until a Key Master clicks *Accept new name*, which re-signs their
+  certificates with it (`POST /members/{id}/name`). Posts use the new name
+  right away.
 - **Removed.** When the relay says this device was removed or revoked (a
   `removed` push, or a `401` confirmed by `/join/status`), the app stops
   syncing, shows a notification and a "You've been removed from this group"
@@ -364,11 +395,21 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
   (AD `protocol::media_ad(group)`) and uploaded to `POST /media`. The post
   records each blob's `blob_digest`, so the server can't swap photos; it's
   checked before decrypting.
-- **HTTPS.** `app/src-tauri/pinned-roots.pem` (Caddy's internal root for the
-  test relay) is compiled in. When it's non-empty, the app trusts exactly those
-  roots and no others, for both HTTPS calls and the `wss://` push socket. The wizard's *Advanced* box can pin a different root PEM
-  for a server. If the file is emptied, the public web roots are used, for when
-  the server gets a real domain. Verification is never off. Plain `http://` is
+- **HTTPS.** Trust is per server, for both HTTPS calls and the `wss://` push
+  socket. A server on a domain is checked against the public web roots
+  (`webpki-roots`), as a browser would, so Let's Encrypt just works. A **test
+  server** (a bare IP address, or a root pasted under *Advanced*) has its own
+  CA: the wizard downloads its root from `/sidetray-root.crt`, checks the
+  server's certificate chains to it, and shows its SHA-256 fingerprint (as
+  `openssl x509 -fingerprint -sha256` and `install.sh` print it). Once you
+  confirm it matches, that root is pinned in the identity and is the only one
+  trusted for that server. If the server later presents a certificate that
+  doesn't chain to it, every request is refused and a red banner says the
+  certificate changed and what that can mean. *This device → Server
+  certificate* shows the pinned fingerprint; *Check it again* compares it with
+  the server's current one, and replacing the pin needs a second explicit
+  confirmation. No root is compiled in. Verification is never off (except to
+  download a test server's root for that comparison). Plain `http://` is
   accepted only for `127.0.0.1`/`localhost`, for a relay in development.
 - **Local data** lives in the app data dir (`%APPDATA%\org.sidetray.app` on
   Windows; `SIDETRAY_DATA_DIR` overrides it, and lets test copies run side by
@@ -395,9 +436,10 @@ it without breaking the signature.
 | reaction | `{"post": event_id, "emoji"}`. The latest one per member wins; `""` removes it |
 | edit | `{"post": event_id, "text"}`. Only the post's author |
 | delete | `{"post": event_id}`. Only the post's author |
+| profile | `{"display_name"?, "avatar": {"id", "digest"} \| null}`: the author's whole profile; the latest one wins. No `display_name` means the certified name. The avatar is a 256x256 WebP encrypted like a photo, `digest` its `blob_digest` |
 
-A post's photo media ids also go in the event's clear `media_ids` field, so the
-server can prune them with the event.
+A post's photo media ids (and a profile's avatar id) also go in the event's
+clear `media_ids` field, so the server can prune them with the event.
 
 ## CLI (Phase 3)
 
@@ -466,7 +508,10 @@ It comes from the public-domain [12dicts](http://wordlist.aspell.net/12dicts/) l
   are `g_` plus 16 random characters. `server/tests/test_legacy_cleanup.py` checks this,
   `server/tests/test_prune.py` covers the prune job and the removed/revoked
   statuses, and `server/tests/test_groups.py` covers several groups, setup
-  tokens, isolation, the per-group numbering migration and the rate limits
+  tokens, isolation, the per-group numbering migration and the rate limits,
+  and `server/tests/test_profiles.py` covers profile events (and the events
+  table rebuild that allows them), keeping each member's latest profile and
+  avatar through pruning, and accepting a new name
   (`cd server && python -m unittest discover tests`; needs `httpx` for the
-  last one).
+  last two).
 - Footprint on the test VM: ~35 MB (api) + ~70 MB (caddy), with 256 MB / 128 MB caps.

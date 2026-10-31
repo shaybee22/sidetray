@@ -247,6 +247,43 @@ pub async fn promote(app: &App, member_id: &str) -> Result<String> {
     Ok(name)
 }
 
+/// Accept the name a member chose in their (signed) profile: re-sign the
+/// certificates of all their devices with it, same keys and role.
+pub async fn accept_name(app: &App, member_id: &str) -> Result<String> {
+    let id = app.require_keymaster()?;
+    let api = app.api(&id)?;
+    let me = app.secrets(&id)?.device_keys()?;
+    let roster = account::refresh_roster(app, &id, &api).await?;
+    let m = roster.raw.members.iter().find(|m| m.id == member_id).context("that person isn't an active member")?;
+    let name = crate::profile::chosen_name(&app.db(), member_id).context("they haven't chosen a different name")?;
+    let mut certs = Vec::new();
+    for d in &m.devices {
+        let v = roster.verified.get(&d.id).filter(|v| v.member_id == member_id).with_context(|| {
+            format!("{} has a device without a valid certificate; not certifying unverified keys", m.display_name)
+        })?;
+        certs.push(issue_cert(
+            &id,
+            &me,
+            &CertSubject {
+                group_id: &id.group_id,
+                member_id: &v.member_id,
+                device_id: &v.device_id,
+                display_name: &name,
+                role: v.role,
+                enc_pk: v.enc_pk,
+                sign_pk: v.sign_pk,
+            },
+        ));
+    }
+    if certs.is_empty() {
+        bail!("they have no active devices");
+    }
+    let _: serde_json::Value =
+        api.post(&format!("/members/{member_id}/name"), &serde_json::json!({ "display_name": name, "certs": certs })).await?;
+    account::refresh_roster(app, &id, &api).await?;
+    Ok(name)
+}
+
 /// Remove a member (all their devices), then rotate the group key.
 pub async fn remove_member(app: &App, member_id: &str) -> Result<Change> {
     let id = app.require_keymaster()?;
@@ -286,7 +323,11 @@ pub async fn revoke_device(app: &App, device_id: &str) -> Result<Change> {
 #[derive(Serialize)]
 pub struct MemberView {
     pub id: String,
+    /// The certified name.
     pub name: String,
+    /// The name they chose in their profile, if it differs (not accepted by a Key Master yet).
+    pub chosen_name: Option<String>,
+    pub avatar: Option<String>,
     /// "keymaster" or "member", from certificates (the server's claim if none verify).
     pub role: String,
     /// "verified", "partial" (some devices don't verify) or "unverified".
@@ -312,7 +353,14 @@ pub async fn list_members(app: &App) -> Result<Vec<MemberView>> {
     let api = app.api(&id)?;
     let roster = account::refresh_roster(app, &id, &api).await?;
     let anchor_names: BTreeMap<String, String> = db::anchors(&app.db())?.into_iter().map(|(d, n, _)| (d, n)).collect();
-    Ok(member_views(&id, &roster, &anchor_names))
+    let mut views = member_views(&id, &roster, &anchor_names);
+    let conn = app.db();
+    for v in &mut views {
+        let (avatar, chosen) = crate::profile::view(&conn, &v.id);
+        v.avatar = avatar;
+        v.chosen_name = chosen.filter(|c| *c != v.name && v.cert_status != "unverified");
+    }
+    Ok(views)
 }
 
 fn member_views(id: &Identity, roster: &CheckedRoster, anchor_names: &BTreeMap<String, String>) -> Vec<MemberView> {
@@ -340,6 +388,8 @@ fn member_views(id: &Identity, roster: &CheckedRoster, anchor_names: &BTreeMap<S
             MemberView {
                 id: m.id.clone(),
                 name: top.map(|v| v.display_name.clone()).unwrap_or_else(|| m.display_name.clone()),
+                chosen_name: None,
+                avatar: None,
                 role: top.map(|v| v.role.as_str()).unwrap_or("member").into(),
                 cert_status: cert_status.into(),
                 me: m.id == id.member_id,

@@ -33,6 +33,31 @@ pub struct App {
     pub pending_joins: AtomicUsize,
     /// Join requests already notified about (device ids), so each pops up once per run.
     pub seen_pending: Mutex<HashSet<String>>,
+    /// Wizard: the server being set up and, for a test server, its root
+    /// certificate, trusted only once the person confirmed the fingerprint.
+    pub wizard_server: Mutex<Option<ServerTrust>>,
+    /// A test server's current root, offered to replace the pinned one.
+    pub repin: Mutex<Option<ServerTrust>>,
+    /// The last sync was refused over the server's certificate (the message to show).
+    pub cert_problem: Mutex<Option<String>>,
+    /// An invite link that opened the app, until the wizard picks it up.
+    pub pending_invite: Mutex<Option<InviteMsg>>,
+}
+
+#[derive(Clone)]
+pub struct ServerTrust {
+    pub server: String,
+    /// Test server: the root certificate (PEM). None: the public web roots.
+    pub root_pem: Option<String>,
+    pub fingerprint: Option<String>,
+    pub confirmed: bool,
+}
+
+/// An invite link, or why it was refused.
+#[derive(Clone, serde::Serialize)]
+pub struct InviteMsg {
+    pub invite: Option<crate::invite::Invite>,
+    pub error: Option<String>,
 }
 
 impl App {
@@ -54,6 +79,10 @@ impl App {
             push_connected: AtomicBool::new(false),
             pending_joins: AtomicUsize::new(0),
             seen_pending: Mutex::new(HashSet::new()),
+            wizard_server: Mutex::new(None),
+            repin: Mutex::new(None),
+            cert_problem: Mutex::new(None),
+            pending_invite: Mutex::new(None),
         })
     }
 
@@ -105,6 +134,10 @@ impl App {
         let s = Arc::new(secrets::load(&self.db(), &id.local_id)?);
         *cache = Some(s.clone());
         Ok(s)
+    }
+
+    pub fn set_cert_problem(&self, p: Option<String>) {
+        *self.cert_problem.lock().unwrap_or_else(|e| e.into_inner()) = p;
     }
 
     pub fn set_secrets(&self, s: Option<Arc<Secrets>>) {
