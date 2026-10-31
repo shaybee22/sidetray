@@ -26,7 +26,7 @@ class LegacyCleanupTest(unittest.TestCase):
 
     def seed(self, conn, group_id, device_id, media_id):
         m = self.main
-        conn.execute("INSERT INTO groups VALUES (?, 'G', 1)", (group_id,))
+        conn.execute("INSERT INTO groups (id, name, created_at) VALUES (?, 'G', 1)", (group_id,))
         conn.execute("INSERT INTO members VALUES (?, ?, 'N', 'e@x', 'keymaster', 'active', 1)",
                      (f"m_{device_id}", group_id))
         conn.execute("INSERT INTO devices (id, group_id, member_id, status, token_hash) VALUES (?, ?, ?, 'active', ?)",

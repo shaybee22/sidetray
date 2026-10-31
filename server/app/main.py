@@ -8,6 +8,10 @@ approves them and uploads the group key sealed (and signed) to them.
 
 Connected devices get small push messages over /ws (see Hub) telling them
 to sync; the content itself is only ever fetched with GET /events.
+
+Phase 6: an hourly prune job deletes what every active device has acked and
+anything past the retention window; Key Masters remove members, revoke lost
+devices and rotate the group key (sealed and signed by their app, as at join).
 """
 
 import asyncio
@@ -43,6 +47,13 @@ KEY_LEN = 32
 MAX_SOCKETS_PER_DEVICE = 4
 WS_IDLE_SECONDS = float(os.environ.get("SIDETRAY_WS_IDLE_SECONDS", 75))
 WS_QUEUE = 256
+# Pruning: events and media go once every active device has acked them, or
+# after the retention window whatever the acks say.
+RETENTION_DAYS = float(os.environ.get("SIDETRAY_RETENTION_DAYS") or 90)
+PRUNE_EVERY_SECONDS = float(os.environ.get("SIDETRAY_PRUNE_EVERY_SECONDS") or 3600)
+# Uploaded media that no event refers to (an upload whose post never came) is
+# dropped after this long.
+ORPHAN_MEDIA_SECONDS = 24 * 3600
 
 # Seeded by the Phase 1 skeleton for its hardcoded test token; removed on startup.
 LEGACY_TEST_GROUP_ID = "g_test"
@@ -190,7 +201,78 @@ def init_db() -> None:
         add_column(conn, "sealed_keys", "signer_device_id", "TEXT REFERENCES devices(id)")
         add_column(conn, "devices", "anchors", "TEXT")  # JSON [{device_id, sign_pubkey}]
         add_column(conn, "devices", "anchors_signature", "BLOB")
+        # Phase 6: key rotation, pruning, removal.
+        add_column(conn, "groups", "key_version", "INTEGER NOT NULL DEFAULT 1")
+        add_column(conn, "groups", "pruned_through", "INTEGER NOT NULL DEFAULT 0")
+        add_column(conn, "groups", "rotation_pending", "INTEGER NOT NULL DEFAULT 0")
+        add_column(conn, "devices", "revoked_reason", "TEXT")  # denied / removed / revoked
+        add_column(conn, "devices", "revoked_at", "INTEGER")
+        conn.execute(
+            "UPDATE groups SET key_version = MAX(key_version,"
+            " (SELECT COALESCE(MAX(key_version), 1) FROM sealed_keys WHERE group_id = groups.id),"
+            " (SELECT COALESCE(MAX(key_version), 1) FROM events WHERE group_id = groups.id))"
+        )
         drop_legacy_test_group(conn)
+
+
+def prune(t: int | None = None) -> dict:
+    """Delete events (and their media) that every active device has acked, and
+    events and media older than the retention window. Revoked devices and
+    removed members don't count. Records the highest seq deleted per group
+    (`pruned_through`), so a device that comes back with an older cursor
+    knows it missed something."""
+    t = now() if t is None else t
+    cutoff = t - int(RETENTION_DAYS * 86400)
+    out = {"events": 0, "media": 0}
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        doomed_media: set[str] = set()
+        for g in conn.execute("SELECT id FROM groups").fetchall():
+            gid = g["id"]
+            # A device with no ack yet has nothing: it holds everything back.
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MIN(COALESCE(a.last_seq, 0)) AS low FROM devices d"
+                " JOIN members m ON m.id = d.member_id LEFT JOIN acks a ON a.device_id = d.id"
+                " WHERE d.group_id = ? AND d.status = 'active' AND m.status = 'active'",
+                (gid,),
+            ).fetchone()
+            acked = row["low"] if row["n"] else 0
+            where = "group_id = ? AND (seq <= ? OR created_at < ?)"
+            args = (gid, acked, cutoff)
+            top = conn.execute(f"SELECT MAX(seq) FROM events WHERE {where}", args).fetchone()[0]
+            if top is None:
+                continue
+            for r in conn.execute(f"SELECT media_ids FROM events WHERE {where} AND media_ids != ''", args):
+                doomed_media.update(m for m in r["media_ids"].split(",") if m)
+            out["events"] += conn.execute(f"DELETE FROM events WHERE {where}", args).rowcount
+            conn.execute("UPDATE groups SET pruned_through = MAX(pruned_through, ?) WHERE id = ?", (top, gid))
+        # Media: referenced by a deleted event, past retention, or never referenced.
+        live: set[str] = set()
+        for r in conn.execute("SELECT media_ids FROM events WHERE media_ids != ''"):
+            live.update(m for m in r["media_ids"].split(",") if m)
+        doomed = [
+            r for r in conn.execute("SELECT id, path, created_at FROM media").fetchall()
+            if r["id"] in doomed_media or r["created_at"] < cutoff
+            or (r["id"] not in live and r["created_at"] < t - ORPHAN_MEDIA_SECONDS)
+        ]
+        for r in doomed:
+            conn.execute("DELETE FROM media WHERE id = ?", (r["id"],))
+        out["media"] = len(doomed)
+    # Files after the commit: a crash in between leaves a stray file, never a dangling row.
+    for r in doomed:
+        (MEDIA_DIR / r["path"]).unlink(missing_ok=True)
+    return out
+
+
+async def prune_loop() -> None:
+    while True:
+        try:
+            n = await run_in_threadpool(prune)
+            if n["events"] or n["media"]:
+                print(f"prune: deleted {n['events']} events, {n['media']} media", flush=True)
+        except Exception as e:  # keep the job alive; it retries next time
+            print(f"prune failed: {e!r}", flush=True)
+        await asyncio.sleep(PRUNE_EVERY_SECONDS)
 
 
 class Hub:
@@ -275,10 +357,11 @@ def push_key_rotated(group_id: str, key_version: int) -> None:
     hub.send(to, {"type": "key_rotated", "key_version": key_version})
 
 
-def push_removed(device_ids: list[str]) -> None:
-    """These devices were revoked: tell them, then close their sockets.
-    Sent by member removal (Phase 6), and by /ws itself when it notices."""
-    hub.send(device_ids, {"type": "removed"}, close=True)
+def push_removed(device_ids: list[str], scope: str) -> None:
+    """These devices were revoked: tell them, then close their sockets. `scope`
+    is "member" (the member was removed) or "device" (just this device).
+    Sent by removal and revocation, and by /ws itself when it notices."""
+    hub.send(device_ids, {"type": "removed", "scope": scope}, close=True)
 
 
 def the_group(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -426,6 +509,26 @@ class CertsIn(BaseModel):
     certs: list[CertIn] = Field(min_length=1, max_length=100)
 
 
+class GrantIn(BaseModel):
+    """The new group key sealed to one device, signed by the rotating Key Master
+    over crypto::protocol::key_grant_message."""
+
+    device_id: str
+    sealed_blob: str
+    signature: str
+
+    @field_validator("sealed_blob", "signature")
+    @classmethod
+    def check_b64(cls, v: str, info):
+        b64decode(v, info.field_name)
+        return v
+
+
+class RotateIn(BaseModel):
+    key_version: int = Field(ge=2)
+    sealed_keys: list[GrantIn] = Field(min_length=1, max_length=1000)
+
+
 class RoleIn(BaseModel):
     role: Literal["keymaster"]  # demotion waits for revocation (Phase 6)
     certs: list[CertIn] = Field(min_length=1, max_length=100)
@@ -453,10 +556,12 @@ class AckIn(BaseModel):
 async def lifespan(_app: FastAPI):
     init_db()
     hub.loop = asyncio.get_running_loop()
+    pruner = asyncio.create_task(prune_loop())
     yield
+    pruner.cancel()
 
 
-app = FastAPI(title="Side Tray relay", version="0.5.0", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="Side Tray relay", version="0.6.0", docs_url=None, redoc_url=None, lifespan=lifespan)
 api = APIRouter(prefix="/api/v1")
 
 
@@ -546,7 +651,7 @@ def join_status(dev: Device = Depends(any_device)):
     if dev.status == "pending":
         return {"status": "pending", "device_id": dev.id}
     if dev.status != "active":
-        return {"status": "denied", "device_id": dev.id}
+        return {"status": revoked_status(dev.id), "device_id": dev.id}
     with db() as conn:
         row = conn.execute(
             "SELECT approved_by, anchors, anchors_signature FROM devices WHERE id = ?", (dev.id,)
@@ -556,6 +661,32 @@ def join_status(dev: Device = Depends(any_device)):
             "approved_by": row["approved_by"],
             "anchors": json.loads(row["anchors"]) if row["anchors"] else [],
             "anchors_signature": b64encode(row["anchors_signature"] or b"")}
+
+
+def revoked_status(device_id: str) -> str:
+    """Where a device stands: "active", "denied" (its join was turned down),
+    "removed" (its member was removed) or "revoked" (just this device)."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT d.status, d.revoked_reason, d.approved_by, m.status AS member_status"
+            " FROM devices d JOIN members m ON m.id = d.member_id WHERE d.id = ?",
+            (device_id,),
+        ).fetchone()
+    if r is None:
+        return "revoked"
+    if r["status"] == "active" and r["member_status"] == "active":
+        return "active"
+    if r["revoked_reason"] == "denied" or (r["revoked_reason"] is None and r["approved_by"] is None):
+        return "denied"
+    if r["member_status"] == "removed" or r["revoked_reason"] == "removed":
+        return "removed"
+    return "revoked"
+
+
+def group_row(conn: sqlite3.Connection, group_id: str) -> sqlite3.Row:
+    return conn.execute(
+        "SELECT key_version, pruned_through, rotation_pending FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
 
 
 def sealed_keys_for(device_id: str) -> list[dict]:
@@ -585,7 +716,44 @@ def sealed_keys_for(device_id: str) -> list[dict]:
 
 @api.get("/keys")
 def get_keys(dev: Device = Depends(current_device)):
-    return {"sealed_keys": sealed_keys_for(dev.id)}
+    """This device's sealed group keys (every version), the group's current key
+    version, and whether a removal is still waiting for a Key Master to rotate."""
+    with db() as conn:
+        g = group_row(conn, dev.group_id)
+    return {"sealed_keys": sealed_keys_for(dev.id), "key_version": g["key_version"],
+            "rotation_pending": bool(g["rotation_pending"])}
+
+
+@api.post("/keys/rotate")
+def rotate_keys(body: RotateIn, km: Device = Depends(keymaster_device)):
+    """A Key Master uploads a new group key version, sealed to every active
+    device (its own included) and signed per device. The server checks the
+    version is the next one and that the set of devices is exactly the active
+    ones, so nobody is quietly left out or added."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = group_row(conn, km.group_id)["key_version"]
+        if body.key_version != cur + 1:
+            raise HTTPException(409, f"the group key is at version {cur}; the next one is {cur + 1}")
+        want = set(active_device_ids(conn, km.group_id))
+        got = [k.device_id for k in body.sealed_keys]
+        if len(set(got)) != len(got):
+            raise HTTPException(422, "more than one key for the same device")
+        if set(got) != want:
+            missing, extra = sorted(want - set(got)), sorted(set(got) - want)
+            raise HTTPException(422, {"error": "the new key must be sealed to exactly the active devices",
+                                      "missing": missing, "not_active": extra})
+        for k in body.sealed_keys:
+            conn.execute(
+                "INSERT INTO sealed_keys (group_id, device_id, key_version, sealed_blob, signature, signer_device_id)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (km.group_id, k.device_id, body.key_version, b64decode(k.sealed_blob, "sealed_blob"),
+                 b64decode(k.signature, "signature"), km.id),
+            )
+        conn.execute("UPDATE groups SET key_version = ?, rotation_pending = 0 WHERE id = ?",
+                     (body.key_version, km.group_id))
+    push_key_rotated(km.group_id, body.key_version)
+    return {"key_version": body.key_version, "devices": len(got)}
 
 
 @api.get("/joins/pending")
@@ -670,6 +838,9 @@ def approve_join(device_id: str, body: ApproveIn, km: Device = Depends(keymaster
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         pending_device(conn, device_id, km.group_id)
+        cur = group_row(conn, km.group_id)["key_version"]
+        if cur not in versions:
+            raise HTTPException(409, f"include the current group key (version {cur}); fetch GET /keys first")
         if body.cert.device_id != device_id:
             raise HTTPException(422, "certificate is for a different device")
         store_cert(conn, km, body.cert, member_role_of(conn, device_id), allowed_status=("pending",))
@@ -699,7 +870,8 @@ def deny_join(device_id: str, km: Device = Depends(keymaster_device)):
         row = pending_device(conn, device_id, km.group_id)
         # The token stays on file only so /join/status can report the denial;
         # every other endpoint requires an active device.
-        conn.execute("UPDATE devices SET status = 'revoked' WHERE id = ?", (device_id,))
+        conn.execute("UPDATE devices SET status = 'revoked', revoked_reason = 'denied', revoked_at = ?"
+                     " WHERE id = ?", (now(), device_id))
         others = conn.execute(
             "SELECT COUNT(*) FROM devices WHERE member_id = ? AND status != 'revoked'",
             (row["member_id"],),
@@ -715,7 +887,8 @@ def members(dev: Device = Depends(current_device)):
     certificates (crypto::roster) and ignore anything that doesn't verify."""
     with db() as conn:
         rows = conn.execute(
-            "SELECT m.id AS member_id, m.display_name, m.role, d.id AS device_id, d.enc_pubkey, d.sign_pubkey"
+            "SELECT m.id AS member_id, m.display_name, m.role, d.id AS device_id, d.enc_pubkey, d.sign_pubkey,"
+            " d.last_seen, d.requested_at"
             " FROM members m JOIN devices d ON d.member_id = m.id"
             " WHERE m.group_id = ? AND m.status = 'active' AND d.status = 'active'"
             " ORDER BY m.created_at, d.requested_at",
@@ -735,9 +908,12 @@ def members(dev: Device = Depends(current_device)):
     for r in rows:
         m = out.setdefault(r["member_id"], {"id": r["member_id"], "display_name": r["display_name"],
                                             "role": r["role"], "devices": []})
-        m["devices"].append({"id": r["device_id"], "enc_pubkey": b64encode(r["enc_pubkey"]),
-                             "sign_pubkey": b64encode(r["sign_pubkey"]),
-                             "certs": certs.get(r["device_id"], [])})
+        d = {"id": r["device_id"], "enc_pubkey": b64encode(r["enc_pubkey"]),
+             "sign_pubkey": b64encode(r["sign_pubkey"]), "certs": certs.get(r["device_id"], [])}
+        if dev.role == "keymaster":
+            # Activity is only shown to the people who manage devices.
+            d["last_seen"], d["joined_at"] = r["last_seen"], r["requested_at"]
+        m["devices"].append(d)
     return {"members": list(out.values())}
 
 
@@ -776,9 +952,75 @@ def set_role(member_id: str, body: RoleIn, km: Device = Depends(keymaster_device
     return {"member_id": member_id, "role": body.role}
 
 
+@api.post("/members/{member_id}/remove")
+def remove_member(member_id: str, km: Device = Depends(keymaster_device)):
+    """Remove a member: every one of their devices is revoked at once (tokens
+    stop working, sockets get `removed`). The group key still has to be rotated
+    by a Key Master's app; until then GET /keys says rotation_pending."""
+    t = now()
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        m = conn.execute(
+            "SELECT status FROM members WHERE id = ? AND group_id = ?", (member_id, km.group_id)
+        ).fetchone()
+        if m is None:
+            raise HTTPException(404, "no such member")
+        if m["status"] != "active":
+            raise HTTPException(409, "already removed")
+        if member_id == km.member_id:
+            raise HTTPException(409, "you can't remove yourself; ask another Key Master")
+        devices = [r["id"] for r in conn.execute(
+            "SELECT id FROM devices WHERE member_id = ? AND status IN ('active', 'pending')", (member_id,))]
+        had_active = conn.execute(
+            "SELECT COUNT(*) FROM devices WHERE member_id = ? AND status = 'active'", (member_id,)
+        ).fetchone()[0]
+        conn.execute("UPDATE members SET status = 'removed' WHERE id = ?", (member_id,))
+        conn.execute(
+            "UPDATE devices SET status = 'revoked', revoked_reason = 'removed', revoked_at = ?"
+            " WHERE member_id = ? AND status IN ('active', 'pending')",
+            (t, member_id),
+        )
+        if had_active:
+            conn.execute("UPDATE groups SET rotation_pending = 1 WHERE id = ?", (km.group_id,))
+    push_removed(devices, "member")
+    return {"member_id": member_id, "status": "removed", "revoked_devices": devices,
+            "rotation_pending": bool(had_active)}
+
+
+@api.post("/devices/{device_id}/revoke")
+def revoke_device(device_id: str, km: Device = Depends(keymaster_device)):
+    """Revoke one device (say, a lost laptop). Its member stays in the group.
+    Like a removal, the group key then needs rotating."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        d = conn.execute(
+            "SELECT status FROM devices WHERE id = ? AND group_id = ?", (device_id, km.group_id)
+        ).fetchone()
+        if d is None:
+            raise HTTPException(404, "no such device")
+        if d["status"] == "pending":
+            raise HTTPException(409, "that device is still waiting to join; deny it instead")
+        if d["status"] != "active":
+            raise HTTPException(409, "already revoked")
+        if device_id == km.id:
+            raise HTTPException(409, "you can't revoke the device you're using")
+        conn.execute("UPDATE devices SET status = 'revoked', revoked_reason = 'revoked', revoked_at = ? WHERE id = ?",
+                     (now(), device_id))
+        conn.execute("UPDATE groups SET rotation_pending = 1 WHERE id = ?", (km.group_id,))
+    push_removed([device_id], "device")
+    return {"device_id": device_id, "status": "revoked", "rotation_pending": True}
+
+
 @api.post("/events", status_code=201)
 def post_event(ev: EventIn, dev: Device = Depends(current_device)):
     with db() as conn:
+        cur = group_row(conn, dev.group_id)["key_version"]
+        if ev.key_version < cur:
+            # After a rotation, nothing new may use a key a removed member holds.
+            raise HTTPException(409, f"key_version {ev.key_version} is out of date; the group key is at"
+                                     f" version {cur} (fetch GET /keys)")
+        if ev.key_version > cur:
+            raise HTTPException(422, f"no group key version {ev.key_version} yet")
         for mid in ev.media_ids:
             if not conn.execute(
                 "SELECT 1 FROM media WHERE id = ? AND group_id = ?", (mid, dev.group_id)
@@ -816,6 +1058,7 @@ def get_events(
             " FROM events WHERE group_id = ? AND seq > ? ORDER BY seq LIMIT ?",
             (dev.group_id, after, limit + 1),
         ).fetchall()
+        g = group_row(conn, dev.group_id)
     more = len(rows) > limit
     rows = rows[:limit]
     events = [
@@ -835,6 +1078,10 @@ def get_events(
         "events": events,
         "last_seq": events[-1]["seq"] if events else after,
         "has_more": more,
+        # A cursor below pruned_through means events this device never got were deleted.
+        "pruned_through": g["pruned_through"],
+        "retention_days": RETENTION_DAYS,
+        "key_version": g["key_version"],
     }
 
 
@@ -900,17 +1147,6 @@ def download_media(media_id: str, dev: Device = Depends(current_device)):
     return FileResponse(MEDIA_DIR / row["path"], media_type="application/octet-stream")
 
 
-def device_status(device_id: str) -> str:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT d.status, m.status AS member_status FROM devices d JOIN members m ON m.id = d.member_id"
-            " WHERE d.id = ?", (device_id,)
-        ).fetchone()
-    if row is None:
-        return "revoked"
-    return row["status"] if row["member_status"] == "active" else "revoked"
-
-
 @api.websocket("/ws")
 async def ws(websocket: WebSocket):
     """Push channel. Authenticated like every other call, with
@@ -922,7 +1158,8 @@ async def ws(websocket: WebSocket):
       {"type": "new_event", "seq", "kind"}      someone else appended an event
       {"type": "join_request", "device_id", "display_name", "existing_member"}  Key Masters only
       {"type": "key_rotated", "key_version"}    fetch GET /keys
-      {"type": "removed"}                       this device was revoked; the socket closes
+      {"type": "removed", "scope"}              this device was revoked ("device") or its
+                                                member removed ("member"); the socket closes
       {"type": "pong"}                          reply to a ping
     Client -> server: {"type": "ping"} at least every WS_IDLE_SECONDS.
     """
@@ -950,8 +1187,9 @@ async def ws(websocket: WebSocket):
                 continue
             if kind == "ping":
                 # Notice revocation even if nobody calls push_removed.
-                if await run_in_threadpool(device_status, dev.id) != "active":
-                    push_removed([dev.id])
+                st = await run_in_threadpool(revoked_status, dev.id)
+                if st != "active":
+                    push_removed([dev.id], "member" if st == "removed" else "device")
                     continue
                 try:
                     q.put_nowait('{"type":"pong"}')

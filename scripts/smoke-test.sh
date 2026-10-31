@@ -7,7 +7,10 @@
 #    group creation with the setup token, member certificates, join, pending
 #    list, Key Master-only checks, approve with sealed keys + certificate +
 #    anchors, deny, promotion, members, events, ack, media, and the /ws push
-#    channel (who gets join_request and new_event, idle sockets dropped).
+#    channel (who gets join_request and new_event, idle sockets dropped),
+#    and Phase 6: member removal, single-device revocation, key rotation
+#    (exactly the active devices, next version only, stale keys refused) and
+#    the prune job (acked by every active device, and past retention).
 #    Keys, signatures and ciphertext are random bytes: the relay never checks
 #    them (clients do), only that certificates describe the right device.
 set -euo pipefail
@@ -58,7 +61,7 @@ unset CACERT
 
 echo "== full API on a throwaway container"
 docker compose run -d --rm --no-deps --name "$SMOKE" -p 127.0.0.1::8000 \
-  -e SIDETRAY_DATA=/tmp/smoke -e SIDETRAY_SETUP_TOKEN=smoke-setup -e SIDETRAY_WS_IDLE_SECONDS=6 api >/dev/null
+  -e SIDETRAY_DATA=/tmp/smoke -e SIDETRAY_SETUP_TOKEN=smoke-setup -e SIDETRAY_WS_IDLE_SECONDS=6 -e SIDETRAY_PRUNE_EVERY_SECONDS=2 api >/dev/null
 PORT=$(docker port "$SMOKE" 8000/tcp | head -1 | sed 's/.*://')
 B="http://127.0.0.1:$PORT/api/v1"
 for _ in $(seq 50); do curl -sf "$B/health" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -80,7 +83,7 @@ expect 422 POST /join "" '{"group_name":"G","display_name":"A","email":"a@x.test
   && pass "short public keys -> 422" || fail "short public keys -> 422"
 
 KM=$(expect 201 POST /join "" "$(join_body Kim kim@x.test smoke-setup "" "$KM_SIGN")")
-KM_TOK=$(echo "$KM" | j '["token"]'); KM_DEV=$(echo "$KM" | j '["device_id"]')
+KM_TOK=$(echo "$KM" | j '["token"]'); KM_DEV=$(echo "$KM" | j '["device_id"]'); KM_MEM=$(echo "$KM" | j '["member_id"]')
 [ "$(echo "$KM" | j '["role"]')" = keymaster ] && [ "$(echo "$KM" | j '["status"]')" = active ] \
   && pass "setup token creates the group; first device is an active Key Master ($KM_DEV)" || fail "setup token creates the group; first device is an active Key Master ($KM_DEV)"
 [ "$(expect 200 GET /group | j '["name"]')" = "Smoke Family" ] && pass "GET /group names it" || fail "GET /group names it"
@@ -192,7 +195,7 @@ W="ws://127.0.0.1:$PORT/api/v1/ws"
 [ "$(probe "$W" || true)" = "rejected 403" ] && pass "/ws without a token -> 403" || fail "/ws without a token -> 403"
 [ "$(probe "$W" --token bogus-token || true)" = "rejected 403" ] && pass "/ws with an unknown token -> 403" || fail "/ws with an unknown token -> 403"
 ZED=$(expect 201 POST /join "" "$(join_body Zed zed@x.test)")
-ZED_TOK=$(echo "$ZED" | j '["token"]'); ZED_DEV=$(echo "$ZED" | j '["device_id"]')
+ZED_TOK=$(echo "$ZED" | j '["token"]'); ZED_DEV=$(echo "$ZED" | j '["device_id"]'); ZED_MEM=$(echo "$ZED" | j '["member_id"]')
 [ "$(probe "$W" --token "$ZED_TOK" || true)" = "rejected 403" ] && pass "/ws with a pending token -> 403" || fail "/ws with a pending token -> 403"
 [ "$(probe "$W" --token "$MAL_TOK" || true)" = "rejected 403" ] && pass "/ws with a denied token -> 403" || fail "/ws with a denied token -> 403"
 expect 200 POST "/joins/$ZED_DEV/approve" "$KM_TOK" "$(approve_body "$ZED_DEV" Zed)" >/dev/null && pass "Zed approved as a member" || fail "Zed approved as a member"
@@ -202,7 +205,8 @@ probe "$W" --token "$KM_TOK" --count 2 --timeout 15 --ready "$TMP/km.ready" > "$
 probe "$W" --token "$ZED_TOK" --count 1 --timeout 15 --ready "$TMP/zed.ready" > "$TMP/zed.ws" & ZED_WS=$!
 for _ in $(seq 50); do [ -e "$TMP/km.ready" ] && [ -e "$TMP/zed.ready" ] && break; sleep 0.1; done
 [ -e "$TMP/km.ready" ] && [ -e "$TMP/zed.ready" ] && pass "two devices connected, each got hello and a pong" || fail "two devices connected, each got hello and a pong"
-YAN_DEV=$(expect 201 POST /join "" "$(join_body Yan yan@x.test)" | j '["device_id"]')
+YAN=$(expect 201 POST /join "" "$(join_body Yan yan@x.test)")
+YAN_DEV=$(echo "$YAN" | j '["device_id"]'); YAN_TOK=$(echo "$YAN" | j '["token"]')
 ZSEQ=$(expect 201 POST /events "$ZED_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | j '["seq"]')
 KSEQ=$(expect 201 POST /events "$KM_TOK" "{\"kind\":\"comment\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | j '["seq"]')
 wait "$KM_WS" || fail "Kim's socket didn't get its two messages"
@@ -218,4 +222,114 @@ assert zed == [{"type": "new_event", "seq": kseq, "kind": "comment"}], zed
 PY
 pass "Key Master got join_request + Zed's new_event; member Zed got only Kim's new_event, not its own or the join"
 [ "$(probe "$W" --token "$KM_TOK" --count 1 --timeout 12)" = '{"type": "_closed"}' ]   && pass "a socket that stops pinging is closed after the idle timeout" || fail "a socket that stops pinging is closed after the idle timeout"
+
+echo "== removal, revocation and key rotation"
+expect 200 POST "/joins/$YAN_DEV/approve" "$KM_TOK" "$(approve_body "$YAN_DEV" Yan)" >/dev/null && pass "Yan approved as a member" || fail "Yan approved as a member"
+expect 403 POST "/members/$KM_MEM/remove" "$YAN_TOK" >/dev/null && pass "member can't remove anyone (403)" || fail "member can't remove anyone (403)"
+expect 409 POST "/members/$KM_MEM/remove" "$KM_TOK" >/dev/null && pass "Key Master can't remove themselves (409)" || fail "Key Master can't remove themselves (409)"
+expect 404 POST /members/m_nope/remove "$KM_TOK" >/dev/null && pass "unknown member -> 404" || fail "unknown member -> 404"
+
+probe "$W" --token "$ZED_TOK" --count 2 --timeout 15 --ready "$TMP/zed2.ready" > "$TMP/zed2.ws" & ZED_WS=$!
+for _ in $(seq 50); do [ -e "$TMP/zed2.ready" ] && break; sleep 0.1; done
+REM=$(expect 200 POST "/members/$ZED_MEM/remove" "$KM_TOK")
+[ "$(echo "$REM" | j '["revoked_devices"]')" = "['$ZED_DEV']" ] && [ "$(echo "$REM" | j '["rotation_pending"]')" = True ] \
+  && pass "Key Master removes Zed: his device is revoked, rotation pending" || fail "Key Master removes Zed: his device is revoked, rotation pending"
+wait "$ZED_WS" || fail "Zed's socket didn't get removed + close"
+[ "$(cat "$TMP/zed2.ws")" = "$(printf '%s\n%s' '{"type": "removed", "scope": "member"}' '{"type": "_closed"}')" ] \
+  && pass "Zed's open socket got {type: removed, scope: member} and was closed" || fail "Zed's open socket got removed + close: $(cat "$TMP/zed2.ws")"
+expect 401 GET /events "$ZED_TOK" >/dev/null && pass "removed member's token can't read events" || fail "removed member's token can't read events"
+expect 401 GET /keys "$ZED_TOK" >/dev/null && pass "removed member's token can't fetch keys" || fail "removed member's token can't fetch keys"
+[ "$(expect 200 GET /join/status "$ZED_TOK" | j '["status"]')" = removed ] && pass "/join/status tells Zed's app it was removed" || fail "/join/status tells Zed's app it was removed"
+[ "$(probe "$W" --token "$ZED_TOK" || true)" = "rejected 403" ] && pass "/ws with a removed member's token -> 403" || fail "/ws with a removed member's token -> 403"
+expect 409 POST "/members/$ZED_MEM/remove" "$KM_TOK" >/dev/null && pass "removing twice -> 409" || fail "removing twice -> 409"
+[ "$(expect 200 GET /members "$KM_TOK" | python3 -c "import sys,json; print(sorted(m['display_name'] for m in json.load(sys.stdin)['members']))")" = "['Al', 'Kim', 'Yan']" ] \
+  && pass "roster no longer lists Zed" || fail "roster no longer lists Zed"
+KEYS=$(expect 200 GET /keys "$KM_TOK")
+[ "$(echo "$KEYS" | j '["rotation_pending"]')" = True ] && [ "$(echo "$KEYS" | j '["key_version"]')" = 1 ] \
+  && pass "GET /keys: key version 1, rotation pending" || fail "GET /keys: key version 1, rotation pending"
+
+# rotate_body VERSION DEVICE... -> a v-VERSION key "sealed" to each device
+rotate_body() {
+  local v=$1; shift
+  python3 - "$v" "$@" <<'PY'
+import base64, json, os, sys
+v, devs = int(sys.argv[1]), sys.argv[2:]
+b = lambda n: base64.b64encode(os.urandom(n)).decode()
+print(json.dumps({"key_version": v, "sealed_keys": [{"device_id": d, "sealed_blob": b(84), "signature": b(64)} for d in devs]}))
+PY
+}
+expect 403 POST /keys/rotate "$YAN_TOK" "$(rotate_body 2 "$KM_DEV" "$AL_DEV" "$YAN_DEV")" >/dev/null && pass "member can't rotate the key (403)" || fail "member can't rotate the key (403)"
+expect 409 POST /keys/rotate "$KM_TOK" "$(rotate_body 3 "$KM_DEV" "$AL_DEV" "$YAN_DEV")" >/dev/null && pass "skipping a version -> 409" || fail "skipping a version -> 409"
+expect 422 POST /keys/rotate "$KM_TOK" "$(rotate_body 2 "$KM_DEV" "$AL_DEV")" >/dev/null && pass "leaving an active device out -> 422" || fail "leaving an active device out -> 422"
+expect 422 POST /keys/rotate "$KM_TOK" "$(rotate_body 2 "$KM_DEV" "$AL_DEV" "$YAN_DEV" "$ZED_DEV")" >/dev/null && pass "sealing to the removed device -> 422" || fail "sealing to the removed device -> 422"
+expect 422 POST /keys/rotate "$KM_TOK" "$(rotate_body 2 "$KM_DEV" "$AL_DEV" "$YAN_DEV" "$YAN_DEV")" >/dev/null && pass "two keys for one device -> 422" || fail "two keys for one device -> 422"
+probe "$W" --token "$YAN_TOK" --count 1 --timeout 15 --ready "$TMP/yan.ready" > "$TMP/yan.ws" & YAN_WS=$!
+for _ in $(seq 50); do [ -e "$TMP/yan.ready" ] && break; sleep 0.1; done
+ROT=$(rotate_body 2 "$KM_DEV" "$AL_DEV" "$YAN_DEV")
+expect 200 POST /keys/rotate "$KM_TOK" "$ROT" >/dev/null && pass "Key Master rotates to v2, sealed to exactly Kim, Al and Yan" || fail "Key Master rotates to v2"
+wait "$YAN_WS" || fail "Yan's socket didn't get key_rotated"
+[ "$(cat "$TMP/yan.ws")" = '{"type": "key_rotated", "key_version": 2}' ] && pass "Yan's socket got key_rotated v2" || fail "Yan's socket got key_rotated v2: $(cat "$TMP/yan.ws")"
+expect 409 POST /keys/rotate "$KM_TOK" "$ROT" >/dev/null && pass "rotating to v2 twice -> 409" || fail "rotating to v2 twice -> 409"
+python3 - "$(expect 200 GET /keys "$YAN_TOK")" "$ROT" "$YAN_DEV" "$KM_DEV" <<'PY'
+import json, sys
+k, rot, yan, km = json.loads(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3], sys.argv[4]
+assert k["key_version"] == 2 and k["rotation_pending"] is False, k
+v2 = [s for s in k["sealed_keys"] if s["key_version"] == 2]
+mine = next(s for s in rot["sealed_keys"] if s["device_id"] == yan)
+assert [s["key_version"] for s in k["sealed_keys"]] == [1, 2], k
+assert (v2[0]["sealed_blob"], v2[0]["signature"], v2[0]["signer_device_id"]) == (mine["sealed_blob"], mine["signature"], km), v2
+PY
+pass "Yan's GET /keys has v1 and v2 (its own blob, signed by Kim); rotation no longer pending"
+expect 409 POST /events "$YAN_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" >/dev/null && pass "posting with the old key v1 -> 409" || fail "posting with the old key v1 -> 409"
+expect 422 POST /events "$YAN_TOK" "{\"kind\":\"post\",\"key_version\":3,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" >/dev/null && pass "posting with a key that doesn't exist yet -> 422" || fail "posting with key v3 -> 422"
+V2SEQ=$(expect 201 POST /events "$YAN_TOK" "{\"kind\":\"post\",\"key_version\":2,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | j '["seq"]')
+pass "posting with v2 works (seq=$V2SEQ)"
+[ "$(expect 200 GET "/events?after=0" "$KM_TOK" | j '["key_version"]')" = 2 ] && pass "GET /events reports the current key version" || fail "GET /events reports the current key version"
+
+v12() {  # approve body sealing versions 1 and 2: device display_name [role]
+  echo "$(approve_body "$@")" | python3 -c "import sys,json; b=json.load(sys.stdin); k=dict(b['sealed_keys'][0]); k['key_version']=2; b['sealed_keys'].append(k); print(json.dumps(b))"
+}
+WES=$(expect 201 POST /join "" "$(join_body Wes wes@x.test)")
+WES_DEV=$(echo "$WES" | j '["device_id"]'); WES_TOK=$(echo "$WES" | j '["token"]')
+expect 409 POST "/joins/$WES_DEV/approve" "$KM_TOK" "$(approve_body "$WES_DEV" Wes)" >/dev/null && pass "approving with only the old key -> 409" || fail "approving with only the old key -> 409"
+expect 200 POST "/joins/$WES_DEV/approve" "$KM_TOK" "$(v12 "$WES_DEV" Wes)" >/dev/null && pass "approving with v1 and v2 works" || fail "approving with v1 and v2 works"
+
+AL2=$(expect 201 POST /join "" "$(join_body Al al@x.test)")
+AL2_DEV=$(echo "$AL2" | j '["device_id"]'); AL2_TOK=$(echo "$AL2" | j '["token"]')
+expect 409 POST "/devices/$AL2_DEV/revoke" "$KM_TOK" >/dev/null && pass "revoking a pending device -> 409 (deny it)" || fail "revoking a pending device -> 409"
+expect 200 POST "/joins/$AL2_DEV/approve" "$KM_TOK" "$(v12 "$AL2_DEV" Al keymaster)" >/dev/null && pass "Al's second device approved" || fail "Al's second device approved"
+expect 403 POST "/devices/$AL2_DEV/revoke" "$YAN_TOK" >/dev/null && pass "member can't revoke a device (403)" || fail "member can't revoke a device (403)"
+expect 409 POST "/devices/$KM_DEV/revoke" "$KM_TOK" >/dev/null && pass "Key Master can't revoke the device they're using (409)" || fail "can't revoke own device (409)"
+probe "$W" --token "$AL2_TOK" --count 2 --timeout 15 --ready "$TMP/al2.ready" > "$TMP/al2.ws" & AL2_WS=$!
+for _ in $(seq 50); do [ -e "$TMP/al2.ready" ] && break; sleep 0.1; done
+expect 200 POST "/devices/$AL2_DEV/revoke" "$KM_TOK" >/dev/null && pass "Key Master revokes Al's second (lost) device" || fail "Key Master revokes Al's second device"
+wait "$AL2_WS" || fail "the lost device's socket didn't get removed + close"
+[ "$(head -1 "$TMP/al2.ws")" = '{"type": "removed", "scope": "device"}' ] && pass "its socket got {type: removed, scope: device}" || fail "lost device socket: $(cat "$TMP/al2.ws")"
+expect 401 GET /events "$AL2_TOK" >/dev/null && pass "revoked device's token can't read events" || fail "revoked device's token can't read events"
+[ "$(expect 200 GET /join/status "$AL2_TOK" | j '["status"]')" = revoked ] && pass "/join/status says revoked (not removed)" || fail "/join/status says revoked"
+expect 200 GET /events "$AL_TOK" >/dev/null && pass "Al's other device still works" || fail "Al's other device still works"
+[ "$(expect 200 GET /keys "$KM_TOK" | j '["rotation_pending"]')" = True ] && pass "revoking a device makes rotation pending" || fail "revoking a device makes rotation pending"
+expect 200 POST /keys/rotate "$KM_TOK" "$(rotate_body 3 "$KM_DEV" "$AL_DEV" "$YAN_DEV" "$WES_DEV")" >/dev/null && pass "rotate to v3 without the lost device" || fail "rotate to v3 without the lost device"
+
+echo "== pruning"
+LAST=$(expect 201 POST /events "$KM_TOK" "{\"kind\":\"post\",\"key_version\":3,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\",\"media_ids\":[\"$MID\"]}" | j '["seq"]')
+for t in "$KM_TOK" "$AL_TOK" "$YAN_TOK"; do expect 200 POST /ack "$t" "{\"seq\":$LAST}" >/dev/null; done
+sleep 4
+[ "$(expect 200 GET "/events?after=0" "$KM_TOK" | j '["events"][0]["seq"]')" -le "$LAST" ] && pass "nothing pruned while Wes (active) hasn't acked" || fail "nothing pruned while Wes hasn't acked"
+expect 200 POST /ack "$WES_TOK" "{\"seq\":$LAST}" >/dev/null
+for _ in $(seq 40); do [ "$(expect 200 GET "/events?after=0" "$KM_TOK" | j '["events"]')" = "[]" ] && break; sleep 0.25; done
+GOT=$(expect 200 GET "/events?after=0" "$KM_TOK")
+[ "$(echo "$GOT" | j '["events"]')" = "[]" ] && [ "$(echo "$GOT" | j '["pruned_through"]')" = "$LAST" ] \
+  && pass "hourly job (every 2 s here) pruned everything once every active device acked; removed Zed and revoked devices didn't count" \
+  || fail "prune job after everyone acked: $GOT"
+expect 404 GET "/media/$MID" "$KM_TOK" >/dev/null && pass "the pruned post's media is gone" || fail "the pruned post's media is gone"
+OLD=$(expect 201 POST /events "$KM_TOK" "{\"kind\":\"post\",\"key_version\":3,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | j '["seq"]')
+expect 200 POST /ack "$KM_TOK" "{\"seq\":$OLD}" >/dev/null
+docker exec "$SMOKE" python -c "import sqlite3; c = sqlite3.connect('/tmp/smoke/sidetray.db'); c.execute('UPDATE events SET created_at = created_at - 91 * 86400 WHERE seq = ?', ($OLD,)); c.commit()"
+PRUNED=$(docker exec "$SMOKE" python -m app.admin prune)
+[ "$(echo "$PRUNED" | j '["events"]')" -le 1 ] || fail "admin prune: $PRUNED"
+GOT=$(expect 200 GET "/events?after=$LAST" "$YAN_TOK")
+[ "$(echo "$GOT" | j '["events"]')" = "[]" ] && [ "$(echo "$GOT" | j '["pruned_through"]')" = "$OLD" ] \
+  && pass "an event past the 90-day window is pruned though Yan never got it; pruned_through ($OLD) > Yan's cursor ($LAST) tells Yan it missed posts" \
+  || fail "retention prune: $GOT"
 echo "All smoke checks passed."
