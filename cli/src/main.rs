@@ -100,6 +100,10 @@ enum Cmd {
     Members,
     /// Encrypt, sign and post a text post.
     Post { text: String },
+    /// Comment on a post (by the id `pull` shows).
+    Comment { post_id: String, text: String },
+    /// React to a post with an emoji; an empty string removes your reaction.
+    React { post_id: String, emoji: String },
     /// Fetch new events, verify and decrypt them, and acknowledge.
     Pull,
 }
@@ -124,7 +128,9 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Certify { device_id, code, keymaster } => certify(dir, device_id.as_deref(), code.as_deref(), keymaster),
         Cmd::Promote { member_id } => promote(dir, &member_id),
         Cmd::Members => members(dir),
-        Cmd::Post { text } => post(dir, &text),
+        Cmd::Post { text } => post(dir, "post", serde_json::json!({ "text": text })),
+        Cmd::Comment { post_id, text } => post(dir, "comment", serde_json::json!({ "post": post_id, "text": text })),
+        Cmd::React { post_id, emoji } => post(dir, "reaction", serde_json::json!({ "post": post_id, "emoji": emoji })),
         Cmd::Pull => pull(dir),
     }
 }
@@ -674,13 +680,13 @@ fn members(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn post(dir: &Path, text: &str) -> Result<()> {
+/// Encrypt, sign and append one event (payload formats: README "Event payloads").
+fn post(dir: &Path, kind: &str, payload: serde_json::Value) -> Result<()> {
     let st = state::load(dir)?;
     require_active(&st)?;
     let me = st.device_keys()?;
     let gk = st.latest_group_key()?;
-    let kind = "post";
-    let body = serde_json::to_vec(&serde_json::json!({ "text": text }))?;
+    let body = serde_json::to_vec(&payload)?;
     let ct = crypto::encrypt(&gk, &body, &protocol::event_ad(&st.group_id, kind));
     let msg = protocol::event_message(&st.group_id, &st.device_id, kind, gk.version(), &ct);
     let sig = crypto::sign(&me, &msg);
@@ -694,7 +700,7 @@ fn post(dir: &Path, text: &str) -> Result<()> {
             media_ids: vec![],
         },
     )?;
-    println!("Posted #{} ({} bytes of ciphertext, key v{}).", r.seq, ct.len(), gk.version());
+    println!("Posted {kind} #{} id {} ({} bytes of ciphertext, key v{}).", r.seq, crypto::event_id(&ct), ct.len(), gk.version());
     Ok(())
 }
 
@@ -739,9 +745,29 @@ fn open_event(st: &State, authors: &BTreeMap<String, VerifiedDevice>, e: &Event)
     let plain = crypto::decrypt(&gk, &ct, &protocol::event_ad(&st.group_id, &e.kind)).context("can't decrypt")?;
     let body: serde_json::Value = serde_json::from_slice(&plain).context("bad payload")?;
     let text = body["text"].as_str().unwrap_or("");
+    let target = body["post"].as_str().unwrap_or("?");
     let who = match author.role {
         Role::Keymaster => format!("{} (Key Master)", author.display_name),
         Role::Member => author.display_name.clone(),
     };
-    Ok(format!("{who}: {text}  [certified author, signature ok, key v{}]", e.key_version))
+    let what = match e.kind.as_str() {
+        "post" => {
+            let photos = body["photos"].as_array().map_or(0, |p| p.len());
+            let extra = match photos {
+                0 => String::new(),
+                1 => "  [1 photo]".into(),
+                n => format!("  [{n} photos]"),
+            };
+            format!("{who}: {text}{extra}  (post {})", crypto::event_id(&ct))
+        }
+        "comment" => format!("{who} commented on {target}: {text}"),
+        "reaction" => match body["emoji"].as_str().unwrap_or("") {
+            "" => format!("{who} removed their reaction to {target}"),
+            emoji => format!("{who} reacted {emoji} to {target}"),
+        },
+        "edit" => format!("{who} edited {target}: {text}"),
+        "delete" => format!("{who} deleted {target}"),
+        other => format!("{who}: ({other} event)"),
+    };
+    Ok(format!("{what}  [certified author, signature ok, key v{}]", e.key_version))
 }

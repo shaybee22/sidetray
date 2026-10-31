@@ -56,6 +56,13 @@ pub fn event_message(
     )
 }
 
+/// Associated data for encrypting a media blob (photo or thumbnail). The post
+/// that references a blob also records its [`crate::blob_digest`], so the
+/// server can't swap one group member's encrypted photo for another's.
+pub fn media_ad(group_id: &str) -> Vec<u8> {
+    framed(b"sidetray/media-ad/v1", &[group_id.as_bytes()])
+}
+
 /// Associated data for an event's content encryption (the key version is
 /// added by [`crate::encrypt`] itself).
 pub fn event_ad(group_id: &str, kind: &str) -> Vec<u8> {

@@ -291,5 +291,26 @@ pub fn safety_code(device: &DevicePublicKeys) -> String {
     format!("{}-{}-{}-{}-{:02}", word(0), word(1), word(2), word(3), n)
 }
 
+/// BLAKE2b-256 of a blob (e.g. an encrypted photo), with a domain prefix.
+/// A post stores this for each photo it references; check it before decrypting.
+pub fn blob_digest(blob: &[u8]) -> [u8; 32] {
+    domain_hash(b"sidetray/blob/v1", blob)
+}
+
+/// The id comments, reactions, edits and deletes use to point at an event:
+/// 32 hex characters (128 bits) of a hash of its ciphertext. Every client
+/// computes the same id without the author having to put one in the payload,
+/// and the server can't change it without breaking the author's signature.
+pub fn event_id(ciphertext: &[u8]) -> String {
+    domain_hash(b"sidetray/event-id/v1", ciphertext)[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn domain_hash(domain: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(domain);
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests;

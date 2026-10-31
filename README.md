@@ -2,10 +2,13 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: Phase 3 (join and Key Master flow).** Devices join with their public
-keys, compare safety codes with a Key Master by phone, and receive the group key
-sealed to them and signed by the approving Key Master. Every device has its own
-bearer token. A dev CLI (`cli/`) drives the whole flow. The desktop app, WebSocket,
+**Status: Phase 4 (desktop client feed).** A Tauri 2 desktop app (`app/`) has a
+first-run wizard (join, or found the group with the setup token), the safety-code
+join flow, a Key Master screen, and a feed with posts, photos, comments and
+reactions. It keeps a local SQLite archive and syncs every 30 seconds. Devices
+join with their public keys, compare safety codes with a Key Master by phone, and
+receive the group key sealed to them and signed by the approving Key Master. The
+dev CLI (`cli/`) speaks the same formats. Tray and notifications, the WebSocket,
 pruning, removal and rate limits come in later phases.
 
 ## Layout
@@ -17,6 +20,8 @@ server/app/main.py    the relay
 scripts/smoke-test.sh live TLS checks + full API run on a throwaway container
 crypto/               Rust crate: keys, sealing, encryption, signatures, safety codes
 cli/                  Rust dev CLI (`sidetray`): init-group, join, approve, post, pull
+app/src-tauri/        desktop app backend (Rust, Tauri 2)
+app/ui/               desktop app frontend (plain HTML/CSS/JS, no build step)
 ```
 
 ## Run
@@ -109,6 +114,78 @@ The server relays the roster, but clients don't take its word for it
   refuses their posts. Names and roles shown come from certificates, never from
   the server's fields.
 
+## Desktop app (Phase 4)
+
+Build on Windows: the Rust MSVC toolchain, Visual Studio C++ Build Tools and
+the WebView2 runtime (preinstalled on Windows 11). No Node or npm is needed:
+the UI is plain files in `app/ui/`, embedded at build time.
+
+```sh
+cd app/src-tauri
+cargo build --release          # target/release/sidetray-app(.exe)
+cargo test                     # photo stripping, event checks, key storage
+```
+
+Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
+`cargo tauri build`.
+
+- **First run.** The wizard asks for the server address and checks `GET /group`.
+  If the group exists, it asks for the group name, your display name and email,
+  then sends the join request. It shows the safety code big, and polls until a
+  Key Master approves. You then type the code that Key Master reads back to you,
+  the same check as the CLI's `status --km-code`. Nothing is stored or trusted
+  until it matches. On a server with no group, the wizard offers to create one
+  with the operator's setup token, and you become its Key Master.
+- **Key Master screen.** Lists pending joins without their codes: you type the
+  code you heard, and the app approves only if it matches the keys the server
+  relayed. It then shows your own code to read back. You can also deny.
+- **Feed.** Newest first: posts, photos, comments, one reaction per person per
+  post, and delete for your own posts. It syncs every 30 seconds (the WebSocket
+  comes in Phase 5) and after every action. Sync applies the same rules as
+  `pull`: an event counts only if its author has a member certificate chaining
+  to a pinned Key Master, the signature verifies and it decrypts. Anything else
+  is skipped and counted under *This device*.
+- **Photos.** Resized so the longest side is 2048 px and saved as WebP at
+  quality 80, plus a 400 px thumbnail. The EXIF orientation is applied, then all
+  metadata (GPS included) is dropped, because the output is encoded from raw
+  pixels. Both files are encrypted with the group key
+  (AD `protocol::media_ad(group)`) and uploaded to `POST /media`. The post
+  records each blob's `blob_digest`, so the server can't swap photos; it's
+  checked before decrypting.
+- **HTTPS.** `app/src-tauri/pinned-roots.pem` (Caddy's internal root for the
+  test relay) is compiled in. When it's non-empty, the app trusts exactly those
+  roots and no others. The wizard's *Advanced* box can pin a different root PEM
+  for a server. If the file is emptied, the public web roots are used, for when
+  the server gets a real domain. Verification is never off. Plain `http://` is
+  accepted only for `127.0.0.1`/`localhost`, for a relay in development.
+- **Local data** lives in the app data dir (`%APPDATA%\org.sidetray.app` on
+  Windows; `SIDETRAY_DATA_DIR` overrides it). `sidetray.db` holds the spec's
+  client tables plus `anchors` and `member_devices`, and `media/` holds the
+  decrypted photos. Posts are plaintext on disk (SPEC: rely on OS disk
+  encryption). The device's private keys, its token and a local wrapping key
+  are kept in one Windows Credential Manager / macOS Keychain entry. Group keys
+  sit in SQLite, encrypted under that wrapping key. Linux has no keychain
+  backend yet, so there those secrets live in the database.
+
+## Event payloads
+
+Event content is JSON, encrypted with AD `protocol::event_ad(group, kind)` and
+signed over `protocol::event_message`. Comments, reactions, edits and deletes
+point at a post by its **event id**, `crypto::event_id(ciphertext)` (32 hex
+characters). Every client computes it the same way, and the server can't change
+it without breaking the signature.
+
+| kind | payload |
+| --- | --- |
+| post | `{"text", "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}]}`, with media ids, and digests as base64 `blob_digest` of each encrypted blob |
+| comment | `{"post": event_id, "text"}` |
+| reaction | `{"post": event_id, "emoji"}`. The latest one per member wins; `""` removes it |
+| edit | `{"post": event_id, "text"}`. Only the post's author |
+| delete | `{"post": event_id}`. Only the post's author |
+
+A post's photo media ids also go in the event's clear `media_ids` field, so the
+server can prune them with the event.
+
 ## CLI (Phase 3)
 
 ```sh
@@ -129,7 +206,8 @@ no real domain.
 | `status [--km-code <code>]` | anyone | After approval: verifies the grants and anchors, then stores keys and pins the approver once you type their code. Later: picks up a promotion |
 | `certify [<device> --code <code>] [--keymaster]` | Key Master | Self-certify, or certify a device approved before certificates existed |
 | `promote <member_id>` | Key Master | Signs Key Master certificates for a verified member's devices |
-| `members`, `post <text>`, `pull` | members | Verified roster (flags unverified devices); encrypt + sign a post; verify author certificate + signature, decrypt, ack |
+| `members`, `post <text>`, `pull` | members | Verified roster (flags unverified devices); encrypt + sign a post; verify author certificate + signature, decrypt, ack. `pull` shows each post's id, photo count, comments and reactions |
+| `comment <post_id> <text>`, `react <post_id> <emoji>` | members | Comment on or react to a post by its id (`react <id> ""` removes your reaction) |
 
 Posts are encrypted with associated data `protocol::event_ad(group, kind)`.
 Authors sign `protocol::event_message(group, author device, kind, version, ciphertext)`.
@@ -148,6 +226,8 @@ will use the OS keychain instead.
 | `encrypt` / `decrypt` | XChaCha20-Poly1305 IETF | `nonce[24] ‖ ct ‖ tag[16]`, AD = `u32le(key_version) ‖ ad` |
 | `sign` / `verify` | Ed25519 detached, strict verify | 64 bytes |
 | `safety_code` | BLAKE2b-256 over both public keys, 1024-word list | `MISS-PARCEL-EARTH-PRICE-88` |
+| `blob_digest` | BLAKE2b-256, domain-separated | 32 bytes; pins an encrypted photo to its post |
+| `event_id` | BLAKE2b-256 of an event's ciphertext, domain-separated | 32 hex characters |
 
 ```sh
 cd crypto && cargo test

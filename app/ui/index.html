@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Side Tray</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+
+<main id="screen-loading" class="screen screen-center">
+  <p class="muted">Opening Side Tray…</p>
+</main>
+
+<!-- First run: server, then who you are -->
+<main id="screen-wizard" class="screen screen-center" hidden>
+  <div class="card narrow">
+    <p class="eyebrow">Side Tray</p>
+    <h1>Welcome</h1>
+    <p class="lede">A private feed for one group of friends and family. Posts are encrypted on this computer before they leave it.</p>
+
+    <form id="wz-server" class="stack" novalidate>
+      <label>Server address
+        <input id="wz-url" required autocomplete="off" spellcheck="false" placeholder="https://example.org">
+      </label>
+      <details>
+        <summary>Advanced: server certificate</summary>
+        <p class="hint">This app trusts the root certificate built into it for your server. If your server uses a different private certificate authority, paste its root certificate (PEM) here.</p>
+        <textarea id="wz-ca" rows="5" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+      </details>
+      <p class="error" id="wz-server-err" hidden></p>
+      <div class="actions"><button class="primary" id="wz-continue">Continue</button></div>
+    </form>
+
+    <form id="wz-details" class="stack" novalidate hidden>
+      <p class="note" id="wz-found"></p>
+      <label>Group name
+        <input id="wz-group" required autocomplete="off" maxlength="100">
+      </label>
+      <label>Your name <span class="hint">as the group will see it</span>
+        <input id="wz-name" required autocomplete="name" maxlength="100">
+      </label>
+      <label>Email <span class="hint">only used to recognise you, never shown publicly</span>
+        <input id="wz-email" type="email" required autocomplete="email" maxlength="254">
+      </label>
+      <label id="wz-token-row" hidden>Setup token <span class="hint">from whoever runs the server</span>
+        <input id="wz-token" type="password" autocomplete="off">
+      </label>
+      <p class="error" id="wz-details-err" hidden></p>
+      <div class="actions">
+        <button type="button" class="ghost" id="wz-back">Back</button>
+        <button class="primary" id="wz-submit">Ask to join</button>
+      </div>
+    </form>
+  </div>
+</main>
+
+<!-- Join request sent: show the code, wait for a Key Master -->
+<main id="screen-waiting" class="screen screen-center" hidden>
+  <div class="card narrow center">
+    <div id="wt-pending">
+      <p class="eyebrow" id="wt-group"></p>
+      <h1>Call a Key Master</h1>
+      <p>Phone a Key Master of the group and read them this code:</p>
+      <div class="safety-code" id="wt-code" aria-live="polite"></div>
+      <p class="hint">They'll type it in to approve you. This screen moves on by itself once they do.</p>
+      <p class="status"><span class="spinner" aria-hidden="true"></span> Waiting for approval</p>
+    </div>
+
+    <div id="wt-approved" hidden>
+      <p class="eyebrow">Approved</p>
+      <h1><span class="wt-approver"></span> let you in</h1>
+      <p>One last check. Ask <b class="wt-approver"></b> to read you <em>their</em> Key Master code, and type it here:</p>
+      <form id="wt-form" class="stack" novalidate>
+        <input id="wt-kmcode" class="code-input" autocomplete="off" spellcheck="false" placeholder="WORD-WORD-WORD-WORD-00" aria-label="Key Master code">
+        <p class="error" id="wt-err" hidden></p>
+        <div class="actions center"><button class="primary" id="wt-unlock">Unlock the feed</button></div>
+      </form>
+      <p class="hint">This proves it was really them who approved you, not the server.</p>
+    </div>
+
+    <div id="wt-denied" hidden>
+      <h1>Request turned down</h1>
+      <p>A Key Master declined this join request. If that's a mistake, talk to them and try again.</p>
+      <div class="actions center"><button class="primary" id="wt-restart">Start over</button></div>
+    </div>
+
+    <p class="error" id="wt-poll-err" hidden></p>
+    <button class="link" id="wt-cancel">Cancel this request</button>
+  </div>
+</main>
+
+<!-- The app -->
+<div id="screen-main" class="screen" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <span id="tb-group"></span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab" role="tab" data-tab="feed" aria-selected="true">Feed</button>
+      <button class="tab" role="tab" data-tab="km" id="tab-km-btn" hidden>Key Master <span class="badge" id="km-badge" hidden></span></button>
+      <button class="tab" role="tab" data-tab="device">This device</button>
+    </nav>
+    <div class="sync">
+      <span class="muted small" id="sync-status"></span>
+      <button class="ghost small" id="sync-btn">Sync</button>
+    </div>
+  </header>
+
+  <section class="panel" id="panel-feed">
+    <form id="composer" class="card composer" novalidate>
+      <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
+      <div class="staged" id="cp-photos"></div>
+      <div class="composer-bar">
+        <label class="button ghost">Add photos<input id="cp-file" type="file" accept="image/*" multiple hidden></label>
+        <span class="muted small" id="cp-hint"></span>
+        <button class="primary" id="cp-post">Post</button>
+      </div>
+      <p class="error" id="cp-err" hidden></p>
+    </form>
+    <div id="feed"></div>
+    <p class="empty" id="feed-empty" hidden>No posts yet. Say hello.</p>
+    <div class="actions center"><button class="ghost" id="load-more" hidden>Older posts</button></div>
+  </section>
+
+  <section class="panel" id="panel-km" hidden>
+    <div class="card">
+      <h2>Join requests</h2>
+      <p class="hint">For each request, phone the person and have them read you their code. Type what you hear. The app only approves it if it matches.</p>
+      <div id="pending"></div>
+      <p class="empty" id="pending-empty">Nobody is waiting to join.</p>
+      <p class="error" id="pending-err" hidden></p>
+    </div>
+    <div class="card">
+      <h3>Your Key Master code</h3>
+      <p class="hint">After you approve someone, read this back to them so they know it was you.</p>
+      <div class="safety-code small" id="km-code"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-device" hidden>
+    <div class="card">
+      <h2>This device</h2>
+      <dl class="facts" id="device-facts"></dl>
+    </div>
+  </section>
+</div>
+
+<div id="lightbox" hidden>
+  <img id="lightbox-img" alt="">
+  <button class="lightbox-close" id="lightbox-close" aria-label="Close">×</button>
+</div>
+
+<template id="tpl-post">
+  <article class="card post">
+    <header class="post-head">
+      <span class="avatar" aria-hidden="true"></span>
+      <div>
+        <div class="author"></div>
+        <div class="muted small when"></div>
+      </div>
+      <button class="link small danger post-delete" hidden>Delete</button>
+    </header>
+    <div class="post-text"></div>
+    <div class="photos"></div>
+    <div class="reactions"></div>
+    <div class="comments"></div>
+    <form class="comment-form" novalidate>
+      <input class="comment-input" placeholder="Write a comment…" maxlength="20000" autocomplete="off">
+      <button class="ghost small">Reply</button>
+    </form>
+  </article>
+</template>
+
+<template id="tpl-pending">
+  <div class="pending-item">
+    <div class="pending-who">
+      <b class="p-name"></b> <span class="muted p-email"></span>
+      <div class="tag p-flag" hidden></div>
+    </div>
+    <form class="pending-form" novalidate>
+      <input class="code-input p-code" autocomplete="off" spellcheck="false" placeholder="Code they read to you" aria-label="Code they read to you">
+      <label class="check p-km-row" hidden><input type="checkbox" class="p-km"> Yes, give this device Key Master rights</label>
+      <div class="actions">
+        <button type="button" class="ghost danger p-deny">Deny</button>
+        <button class="primary p-approve">Approve</button>
+      </div>
+      <p class="error p-err" hidden></p>
+    </form>
+    <div class="p-done" hidden>
+      <p><b class="p-done-name"></b> is in. Now read them your Key Master code:</p>
+      <div class="safety-code small p-done-code"></div>
+    </div>
+  </div>
+</template>
+
+</body>
+</html>

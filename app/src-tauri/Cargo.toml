@@ -1,0 +1,55 @@
+[package]
+name = "sidetray-app"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.90"
+description = "Side Tray desktop client"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "sidetray-app"
+path = "src/main.rs"
+
+[features]
+# Embed ui/ in the binary, so a plain `cargo build` gives a runnable app
+# (the Tauri CLI would otherwise switch this on for release builds).
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+sidetray-crypto = { path = "../../crypto" }
+tauri = { version = "2.12", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+getrandom = "0.2"
+zeroize = { version = "1.8", features = ["derive"] }
+# rustls only, so the app trusts exactly the roots we give it (no OS store, no OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+# Photos: decode common formats, apply EXIF orientation, resize; libwebp for lossy WebP.
+image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+webp = { version = "0.3", default-features = false }
+
+# Device secrets go to the OS keychain where there's a native one; elsewhere
+# they stay in the local database (SPEC.md: "where available").
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
+
+# Image decoding and resizing are painfully slow unoptimised, even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

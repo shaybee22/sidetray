@@ -317,3 +317,21 @@ fn safety_code_covers_both_public_keys() {
     assert_ne!(safety_code(&enc_changed), base);
     assert_ne!(safety_code(&sign_changed), base);
 }
+
+#[test]
+fn blob_digest_is_stable_and_sensitive() {
+    assert_eq!(blob_digest(b"abc"), blob_digest(b"abc"));
+    assert_ne!(blob_digest(b"abc"), blob_digest(b"abd"));
+    assert_ne!(blob_digest(b""), [0; 32]);
+}
+
+#[test]
+fn event_id_is_short_hex_and_distinct_from_blob_digest() {
+    let id = event_id(b"ciphertext");
+    assert_eq!(id.len(), 32);
+    assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert_eq!(id, event_id(b"ciphertext"));
+    assert_ne!(id, event_id(b"ciphertexu"));
+    let digest_prefix: String = blob_digest(b"ciphertext")[..16].iter().map(|b| format!("{b:02x}")).collect();
+    assert_ne!(id, digest_prefix);
+}
