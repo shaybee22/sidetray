@@ -13,7 +13,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager};
 
 const TRAY_ID: &str = "main";
-/// The monogram without its frame, made from app-icon.png by icons/make-tray-icon.py.
+/// The monogram without its frame, made from app-icon.png by icons/make-small-icons.py.
 const TRAY_ICON: &[u8] = include_bytes!("../icons/tray.png");
 
 pub fn create(handle: &AppHandle) -> Result<()> {
