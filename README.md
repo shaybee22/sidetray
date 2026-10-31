@@ -2,7 +2,7 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: Phase 5 (tray, notifications, real-time push).** A Tauri 2 desktop app
+**Status: Phase 6 (pruning, removal, key rotation).** A Tauri 2 desktop app
 (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
 comments and reactions. It keeps a local SQLite archive and syncs the moment the
@@ -10,9 +10,12 @@ relay pushes a change over a WebSocket (polling every 30 seconds only while the
 socket is down). It lives in the system tray with an unread badge and shows
 native notifications. Devices join with their public keys, compare safety codes
 with a Key Master by phone, and receive the group key sealed to them and signed by
-the approving Key Master. The dev CLI (`cli/`) speaks the same formats. Pruning,
-removal, key rotation and rate limits come in Phase 6; direct messages are
-specified as Phase 5b in SPEC.md.
+the approving Key Master. Key Masters manage members from the app: promote,
+remove, or revoke a lost device, after which their app rotates the group key
+for everyone left. The relay prunes what every device has fetched, and anything
+past 90 days. The dev CLI (`cli/`) speaks the same formats. Rate limits are
+still to come; direct messages (5b) and real-server setup, invite links,
+avatars and more groups per server (6b) are specified in SPEC.md.
 
 ## Layout
 
@@ -20,6 +23,7 @@ specified as Phase 5b in SPEC.md.
 compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS)
 Caddyfile             TLS via Caddy's internal CA (no domain yet)
 server/app/main.py    the relay
+server/app/admin.py   operator commands (`python -m app.admin prune`)
 scripts/smoke-test.sh live TLS checks + full API run on a throwaway container
 scripts/ws_probe.py   stdlib-only WebSocket client the smoke test uses for /ws
 crypto/               Rust crate: keys, sealing, encryption, signatures, safety codes
@@ -39,6 +43,9 @@ docker compose up -d --build
 ```
 
 Data lives in the `api_data` volume (`/data/sidetray.db` and `/data/media/`).
+`SIDETRAY_RETENTION_DAYS` in `.env` (default 90) sets how long the relay keeps
+events and photos that not every device has fetched yet. The prune job runs
+hourly; `docker compose exec api python -m app.admin prune` runs it now.
 Caddy's CA and certs live in `caddy_data`; keep that volume or clients will need the new root.
 
 ## Trusting the test certificate
@@ -65,16 +72,19 @@ base64. The server never decrypts.
 | GET | /health | anyone | | `{ok}` |
 | GET | /group | anyone | | `{exists, id?, name?}` |
 | POST | /join | anyone | `{group_name, display_name, email, enc_pubkey, sign_pubkey, setup_token?}` | `{group_id, group_name, member_id, device_id, token, status, role}` |
-| GET | /join/status | any device token | | `{status: pending\|active\|denied, role?, sealed_keys[]?}` |
-| GET | /keys | member | | `{sealed_keys[]}` |
+| GET | /join/status | any device token | | `{status: pending\|active\|denied\|removed\|revoked, role?, sealed_keys[]?}` |
+| GET | /keys | member | | `{sealed_keys[], key_version, rotation_pending}` |
+| POST | /keys/rotate | Key Master | `{key_version, sealed_keys: [{device_id, sealed_blob, signature}]}` | `{key_version, devices}` |
 | GET | /joins/pending | Key Master | | `{pending[]}` with each device's public keys |
 | POST | /joins/{device_id}/approve | Key Master | `{sealed_keys: [{key_version, sealed_blob, signature}], cert, anchors[], anchors_signature}` | `{status: active}` |
 | POST | /joins/{device_id}/deny | Key Master | | `{status: denied}` |
-| GET | /members | member | | `{members: [{id, display_name, role, devices: [{id, enc_pubkey, sign_pubkey, certs[]}]}]}` |
+| GET | /members | member | | `{members: [{id, display_name, role, devices: [{id, enc_pubkey, sign_pubkey, certs[], last_seen?, joined_at?}]}], former: [...]}` |
 | POST | /certs | Key Master | `{certs: [{device_id, role, display_name, signature}]}` | `{stored}` |
 | POST | /members/{id}/role | Key Master | `{role: "keymaster", certs[]}`, one per active device | `{role}` |
+| POST | /members/{id}/remove | Key Master | | `{revoked_devices[], rotation_pending}` |
+| POST | /devices/{id}/revoke | Key Master | | `{status: revoked, rotation_pending}` |
 | POST | /events | member | `{kind, key_version, ciphertext, signature, media_ids[]}` | `{seq}` |
-| GET | /events | member | `?after=<seq>&limit=<1..500>` | `{events[], last_seq, has_more}` |
+| GET | /events | member | `?after=<seq>&limit=<1..500>` | `{events[], last_seq, has_more, pruned_through, retention_days, key_version}` |
 | POST | /ack | member | `{seq}` (only moves forward) | `{last_seq}` |
 | POST | /media | member | raw bytes, max 10 MB | `{id, size_bytes}` |
 | GET | /media/{id} | member | | the bytes |
@@ -98,8 +108,8 @@ base64. The server never decrypts.
   signatures. Approving uploads the new device's certificate, plus the Key
   Master keys the approver trusts (`anchors`), signed over
   `protocol::anchors_message`. Promotion needs a `keymaster` certificate from the
-  calling Key Master for each of the member's devices. Demotion waits for
-  revocation (Phase 6).
+  calling Key Master for each of the member's devices. There's no demotion; remove
+  the member instead.
 
 ## Push channel (Phase 5)
 
@@ -112,14 +122,54 @@ comes from `GET /events`. A missing, unknown, pending or revoked token gets HTTP
 | `{"type":"hello","device_id"}` | the new socket | connected |
 | `{"type":"new_event","seq","kind"}` | every active device except the author's | an event was appended: sync |
 | `{"type":"join_request","device_id","display_name","existing_member"}` | Key Masters' devices | someone is waiting for approval |
-| `{"type":"key_rotated","key_version"}` | every active device | fetch `GET /keys` (sent by key rotation, Phase 6) |
-| `{"type":"removed"}` | the revoked device; then the socket closes | sent by member removal (Phase 6), and by the socket itself if it notices the device is no longer active |
+| `{"type":"key_rotated","key_version"}` | every active device | a Key Master rotated the group key: fetch `GET /keys` |
+| `{"type":"removed","scope"}` | the revoked device; then the socket closes | `scope` is `member` (the member was removed) or `device` (just this device was revoked). Also sent by the socket itself if it notices the device is no longer active |
 | `{"type":"pong"}` | the pinging socket | reply to `{"type":"ping"}` |
 
 Clients send `{"type":"ping"}` every 25 seconds; a socket silent for 75 seconds
 (`SIDETRAY_WS_IDLE_SECONDS`) is closed. Up to 4 sockets per device. The hub is in
 memory, so the relay runs as a single uvicorn worker (it already did). Caddy
 proxies the upgrade with no extra configuration.
+
+## Removal, key rotation and pruning (Phase 6)
+
+- **Removing a member** (`POST /members/{id}/remove`) revokes every device of
+  theirs at once: their tokens stop working (`401`), open sockets get
+  `removed` and close, and `/join/status` says `removed`. A Key Master can't
+  remove themselves. **Revoking a device** (`POST /devices/{id}/revoke`) does
+  the same for one device, say a lost laptop; the member stays and its
+  `/join/status` says `revoked`.
+- **Key rotation.** Either one sets `rotation_pending` (`GET /keys`). The Key
+  Master's app then makes key version N+1 with `crypto::grant_group_key`:
+  sealed to each remaining device's key *from its verified roster* and signed,
+  exactly like a join grant. `POST /keys/rotate` accepts only version N+1 and
+  only if it's sealed to exactly the active devices, and pushes `key_rotated`.
+  Every app's sync then fetches the new key and accepts it only if a Key Master
+  in its own verified roster signed it (`crypto::open_key_grant`). Old versions
+  stay, so old posts keep decrypting. If the rotating app is interrupted, the
+  pending flag makes the next Key Master sync finish the job.
+- **Stale keys are refused.** After a rotation, `POST /events` with an older
+  `key_version` gets `409`; the app and CLI fetch the new key and retry once.
+  Approvals must include the current version.
+- **Removed people's earlier posts.** `GET /members` lists revoked devices under
+  `former`, with `revoked_seq`, the last event seq before they were cut off.
+  Clients verify their certificates as usual and accept their events only up
+  to that seq, so a device that syncs after a removal still shows the posts
+  made before it. A device leaves `former` once its events are pruned.
+- **Removing a Key Master** could leave members certified only by them
+  unverified for some devices, so the removing Key Master's app first re-signs
+  certificates for devices it verified just before.
+- **Pruning** runs hourly in the relay: it deletes events (and their media)
+  that every active device has acked, and anything older than
+  `SIDETRAY_RETENTION_DAYS`. Revoked devices and removed members don't hold
+  anything back; a device that has never acked holds everything back.
+  Uploads no event refers to go after a day. The relay records the highest seq
+  it pruned; `GET /events` returns it as `pruned_through`, and a returning
+  device whose cursor is below it shows "You missed some posts".
+- Known limits: a key version granted by a Key Master who has since been
+  removed can't be verified by a device that comes back after that, so its
+  events are rejected there. Removed Key Masters stay pinned as anchors on
+  devices that pinned them at join.
 
 ## Roster trust
 
@@ -164,6 +214,20 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
 - **Key Master screen.** Lists pending joins without their codes: you type the
   code you heard, and the app approves only if it matches the keys the server
   relayed. It then shows your own code to read back. You can also deny.
+- **Members.** Everyone sees the member list: name, Key Master tag and
+  certificate status (verified, partly verified, unverified) for each member,
+  and each device with who certified it. Key Masters also see when each device
+  was last seen and get *Make Key Master*, *Remove* and, per device, *Revoke*.
+  Each asks for confirmation in a dialog (Cancel has the focus). Remove and
+  Revoke then rotate the group key and say how many devices got it.
+- **Removed.** When the relay says this device was removed or revoked (a
+  `removed` push, or a `401` confirmed by `/join/status`), the app stops
+  syncing, shows a notification and a "You've been removed from this group"
+  screen (or "This device was disconnected"). The archive stays: *Look through
+  saved posts* opens the feed read-only. *Delete them and join a group again*
+  wipes the local data and restarts the wizard.
+- **Missed posts.** A device that comes back after the relay pruned events it
+  never got shows a dismissible notice at the top of the feed.
 - **Feed.** Newest first: posts, photos, comments, one reaction per person per
   post, and delete for your own posts. It syncs after every action and whenever
   the push socket says something changed. While the socket is down it polls
@@ -254,10 +318,10 @@ no real domain.
 | `pending` | Key Master | Lists join requests with codes computed from the relayed keys |
 | `approve <device> --code <code>` | Key Master | Refuses unless the code you heard matches; seals and signs every key version; prints your Key Master code |
 | `deny <device>` | Key Master | Rejects a request |
-| `status [--km-code <code>]` | anyone | After approval: verifies the grants and anchors, then stores keys and pins the approver once you type their code. Later: picks up a promotion |
+| `status [--km-code <code>]` | anyone | After approval: verifies the grants and anchors, then stores keys and pins the approver once you type their code. Later: picks up a promotion, or reports that the device was removed or revoked |
 | `certify [<device> --code <code>] [--keymaster]` | Key Master | Self-certify, or certify a device approved before certificates existed |
 | `promote <member_id>` | Key Master | Signs Key Master certificates for a verified member's devices |
-| `members`, `post <text>`, `pull` | members | Verified roster (flags unverified devices); encrypt + sign a post; verify author certificate + signature, decrypt, ack. `pull` shows each post's id, photo count, comments and reactions |
+| `members`, `post <text>`, `pull` | members | Verified roster (flags unverified devices); encrypt + sign a post; verify author certificate + signature, decrypt, ack. `pull` first fetches any rotated group key (checking a verified Key Master signed it), and shows each post's id, photo count, comments and reactions. `post` retries once with the new key if the relay says its key is out of date |
 | `comment <post_id> <text>`, `react <post_id> <emoji>` | members | Comment on or react to a post by its id (`react <id> ""` removes your reaction) |
 
 Posts are encrypted with associated data `protocol::event_ad(group, kind)`.
@@ -278,6 +342,7 @@ will use the OS keychain instead.
 | `sign` / `verify` | Ed25519 detached, strict verify | 64 bytes |
 | `safety_code` | BLAKE2b-256 over both public keys, 1024-word list | `MISS-PARCEL-EARTH-PRICE-88` |
 | `blob_digest` | BLAKE2b-256, domain-separated | 32 bytes; pins an encrypted photo to its post |
+| `grant_group_key` / `open_key_grant` | seal + Ed25519 over `protocol::key_grant_message` | used for join approvals and key rotation |
 | `event_id` | BLAKE2b-256 of an event's ciphertext, domain-separated | 32 hex characters |
 
 ```sh
@@ -296,6 +361,7 @@ It comes from the public-domain [12dicts](http://wordlist.aspell.net/12dicts/) l
 - Tokens are stored as SHA-256 hashes.
 - Every startup removes the Phase 1 seed (group `g_test`). The cleanup is a no-op
   once the seed is gone, and touches only rows with `group_id = 'g_test'`; real ids
-  are `g_` plus 16 random characters. `server/tests/test_legacy_cleanup.py` checks this
-  (`cd server && python -m unittest discover tests`).
+  are `g_` plus 16 random characters. `server/tests/test_legacy_cleanup.py` checks this,
+  and `server/tests/test_prune.py` covers the prune job and the removed/revoked
+  statuses (`cd server && python -m unittest discover tests`).
 - Footprint on the test VM: ~35 MB (api) + ~70 MB (caddy), with 256 MB / 128 MB caps.

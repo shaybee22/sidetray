@@ -125,7 +125,7 @@ async fn self_certify(app: &App, id: &Identity, me: &DeviceKeys) -> Result<()> {
     Ok(())
 }
 
-fn own_subject(id: &Identity, role: Role) -> CertSubject<'_> {
+pub fn own_subject(id: &Identity, role: Role) -> CertSubject<'_> {
     CertSubject {
         group_id: &id.group_id,
         member_id: &id.member_id,
@@ -137,7 +137,7 @@ fn own_subject(id: &Identity, role: Role) -> CertSubject<'_> {
     }
 }
 
-fn issue_cert(id: &Identity, me: &DeviceKeys, subject: &CertSubject) -> CertUpload {
+pub fn issue_cert(id: &Identity, me: &DeviceKeys, subject: &CertSubject) -> CertUpload {
     let cert = MemberCert::issue(me, &id.device_id, subject);
     CertUpload {
         device_id: cert.device_id,
@@ -273,7 +273,8 @@ pub async fn confirm_approval(app: &App, heard: &str) -> Result<()> {
     Ok(())
 }
 
-/// Start over after a denied or abandoned join. Refuses once the device is active.
+/// Start over after a denied or abandoned join, or after being removed (this
+/// deletes the saved posts and photos too). Refuses while the device is active.
 pub fn reset(app: &App) -> Result<()> {
     let conn = app.db();
     if let Some(id) = db::identity(&conn)? {
@@ -283,6 +284,12 @@ pub fn reset(app: &App) -> Result<()> {
         secrets::delete(&conn, &id.local_id)?;
     }
     db::wipe(&conn)?;
+    drop(conn);
+    if let Ok(dir) = std::fs::read_dir(&app.media_dir) {
+        for f in dir.flatten() {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
     app.set_secrets(None);
     Ok(())
 }
@@ -293,19 +300,26 @@ fn anchors(app: &App) -> Result<Vec<Anchor>> {
     Ok(db::anchors(&app.db())?.into_iter().map(|(device_id, _, sign_pk)| Anchor { device_id, sign_pk }).collect())
 }
 
-/// Fetch the roster, keep only devices whose certificates chain to our anchors,
-/// cache them, and pick up our own promotion. Returns the verified devices.
-pub async fn refresh_roster(app: &App, id: &Identity, api: &Api) -> Result<BTreeMap<String, VerifiedDevice>> {
-    let raw: Roster = api.get("/members").await?;
+/// The server's roster, and the devices in it that verify.
+pub struct CheckedRoster {
+    pub raw: Roster,
+    pub verified: BTreeMap<String, VerifiedDevice>,
+    /// Removed or revoked devices whose certificates verified, with the last
+    /// event seq before they were cut off. Their events up to then still count.
+    pub former: BTreeMap<String, (VerifiedDevice, i64)>,
+}
+
+/// Certificates as the server relays them, rebuilt with our own group id and
+/// the claimed fields; any lie breaks the signature.
+fn certs_of(group_id: &str, members: &[Member]) -> Vec<MemberCert> {
     let mut certs = Vec::new();
-    for m in &raw.members {
+    for m in members {
         for d in &m.devices {
             let (Ok(enc_pk), Ok(sign_pk)) = (decode32(&d.enc_pubkey), decode32(&d.sign_pubkey)) else { continue };
             for c in &d.certs {
                 let (Some(role), Ok(signature)) = (Role::parse(&c.role), B64.decode(&c.signature)) else { continue };
-                // Built from our own group id and the claimed fields; any lie breaks the signature.
                 certs.push(MemberCert {
-                    group_id: id.group_id.clone(),
+                    group_id: group_id.to_string(),
                     member_id: m.id.clone(),
                     device_id: d.id.clone(),
                     display_name: c.display_name.clone(),
@@ -318,8 +332,31 @@ pub async fn refresh_roster(app: &App, id: &Identity, api: &Api) -> Result<BTree
             }
         }
     }
+    certs
+}
+
+/// Fetch the roster, keep only devices whose certificates chain to our anchors,
+/// cache them, and pick up our own promotion.
+pub async fn refresh_roster(app: &App, id: &Identity, api: &Api) -> Result<CheckedRoster> {
+    let raw: Roster = api.get("/members").await?;
+    let certs = certs_of(&id.group_id, &raw.members);
     let anchor_list = anchors(app)?;
     let verified = roster::verify_roster(&id.group_id, &anchor_list, &certs);
+    // Former devices are checked as the roster stood with them in it; they
+    // only ever count as authors of events up to their cut-off.
+    let mut all = certs.clone();
+    all.extend(certs_of(&id.group_id, &raw.former));
+    let everyone = roster::verify_roster(&id.group_id, &anchor_list, &all);
+    let former: BTreeMap<String, (VerifiedDevice, i64)> = raw
+        .former
+        .iter()
+        .flat_map(|m| m.devices.iter().map(move |d| (m, d)))
+        .filter(|(_, d)| !verified.contains_key(&d.id))
+        .filter_map(|(m, d)| {
+            let v = everyone.get(&d.id).filter(|v| v.member_id == m.id)?;
+            Some((d.id.clone(), (v.clone(), d.revoked_seq?)))
+        })
+        .collect();
 
     // A Key Master whose own key is an anchor but who has no certificate yet
     // (founding's /certs call failed) certifies itself now.
@@ -352,6 +389,13 @@ pub async fn refresh_roster(app: &App, id: &Identity, api: &Api) -> Result<BTree
             rusqlite::params![v.member_id, v.display_name, v.role.as_str()],
         )?;
     }
+    // Names for posts by people who have since left (kept if we already had them).
+    for (v, _) in former.values() {
+        tx.execute(
+            "INSERT OR IGNORE INTO members (id, display_name, role) VALUES (?1, ?2, ?3)",
+            rusqlite::params![v.member_id, v.display_name, v.role.as_str()],
+        )?;
+    }
     // Certified names replace the placeholder names of pinned Key Masters.
     for a in &anchor_list {
         if let Some(v) = verified.get(&a.device_id) {
@@ -366,7 +410,7 @@ pub async fn refresh_roster(app: &App, id: &Identity, api: &Api) -> Result<BTree
         }
     }
     tx.commit()?;
-    Ok(verified)
+    Ok(CheckedRoster { raw, verified, former })
 }
 
 // --- Key Master: pending joins -------------------------------------------------
@@ -428,6 +472,9 @@ pub async fn approve(app: &App, device_id: &str, heard: &str, as_keymaster: bool
     if role == Role::Keymaster && !as_keymaster {
         bail!("This device would get Key Master rights. Tick the Key Master box if that's really {}.", p.display_name);
     }
+    // The relay insists on the current key version; make sure we have it.
+    let roster = refresh_roster(app, &id, &api).await?;
+    crate::manage::refresh_keys(app, &id, &api, &roster.verified).await?;
     let (group_keys, anchor_list) = {
         let conn = app.db();
         // Pin ourselves (a promoted Key Master might not have yet).
@@ -441,13 +488,8 @@ pub async fn approve(app: &App, device_id: &str, heard: &str, as_keymaster: bool
     let sealed_keys = group_keys
         .iter()
         .map(|gk| {
-            let sealed = crypto::seal_group_key(gk, &theirs.enc);
-            let msg = protocol::key_grant_message(&id.group_id, device_id, &theirs.enc, gk.version(), &sealed);
-            SealedKeyUpload {
-                key_version: gk.version(),
-                sealed_blob: B64.encode(&sealed),
-                signature: B64.encode(crypto::sign(&me, &msg)),
-            }
+            let (sealed, sig) = crypto::grant_group_key(&me, &id.group_id, device_id, &theirs.enc, gk);
+            SealedKeyUpload { key_version: gk.version(), sealed_blob: B64.encode(&sealed), signature: B64.encode(sig) }
         })
         .collect();
     let cert = issue_cert(

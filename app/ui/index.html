@@ -91,6 +91,19 @@
   </div>
 </main>
 
+<!-- Removed from the group, or this device revoked: syncing has stopped -->
+<main id="screen-removed" class="screen screen-center" hidden>
+  <div class="card narrow center">
+    <p class="eyebrow" id="rm-group"></p>
+    <h1 id="rm-title">You've been removed from this group</h1>
+    <p id="rm-body"></p>
+    <p class="hint">Posts and photos already on this computer stay here. Nothing new arrives.</p>
+    <div class="actions center"><button class="primary" id="rm-archive">Look through saved posts</button></div>
+    <button class="link" id="rm-restart">Delete them and join a group again</button>
+    <p class="error" id="rm-err" hidden></p>
+  </div>
+</main>
+
 <!-- The app -->
 <div id="screen-main" class="screen" hidden>
   <header class="topbar">
@@ -100,6 +113,7 @@
     </div>
     <nav class="tabs" role="tablist">
       <button class="tab" role="tab" data-tab="feed" aria-selected="true">Feed</button>
+      <button class="tab" role="tab" data-tab="members">Members</button>
       <button class="tab" role="tab" data-tab="km" id="tab-km-btn" hidden>Key Master <span class="badge" id="km-badge" hidden></span></button>
       <button class="tab" role="tab" data-tab="device">This device</button>
     </nav>
@@ -109,9 +123,16 @@
     </div>
   </header>
 
-  <p class="banner error" id="removed-banner" hidden>The server says this device has been removed from the group. It won't receive new posts.</p>
+  <div class="banner" id="readonly-banner" hidden>
+    <span id="readonly-text">Saved posts from a group you're no longer in. Read only.</span>
+    <button class="ghost small" id="readonly-back">Back</button>
+  </div>
 
   <section class="panel" id="panel-feed">
+    <div class="banner warn" id="missed-banner" hidden>
+      <span id="missed-text"></span>
+      <button class="ghost small" id="missed-dismiss">Dismiss</button>
+    </div>
     <form id="composer" class="card composer" novalidate>
       <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
       <div class="staged" id="cp-photos"></div>
@@ -125,6 +146,17 @@
     <div id="feed"></div>
     <p class="empty" id="feed-empty" hidden>No posts yet. Say hello.</p>
     <div class="actions center"><button class="ghost" id="load-more" hidden>Older posts</button></div>
+  </section>
+
+  <section class="panel" id="panel-members" hidden>
+    <div class="card">
+      <h2>Members</h2>
+      <p class="hint">Everyone in the group. <b>Verified</b> means a Key Master this app trusts signed that person's certificate, so posts under their name really are theirs.</p>
+      <p class="note" id="members-note" hidden></p>
+      <p class="error" id="members-err" hidden></p>
+      <div id="members"></div>
+      <p class="empty" id="members-loading">Loading…</p>
+    </div>
   </section>
 
   <section class="panel" id="panel-km" hidden>
@@ -181,6 +213,34 @@
     </form>
   </article>
 </template>
+
+<template id="tpl-member">
+  <div class="member">
+    <div class="member-head">
+      <span class="avatar" aria-hidden="true"></span>
+      <div class="member-who">
+        <div><b class="m-name"></b> <span class="tag m-role" hidden>Key Master</span> <span class="muted small m-you" hidden>you</span></div>
+        <div class="small m-cert"></div>
+      </div>
+      <div class="member-actions">
+        <button class="ghost small m-promote" hidden>Make Key Master</button>
+        <button class="ghost small danger m-remove" hidden>Remove</button>
+      </div>
+    </div>
+    <ul class="devices"></ul>
+  </div>
+</template>
+
+<dialog id="confirm" aria-labelledby="cf-title">
+  <form method="dialog" class="stack">
+    <h2 id="cf-title"></h2>
+    <p id="cf-body"></p>
+    <div class="actions">
+      <button value="cancel" class="ghost" id="cf-cancel" autofocus>Cancel</button>
+      <button value="ok" class="primary" id="cf-ok">OK</button>
+    </div>
+  </form>
+</dialog>
 
 <template id="tpl-pending">
   <div class="pending-item">

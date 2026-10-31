@@ -93,6 +93,12 @@ pub struct AnchorJson {
 }
 
 #[derive(Deserialize)]
+pub struct KeysResp {
+    #[serde(default)]
+    pub sealed_keys: Vec<SealedKey>,
+}
+
+#[derive(Deserialize)]
 pub struct SealedKey {
     pub key_version: u32,
     pub sealed_blob: String,
@@ -158,6 +164,9 @@ pub struct RoleReq {
 #[derive(Deserialize)]
 pub struct Roster {
     pub members: Vec<Member>,
+    /// Removed members and revoked devices that may still have events on the relay.
+    #[serde(default)]
+    pub former: Vec<Member>,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +184,8 @@ pub struct MemberDevice {
     pub sign_pubkey: String,
     #[serde(default)]
     pub certs: Vec<CertJson>,
+    /// Former devices: the last event seq before they were cut off.
+    pub revoked_seq: Option<i64>,
 }
 
 #[derive(Deserialize)]

@@ -1,15 +1,17 @@
 // No console window in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Side Tray desktop client (SPEC.md Phases 4-5): first-run wizard, join and
+//! Side Tray desktop client (SPEC.md Phases 4-6): first-run wizard, join and
 //! Key Master screens, the feed, photo upload; sync on WebSocket pushes, a
-//! tray icon with an unread badge, and native notifications.
+//! tray icon with an unread badge, and native notifications; the member list,
+//! removal, device revocation and group key rotation.
 
 mod account;
 mod alerts;
 mod api;
 mod db;
 mod feed;
+mod manage;
 mod photo;
 mod push;
 mod secrets;
@@ -64,6 +66,8 @@ struct AppView {
     unread: i64,
     /// The push socket is connected.
     live: bool,
+    /// The relay pruned posts this device never got: (when noticed, retention days).
+    missed: Option<(i64, f64)>,
 }
 
 #[tauri::command]
@@ -75,6 +79,7 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
     let key_versions = secrets::key_versions(&conn).map_err(err)?;
     let unread = db::unread(&conn).map_err(err)?;
     let live = app.push_connected.load(Ordering::SeqCst);
+    let missed = db::missed(&conn).map_err(err)?;
     Ok(match id {
         None => AppView {
             stage: "setup".into(),
@@ -92,6 +97,7 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             rejected,
             unread,
             live,
+            missed: None,
         },
         Some(id) => AppView {
             stage: id.status.clone(),
@@ -109,6 +115,7 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             rejected,
             unread,
             live,
+            missed,
         },
     })
 }
@@ -195,18 +202,83 @@ async fn deny(app: State<'_, Arc<App>>, device_id: String) -> Res<()> {
     account::deny(&app, &device_id).await.map_err(err)
 }
 
+// --- members (Phase 6) ------------------------------------------------------------------
+
+#[tauri::command]
+async fn list_members(app: State<'_, Arc<App>>) -> Res<Vec<manage::MemberView>> {
+    manage::list_members(&app).await.map_err(err)
+}
+
+#[tauri::command]
+async fn promote_member(app: State<'_, Arc<App>>, member_id: String) -> Res<String> {
+    let name = manage::promote(&app, &member_id).await.map_err(err)?;
+    app.wake.notify_one();
+    Ok(name)
+}
+
+#[tauri::command]
+async fn remove_member(app: State<'_, Arc<App>>, member_id: String) -> Res<manage::Change> {
+    let c = manage::remove_member(&app, &member_id).await.map_err(err)?;
+    app.wake.notify_one();
+    Ok(c)
+}
+
+#[tauri::command]
+async fn revoke_device(app: State<'_, Arc<App>>, device_id: String) -> Res<manage::Change> {
+    let c = manage::revoke_device(&app, &device_id).await.map_err(err)?;
+    app.wake.notify_one();
+    Ok(c)
+}
+
+#[tauri::command]
+fn dismiss_missed(app: State<'_, Arc<App>>) -> Res<()> {
+    db::clear_missed(&app.db()).map_err(err)
+}
+
+/// After a `removed` push or a 401: ask the relay where this device stands. If
+/// it was removed, that's recorded (syncing stops; the archive stays), and the
+/// UI and a notification say so.
+pub async fn removed_check(handle: &AppHandle, app: &App) {
+    match manage::check_standing(app).await {
+        Ok(Some(status)) => {
+            let group = app.identity().ok().flatten().map(|i| i.group_name).unwrap_or_default();
+            let (title, body) = if status == "removed" {
+                (format!("You've been removed from {group}"), "Posts already on this computer are kept.")
+            } else {
+                (format!("This device was disconnected from {group}"), "A Key Master revoked it. Posts already on it are kept.")
+            };
+            alerts::show(handle, &title, body, alerts::Target::Feed);
+            app.push_wake.notify_one();
+            tray::refresh(handle, app);
+            let _ = handle.emit("removed", status);
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("checking whether this device was removed: {e:#}"),
+    }
+}
+
 // --- feed ------------------------------------------------------------------------------
 
 #[tauri::command]
 async fn sync_now(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<feed::SyncReport> {
-    let r = feed::sync_once(&app).await.map_err(err)?;
-    let _ = handle.emit("synced", &r);
-    Ok(r)
+    match feed::sync_once(&app).await {
+        Ok(r) => {
+            let _ = handle.emit("synced", &r);
+            Ok(r)
+        }
+        Err(e) => {
+            if api::is_status(&e, 401) {
+                removed_check(&handle, &app).await;
+            }
+            Err(err(e))
+        }
+    }
 }
 
 #[tauri::command]
 fn get_feed(app: State<'_, Arc<App>>, before: Option<i64>, limit: Option<i64>) -> Res<Vec<feed::PostView>> {
-    let id = app.require_active().map_err(err)?;
+    // A removed device can still read what it saved.
+    let id = app.require_archive().map_err(err)?;
     feed::feed(&app.db(), &id.member_id, before, limit.unwrap_or(50).clamp(1, 500)).map_err(err)
 }
 
@@ -331,6 +403,10 @@ fn spawn_sync_loop(handle: AppHandle, app: Arc<App>) {
                         let _ = handle.emit("synced", &r);
                     }
                     Err(e) => {
+                        if api::is_status(&e, 401) {
+                            // Token refused: removed or revoked while we weren't connected?
+                            removed_check(&handle, &app).await;
+                        }
                         let _ = handle.emit("sync-error", format!("{e:#}"));
                     }
                 }
@@ -406,6 +482,11 @@ fn main() {
             list_pending,
             approve,
             deny,
+            list_members,
+            promote_member,
+            remove_member,
+            revoke_device,
+            dismiss_missed,
             sync_now,
             get_feed,
             stage_photo,

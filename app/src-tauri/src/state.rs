@@ -21,6 +21,8 @@ pub struct App {
     pub staged: Mutex<HashMap<String, Processed>>,
     /// One sync at a time.
     pub sync_lock: tokio::sync::Mutex<()>,
+    /// One key rotation at a time (after a removal, or picked up by a sync).
+    pub rotate_lock: tokio::sync::Mutex<()>,
     /// Wakes the background sync loop early (after joining, a push, or "Sync now").
     pub wake: tokio::sync::Notify,
     /// Wakes the push loop (the device just became active).
@@ -46,6 +48,7 @@ impl App {
             secrets: Mutex::new(None),
             staged: Mutex::new(HashMap::new()),
             sync_lock: tokio::sync::Mutex::new(()),
+            rotate_lock: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
             push_wake: tokio::sync::Notify::new(),
             push_connected: AtomicBool::new(false),
@@ -69,8 +72,19 @@ impl App {
 
     pub fn require_active(&self) -> Result<Identity> {
         let id = self.require_identity()?;
-        if id.status != "active" {
-            bail!("this device is {}; it can't do that until a Key Master approves it", id.status);
+        match id.status.as_str() {
+            "active" => Ok(id),
+            "removed" => bail!("you've been removed from {}", id.group_name),
+            "revoked" => bail!("this device has been disconnected from {}", id.group_name),
+            s => bail!("this device is {s}; it can't do that until a Key Master approves it"),
+        }
+    }
+
+    /// A device whose archive can be read: active, or removed with its history kept.
+    pub fn require_archive(&self) -> Result<Identity> {
+        let id = self.require_identity()?;
+        if !matches!(id.status.as_str(), "active" | "removed" | "revoked") {
+            bail!("this device hasn't joined yet");
         }
         Ok(id)
     }

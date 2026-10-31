@@ -203,6 +203,44 @@ pub fn unseal_group_key(device: &DeviceKeys, sealed: &[u8]) -> Result<GroupKey> 
     Ok(GroupKey::from_bytes(version, key))
 }
 
+/// A Key Master hands a group key to one device: seal it to the device's
+/// X25519 key and sign [`protocol::key_grant_message`]. Used when approving a
+/// join and when rotating the key. Returns `(sealed_blob, signature)`.
+pub fn grant_group_key(
+    granter: &DeviceKeys,
+    group_id: &str,
+    recipient_device_id: &str,
+    recipient_enc_pk: &[u8; PUBLIC_KEY_LEN],
+    group_key: &GroupKey,
+) -> (Vec<u8>, [u8; SIGNATURE_LEN]) {
+    let sealed = seal_group_key(group_key, recipient_enc_pk);
+    let msg = protocol::key_grant_message(group_id, recipient_device_id, recipient_enc_pk, group_key.version, &sealed);
+    let sig = sign(granter, &msg);
+    (sealed, sig)
+}
+
+/// The receiving side of [`grant_group_key`]: check the grant is signed by
+/// `signer_sign_pk` for this device, unseal it, and check the version inside
+/// the seal matches the label. The caller decides whether the signer is
+/// someone it trusts to hand out keys (a verified Key Master).
+pub fn open_key_grant(
+    me: &DeviceKeys,
+    group_id: &str,
+    my_device_id: &str,
+    key_version: u32,
+    sealed: &[u8],
+    signature: &[u8],
+    signer_sign_pk: &[u8; PUBLIC_KEY_LEN],
+) -> Result<GroupKey> {
+    let msg = protocol::key_grant_message(group_id, my_device_id, &me.public().enc, key_version, sealed);
+    verify(signer_sign_pk, &msg, signature)?;
+    let gk = unseal_group_key(me, sealed)?;
+    if gk.version != key_version {
+        return Err(Error::Malformed);
+    }
+    Ok(gk)
+}
+
 // ---------------------------------------------------------------------------
 // Content encryption
 // ---------------------------------------------------------------------------

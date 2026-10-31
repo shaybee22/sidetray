@@ -186,16 +186,30 @@ fn anchors(st: &State) -> Result<Vec<Anchor>> {
         .collect()
 }
 
-/// The server's roster, plus the devices in it that actually verify.
+/// The server's roster, plus the devices in it that actually verify, and
+/// former (removed or revoked) devices that verify, with their cut-off seq.
 struct CheckedRoster {
     raw: Roster,
     verified: BTreeMap<String, VerifiedDevice>,
+    former: BTreeMap<String, (VerifiedDevice, i64)>,
 }
 
-fn checked_roster(st: &State, api: &Api) -> Result<CheckedRoster> {
-    let raw: Roster = api.get("/members")?;
+/// Who may author an event: a verified device, or a former one for events
+/// up to the seq it was cut off at.
+fn author_of<'a>(r: &'a CheckedRoster, device_id: &str, seq: i64) -> Result<&'a VerifiedDevice> {
+    if let Some(v) = r.verified.get(device_id) {
+        return Ok(v);
+    }
+    match r.former.get(device_id) {
+        Some((v, cut_off)) if seq <= *cut_off => Ok(v),
+        Some(_) => bail!("author device {device_id} had been removed by the time of this event"),
+        None => bail!("author device {device_id} has no valid member certificate"),
+    }
+}
+
+fn certs_of(st: &State, members: &[Member]) -> Vec<MemberCert> {
     let mut certs = Vec::new();
-    for m in &raw.members {
+    for m in members {
         for d in &m.devices {
             let (Ok(enc_pk), Ok(sign_pk)) = (decode32(&d.enc_pubkey), decode32(&d.sign_pubkey)) else { continue };
             for c in &d.certs {
@@ -215,8 +229,66 @@ fn checked_roster(st: &State, api: &Api) -> Result<CheckedRoster> {
             }
         }
     }
-    let verified = roster::verify_roster(&st.group_id, &anchors(st)?, &certs);
-    Ok(CheckedRoster { raw, verified })
+    certs
+}
+
+fn checked_roster(st: &State, api: &Api) -> Result<CheckedRoster> {
+    let raw: Roster = api.get("/members")?;
+    let certs = certs_of(st, &raw.members);
+    let anchor_list = anchors(st)?;
+    let verified = roster::verify_roster(&st.group_id, &anchor_list, &certs);
+    let mut all = certs.clone();
+    all.extend(certs_of(st, &raw.former));
+    let everyone = roster::verify_roster(&st.group_id, &anchor_list, &all);
+    let mut former = BTreeMap::new();
+    for m in &raw.former {
+        for d in &m.devices {
+            if let (Some(v), Some(cut)) = (everyone.get(&d.id).filter(|v| v.member_id == m.id), d.revoked_seq) {
+                if !verified.contains_key(&d.id) {
+                    former.insert(d.id.clone(), (v.clone(), cut));
+                }
+            }
+        }
+    }
+    Ok(CheckedRoster { raw, verified, former })
+}
+
+/// Pick up group key versions this device doesn't have (after a Key Master
+/// rotated the key). Each grant must be signed by a Key Master in the verified
+/// roster. Returns the versions added.
+fn refresh_keys(st: &mut State, api: &Api, verified: &BTreeMap<String, VerifiedDevice>) -> Result<Vec<u32>> {
+    let keys: KeysResp = api.get("/keys")?;
+    let me = st.device_keys()?;
+    let have = st.key_versions();
+    let mut added = Vec::new();
+    for k in keys.sealed_keys.iter().filter(|k| !have.contains(&k.key_version)) {
+        let opened = (|| -> Result<_> {
+            let signer = k.signer_device_id.as_deref().context("no signer")?;
+            let km = verified
+                .get(signer)
+                .filter(|v| v.role == Role::Keymaster)
+                .with_context(|| format!("granted by {signer}, which isn't a verified Key Master"))?;
+            let gk = crypto::open_key_grant(
+                &me,
+                &st.group_id,
+                &st.device_id,
+                k.key_version,
+                &B64.decode(&k.sealed_blob)?,
+                &B64.decode(&k.signature)?,
+                &km.sign_pk,
+            )?;
+            Ok((gk, km.display_name.clone()))
+        })();
+        match opened {
+            Ok((gk, by)) => {
+                println!("New group key v{} from {by} (signature checked).", gk.version());
+                st.add_group_key(&gk);
+                added.push(gk.version());
+            }
+            Err(e) => println!("Refusing group key v{}: {e:#}", k.key_version),
+        }
+    }
+    Ok(added)
 }
 
 // --- init-group / join ------------------------------------------------------
@@ -359,17 +431,15 @@ fn approve(dir: &Path, device_id: &str, heard: &str, as_keymaster: bool) -> Resu
     }
     let me = st.device_keys()?;
     pin_self(&mut st, &me);
+    // The relay wants the current key version included; pick up a rotation first.
+    let verified = checked_roster(&st, &api)?.verified;
+    refresh_keys(&mut st, &api, &verified)?;
     let sealed_keys = st
         .group_keys()?
         .iter()
         .map(|gk| {
-            let sealed = crypto::seal_group_key(gk, &theirs.enc);
-            let msg = protocol::key_grant_message(&st.group_id, device_id, &theirs.enc, gk.version(), &sealed);
-            SealedKeyUpload {
-                key_version: gk.version(),
-                sealed_blob: B64.encode(&sealed),
-                signature: B64.encode(crypto::sign(&me, &msg)),
-            }
+            let (sealed, sig) = crypto::grant_group_key(&me, &st.group_id, device_id, &theirs.enc, gk);
+            SealedKeyUpload { key_version: gk.version(), sealed_blob: B64.encode(&sealed), signature: B64.encode(sig) }
         })
         .collect::<Vec<_>>();
     if sealed_keys.is_empty() {
@@ -538,6 +608,18 @@ fn status(dir: &Path, km_code: Option<&str>) -> Result<()> {
         "active" => {
             // Pick up a promotion (or anything else the server now says about us).
             let js: JoinStatus = api_for(&st)?.get("/join/status")?;
+            if js.status != "active" {
+                st.status = if js.status == "removed" { "removed".into() } else { "revoked".into() };
+                state::save(dir, &st)?;
+                println!(
+                    "{}",
+                    if st.status == "removed" {
+                        "You've been removed from this group; this device no longer syncs."
+                    } else {
+                        "This device was revoked by a Key Master; it no longer syncs."
+                    }
+                );
+            }
             if let Some(role) = js.role {
                 if role != st.role {
                     println!("Your role changed: {} -> {}.", role_label(&st.role), role_label(&role));
@@ -682,33 +764,49 @@ fn members(dir: &Path) -> Result<()> {
 
 /// Encrypt, sign and append one event (payload formats: README "Event payloads").
 fn post(dir: &Path, kind: &str, payload: serde_json::Value) -> Result<()> {
-    let st = state::load(dir)?;
+    let mut st = state::load(dir)?;
     require_active(&st)?;
-    let me = st.device_keys()?;
-    let gk = st.latest_group_key()?;
+    let api = api_for(&st)?;
     let body = serde_json::to_vec(&payload)?;
-    let ct = crypto::encrypt(&gk, &body, &protocol::event_ad(&st.group_id, kind));
-    let msg = protocol::event_message(&st.group_id, &st.device_id, kind, gk.version(), &ct);
-    let sig = crypto::sign(&me, &msg);
-    let r: Seq = api_for(&st)?.post(
-        "/events",
-        &EventReq {
-            kind,
-            key_version: gk.version(),
-            ciphertext: B64.encode(&ct),
-            signature: B64.encode(sig),
-            media_ids: vec![],
-        },
-    )?;
-    println!("Posted {kind} #{} id {} ({} bytes of ciphertext, key v{}).", r.seq, crypto::event_id(&ct), ct.len(), gk.version());
-    Ok(())
+    let send = |st: &State| -> Result<()> {
+        let me = st.device_keys()?;
+        let gk = st.latest_group_key()?;
+        let ct = crypto::encrypt(&gk, &body, &protocol::event_ad(&st.group_id, kind));
+        let msg = protocol::event_message(&st.group_id, &st.device_id, kind, gk.version(), &ct);
+        let sig = crypto::sign(&me, &msg);
+        let r: Seq = api.post(
+            "/events",
+            &EventReq {
+                kind,
+                key_version: gk.version(),
+                ciphertext: B64.encode(&ct),
+                signature: B64.encode(sig),
+                media_ids: vec![],
+            },
+        )?;
+        println!("Posted {kind} #{} id {} ({} bytes of ciphertext, key v{}).", r.seq, crypto::event_id(&ct), ct.len(), gk.version());
+        Ok(())
+    };
+    match send(&st) {
+        // The group key was rotated since we last pulled: fetch it and retry.
+        Err(e) if format!("{e:#}").contains("out of date") => {
+            let verified = checked_roster(&st, &api)?.verified;
+            refresh_keys(&mut st, &api, &verified)?;
+            state::save(dir, &st)?;
+            send(&st)
+        }
+        r => r,
+    }
 }
 
 fn pull(dir: &Path) -> Result<()> {
     let mut st = state::load(dir)?;
     require_active(&st)?;
     let api = api_for(&st)?;
-    let authors = checked_roster(&st, &api)?.verified;
+    let authors = checked_roster(&st, &api)?;
+    if !refresh_keys(&mut st, &api, &authors.verified)?.is_empty() {
+        state::save(dir, &st)?;
+    }
     let mut shown = 0;
     loop {
         let page: EventPage = api.get(&format!("/events?after={}", st.last_seq))?;
@@ -734,10 +832,8 @@ fn pull(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open_event(st: &State, authors: &BTreeMap<String, VerifiedDevice>, e: &Event) -> Result<String> {
-    let author = authors
-        .get(&e.author_device_id)
-        .with_context(|| format!("author device {} has no valid member certificate", e.author_device_id))?;
+fn open_event(st: &State, authors: &CheckedRoster, e: &Event) -> Result<String> {
+    let author = author_of(authors, &e.author_device_id, e.seq)?;
     let ct = B64.decode(&e.ciphertext)?;
     let msg = protocol::event_message(&st.group_id, &e.author_device_id, &e.kind, e.key_version, &ct);
     crypto::verify(&author.sign_pk, &msg, &B64.decode(&e.signature)?).context("bad author signature")?;

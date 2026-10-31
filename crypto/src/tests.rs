@@ -335,3 +335,27 @@ fn event_id_is_short_hex_and_distinct_from_blob_digest() {
     let digest_prefix: String = blob_digest(b"ciphertext")[..16].iter().map(|b| format!("{b:02x}")).collect();
     assert_ne!(id, digest_prefix);
 }
+
+#[test]
+fn key_grants_round_trip_and_bind_every_field() {
+    let km = generate_device_keys();
+    let me = generate_device_keys();
+    let gk = generate_group_key(3);
+    let (sealed, sig) = grant_group_key(&km, "g", "d_me", &me.public().enc, &gk);
+    let km_pk = km.public().sign;
+    assert!(open_key_grant(&me, "g", "d_me", 3, &sealed, &sig, &km_pk).unwrap() == gk);
+    // Wrong signer, group, device, version label or tampered blob: refused.
+    let other = generate_device_keys().public().sign;
+    assert_eq!(open_key_grant(&me, "g", "d_me", 3, &sealed, &sig, &other).unwrap_err(), Error::BadSignature);
+    assert!(open_key_grant(&me, "h", "d_me", 3, &sealed, &sig, &km_pk).is_err());
+    assert!(open_key_grant(&me, "g", "d_you", 3, &sealed, &sig, &km_pk).is_err());
+    assert!(open_key_grant(&me, "g", "d_me", 4, &sealed, &sig, &km_pk).is_err());
+    assert_every_flip_fails(&sealed, |s| open_key_grant(&me, "g", "d_me", 3, s, &sig, &km_pk).is_ok());
+    // A grant for someone else's key doesn't open, even with a valid signature.
+    let (sealed2, sig2) = grant_group_key(&km, "g", "d_me", &generate_device_keys().public().enc, &gk);
+    assert!(open_key_grant(&me, "g", "d_me", 3, &sealed2, &sig2, &km_pk).is_err());
+    // A Key Master who signs a mislabelled grant still gets caught by the seal.
+    let sealed3 = seal_group_key(&generate_group_key(2), &me.public().enc);
+    let sig3 = sign(&km, &protocol::key_grant_message("g", "d_me", &me.public().enc, 3, &sealed3));
+    assert_eq!(open_key_grant(&me, "g", "d_me", 3, &sealed3, &sig3, &km_pk).unwrap_err(), Error::Malformed);
+}

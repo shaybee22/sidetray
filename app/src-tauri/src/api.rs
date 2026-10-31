@@ -129,7 +129,7 @@ impl Api {
             .ok()
             .and_then(|v| v.get("detail").map(|d| d.as_str().map(str::to_string).unwrap_or_else(|| d.to_string())))
             .unwrap_or(body);
-        bail!("server said {status}: {detail}")
+        Err(HttpError { status: status.as_u16(), detail }.into())
     }
 
     async fn json<T: DeserializeOwned>(req: RequestBuilder) -> Result<T> {
@@ -163,6 +163,31 @@ impl Api {
         let resp = Self::checked(self.auth(req)).await?;
         Ok(resp.bytes().await.context("downloading media")?.to_vec())
     }
+}
+
+/// The relay answered with an error status.
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: u16,
+    pub detail: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server said {}: {}", self.status, self.detail)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// Whether `e` (anywhere in its chain) is the relay answering `status`.
+pub fn is_status(e: &anyhow::Error, status: u16) -> bool {
+    e.chain().any(|c| c.downcast_ref::<HttpError>().is_some_and(|h| h.status == status))
+}
+
+/// The relay refused an event because a newer group key exists (POST /events -> 409).
+pub fn is_stale_key(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<HttpError>().is_some_and(|h| h.status == 409 && h.detail.contains("out of date")))
 }
 
 fn describe_send_error(e: reqwest::Error) -> anyhow::Error {
@@ -240,7 +265,7 @@ pub struct AnchorJson {
     pub sign_pubkey: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct SealedKey {
     pub key_version: u32,
     pub sealed_blob: String,
@@ -249,6 +274,34 @@ pub struct SealedKey {
     pub signer_sign_pubkey: String,
     pub signer_enc_pubkey: String,
     pub signer_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct KeysResp {
+    #[serde(default)]
+    pub sealed_keys: Vec<SealedKey>,
+    pub key_version: u32,
+    #[serde(default)]
+    pub rotation_pending: bool,
+}
+
+#[derive(Serialize)]
+pub struct GrantUpload {
+    pub device_id: String,
+    pub sealed_blob: String,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+pub struct RotateReq {
+    pub key_version: u32,
+    pub sealed_keys: Vec<GrantUpload>,
+}
+
+#[derive(Serialize)]
+pub struct RoleReq {
+    pub role: &'static str,
+    pub certs: Vec<CertUpload>,
 }
 
 #[derive(Deserialize)]
@@ -299,12 +352,18 @@ pub struct CertsReq {
 #[derive(Deserialize)]
 pub struct Roster {
     pub members: Vec<Member>,
+    /// Removed members and revoked devices that may still have events on the relay.
+    #[serde(default)]
+    pub former: Vec<Member>,
 }
 
-/// The server's view of a member. Its role claim isn't parsed: roles come from certificates.
+/// The server's view of a member. Its name and role are only shown for
+/// devices that don't verify (flagged as such); verified ones use certificates.
 #[derive(Deserialize)]
 pub struct Member {
     pub id: String,
+    #[serde(default)]
+    pub display_name: String,
     pub devices: Vec<MemberDevice>,
 }
 
@@ -315,6 +374,11 @@ pub struct MemberDevice {
     pub sign_pubkey: String,
     #[serde(default)]
     pub certs: Vec<CertJson>,
+    /// Only sent to Key Masters.
+    pub last_seen: Option<i64>,
+    pub joined_at: Option<i64>,
+    /// Former devices: the last event seq before they were cut off.
+    pub revoked_seq: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -339,6 +403,14 @@ pub struct EventPage {
     pub events: Vec<Event>,
     pub last_seq: i64,
     pub has_more: bool,
+    /// Highest seq the relay has pruned. A cursor below it missed events.
+    #[serde(default)]
+    pub pruned_through: i64,
+    #[serde(default)]
+    pub retention_days: f64,
+    /// The group's current key version.
+    #[serde(default)]
+    pub key_version: u32,
 }
 
 #[derive(Deserialize)]

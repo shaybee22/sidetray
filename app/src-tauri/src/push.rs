@@ -31,7 +31,7 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 enum Ended {
     /// Closed or went quiet; reconnect.
     Dropped,
-    /// The server says this device was revoked; stop until it joins again.
+    /// The server says this device was revoked or its member removed.
     Removed,
 }
 
@@ -60,8 +60,8 @@ pub fn spawn(handle: AppHandle, app: Arc<App>) {
             match outcome {
                 Ok(Ended::Removed) => {
                     eprintln!("push: the server says this device was removed");
-                    let _ = handle.emit("removed", ());
-                    app.push_wake.notified().await;
+                    // Confirm with /join/status; that records it and stops syncing.
+                    crate::removed_check(&handle, &app).await;
                     continue;
                 }
                 Ok(Ended::Dropped) => eprintln!("push: connection closed"),
@@ -120,7 +120,7 @@ async fn run(handle: &AppHandle, app: &App, id: &Identity) -> Result<Ended> {
                         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
                         .unwrap_or_default();
                     match kind.as_str() {
-                        // A sync picks up new events and pending joins, and (Phase 6) new keys.
+                        // A sync picks up new events, pending joins and rotated keys.
                         "new_event" | "join_request" | "key_rotated" => app.wake.notify_one(),
                         "removed" => return Ok(Ended::Removed),
                         _ => {} // hello, pong

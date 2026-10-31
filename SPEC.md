@@ -117,7 +117,7 @@ The feed is an append-only log with a sequence number; each device pulls everyth
 **Pruning (server cron, hourly)**
 
 - Delete events and media where every active device's `last_seq` is at or past them
-- Also delete anything older than the retention window (default 90 days), even if someone hasn't synced
+- Also delete anything older than the retention window (default 90 days, `SIDETRAY_RETENTION_DAYS`), even if someone hasn't synced
 - A device that hasn't checked in for longer than the retention window gets a "you missed some posts" notice on return
 - Revoked devices don't count toward "everyone has it"
 
@@ -144,6 +144,7 @@ All endpoints are HTTPS under `/api/v1`, authenticated with a per-device bearer 
 | POST | /joins/{device_id}/deny | Key Master | Reject the request |
 | GET | /members | member | Roster: names, roles, signing public keys |
 | POST | /members/{id}/remove | Key Master | Remove member, revoke devices |
+| POST | /devices/{id}/revoke | Key Master | Revoke one device (lost or replaced); the member stays |
 | POST | /members/{id}/role | Key Master | Promote or demote Key Master |
 | POST | /keys/rotate | Key Master | Upload a new key version sealed to every active device |
 | GET | /keys | member | Fetch sealed keys for this device (after a rotation) |
@@ -168,6 +169,7 @@ Each phase ends with something you can run and poke at; hand them to CC one at a
 5. **Tray and notifications**: minimize to tray, unread badge, native notifications, start with OS (optional toggle).
    - 5b. **Direct messages**: end-to-end encrypted one-to-one messages; see the next section.
 6. **Pruning and removal**: hourly prune job, member removal, key rotation. Done when a removed device stops receiving and old events disappear from the server.
+   - 6b. **Real servers, invites, avatars, more groups**: `install.sh`, public certificates, invite links, avatars, several groups per server; see below.
 7. **Release**: GitHub Actions builds Windows (.msi), macOS (.dmg), Linux (.AppImage / .deb); install page with screenshots.
 
 ## Phase 5b: Direct messages
@@ -208,6 +210,54 @@ Private one-to-one conversations (text and photos) between two members, relayed 
 
 **Done when** two members exchange text and a photo, the sender's second device shows the conversation too, a third member's device gets nothing from `GET /dms` and can't fetch the photo, and both messages disappear from the server once every participant device has acked them.
 
+## Phase 6b: Real servers, invites, avatars, more groups
+
+Everything so far runs against a test relay on a LAN IP with Caddy's private CA. This phase makes a server something a non-developer can stand up on a domain, makes joining one click from a link, gives people faces, and lets one server host several groups. Documented here; not built yet.
+
+**`install.sh` server installer**
+
+One script, run as root on a fresh Debian or Ubuntu VPS: `curl -fsSL <release url>/install.sh | sudo bash`, or download and run it.
+
+1. Asks for the domain name (e.g. `tray.example.org`) and an email address for Let's Encrypt expiry notices. Checks the domain's A/AAAA record points at this machine and that ports 80 and 443 are free; explains what to fix if not.
+2. Installs Docker Engine and the Compose plugin from Docker's apt repository if they're missing.
+3. Creates `/opt/sidetray` with `compose.yaml`, a production `Caddyfile` (the domain as the site address, `email <address>`, no `tls internal`) and `.env` (`SIDETRAY_HOST`, `SIDETRAY_RETENTION_DAYS=90`). Files it would overwrite are kept as `.bak`.
+4. Pulls the images and runs `docker compose up -d`, then waits until `https://<domain>/api/v1/health` answers over a publicly trusted certificate.
+5. Runs `sidetray-admin new-group` (below) and prints the one-time setup token and an invite link for the first person, the future Key Master.
+
+Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, and only issues a new setup token if asked to.
+
+**Production certificate mode**
+
+- For a server on a domain, the app trusts the normal public certificate roots (webpki roots, as browsers do), so a Let's Encrypt certificate just works. Release builds ship with an empty `pinned-roots.pem`.
+- The pinned Caddy CA becomes a **test mode**: used when the wizard is pointed at a bare IP address, or when someone pastes a root certificate under *Advanced*. The app labels such servers "test server" on *This device*.
+- The choice is stored per server. Verification is never turned off, and plain `http://` stays limited to `localhost`.
+
+**Invite links**
+
+- Format: `sidetray://join?server=https%3A%2F%2Ftray.example.org&group=Smith%20Family`. Both values are URL-encoded; nothing else is accepted.
+- The installer registers the `sidetray://` scheme (Phase 7; `tauri-plugin-deep-link`). Opening a link starts the app, or hands the link to the running copy, and opens the wizard with the server and group name filled in and checked. The person still types their name and email.
+- Links carry no secrets and grant nothing: the join is still `pending` until a Key Master compares safety codes on the phone. A link for a server that isn't `https://` is refused.
+- Key Masters get a *Copy invite link* button on the Key Master tab; the installer prints the first one.
+
+**Avatars and display names**
+
+- Optional. *This device → Profile* lets you pick a photo, then drag and zoom it inside a circle (like Discord) and save. The crop happens in the app: a 256×256 WebP, metadata stripped like post photos.
+- The image is encrypted with the group key, uploaded with `POST /media`, and announced in a new signed event, `kind: profile`, payload `{"display_name"?, "avatar"?: {"id", "digest"} | null}`. The media id also goes in the event's clear `media_ids`. `null` removes the avatar.
+- Clients use the latest valid profile event per member. Initials on a coloured circle remain the fallback whenever there's no avatar, it hasn't downloaded yet, or it fails its digest check.
+- A display name change rides the same event. Member certificates still carry the name a Key Master certified, so the Members screen shows both until a Key Master accepts the new name (one click, which re-signs that member's certificates). Posts show the new name straight away.
+- The relay never prunes a member's latest profile event or its avatar, so devices that join later still see everyone's face; older profile events prune normally.
+
+**Multiple groups per server**
+
+- `docker compose exec api sidetray-admin new-group` prints a fresh one-time setup token (stored hashed, valid 7 days). The first device to join with it creates a new group and becomes its Key Master, exactly like the first group today. `SIDETRAY_SETUP_TOKEN` in `.env` keeps working for a server's first group.
+- The server never lists its groups. `GET /group?name=<name>` only answers whether that exact name (case-insensitive) exists, and every authenticated call works within the group of the calling device's token. Group names are unique per server.
+- Pruning, rate limits and the `/ws` hub are already per group; the tables already carry `group_id`.
+- In the app, one install still joins one group. An in-app group switcher (several identities side by side) is a later phase.
+
+**Done when** `install.sh` brings up a fresh VPS on a real domain, the app joins it with no pasted certificate, an invite link opens the wizard pre-filled, a cropped avatar and a new name show up on another member's device, and a second group created with `sidetray-admin new-group` can't see or be found from the first.
+
+## Distribution and later
+
 **Distribution**
 
 - Unsigned Windows installers trigger the SmartScreen warning; options are a code-signing cert (~$100–300/yr) or a one-line "More info → Run anyway" instruction on the install page
@@ -216,10 +266,9 @@ Private one-to-one conversations (text and photos) between two members, relayed 
 
 **Later**
 
-- Multiple groups with an admin screen to create them
+- In-app group switcher (one install in several groups); the server side is Phase 6b
 - Facebook "Send to Side Tray too?" browser extension
 - PWA for phones, then native apps if needed
 - Archive sharing for new members, SQLCipher at rest, email verification via the M365 domain
 - iPhone photos: accept HEIC/HEIF in the photo picker (decode, then the same resize, EXIF strip and WebP encode)
-- Production TLS mode: trust the normal public certificate roots (a Let's Encrypt certificate on a real domain) instead of the pinned Caddy CA, chosen per server in the wizard, still never turning verification off
 - Linux: keep the device's private keys and token in the system keyring (Secret Service / libsecret) instead of the local database

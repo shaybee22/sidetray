@@ -15,6 +15,7 @@
 
 use crate::account;
 use crate::api::*;
+use crate::manage;
 use crate::db::{self, Identity};
 use crate::secrets::{self, Secrets};
 use crate::state::App;
@@ -84,6 +85,31 @@ pub struct SyncReport {
     /// Key Master: the pending join requests, as (device id, display name).
     #[serde(skip)]
     pub pending: Vec<(String, String)>,
+    /// The relay had already pruned events this device never got.
+    pub missed: bool,
+    /// Key Master: this sync finished a pending key rotation (the new version).
+    pub rotated: Option<u32>,
+}
+
+/// Who may author events: verified devices in the roster now, and former
+/// devices (removed or revoked) for events up to the seq they were cut off at.
+#[derive(Default)]
+pub struct Authors {
+    pub current: BTreeMap<String, VerifiedDevice>,
+    pub former: BTreeMap<String, (VerifiedDevice, i64)>,
+}
+
+impl Authors {
+    fn get(&self, device_id: &str, seq: i64) -> Result<&VerifiedDevice> {
+        if let Some(v) = self.current.get(device_id) {
+            return Ok(v);
+        }
+        match self.former.get(device_id) {
+            Some((v, cut_off)) if seq <= *cut_off => Ok(v),
+            Some(_) => bail!("author device {device_id} had been removed by the time of this event"),
+            None => bail!("author device {device_id} has no valid member certificate"),
+        }
+    }
 }
 
 /// A new post or comment by someone else.
@@ -103,13 +129,32 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
     let id = app.require_active()?;
     let api = app.api(&id)?;
     let s = app.secrets(&id)?;
-    let authors = account::refresh_roster(app, &id, &api).await?;
+    let roster = account::refresh_roster(app, &id, &api).await?;
+    let authors = Authors { current: roster.verified, former: roster.former };
     // The roster refresh may have recorded a promotion.
     let id = app.require_active()?;
     let mut report = SyncReport { initial: db::last_seq(&app.db())? == 0, ..Default::default() };
+    // Key Masters check every time, to notice a rotation left pending.
+    let km_keys = if id.is_keymaster() { Some(manage::refresh_keys(app, &id, &api, &authors.current).await?) } else { None };
+    let mut keys_checked = km_keys.is_some();
+    let mut first_page = true;
     loop {
         let after = db::last_seq(&app.db())?;
         let page: EventPage = api.get(&format!("/events?after={after}")).await?;
+        if std::mem::take(&mut first_page) && after > 0 && page.pruned_through > after {
+            // Away longer than the retention window: some events were deleted unseen.
+            db::set_missed(&app.db(), page.retention_days)?;
+            report.missed = true;
+        }
+        if !keys_checked {
+            let have = secrets::key_versions(&app.db())?;
+            let latest = have.last().copied().unwrap_or(0);
+            if page.key_version > latest || page.events.iter().any(|e| !have.contains(&e.key_version)) {
+                // A Key Master rotated the group key: fetch ours before decrypting.
+                manage::refresh_keys(app, &id, &api, &authors.current).await?;
+                keys_checked = true;
+            }
+        }
         {
             let conn = app.db();
             let tx = conn.unchecked_transaction()?;
@@ -140,6 +185,13 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
         }
     }
     download_media(app, &id, &s, &api).await;
+    if let Some(keys) = &km_keys {
+        match manage::rotate_if_pending(app, keys).await {
+            Some(Ok(r)) if r.devices > 0 => report.rotated = Some(r.key_version),
+            Some(Err(e)) => eprintln!("finishing a pending key rotation: {e:#}"),
+            _ => {}
+        }
+    }
     if id.is_keymaster() {
         if let Ok(list) = api.get::<PendingList>("/joins/pending").await {
             report.pending_joins = list.pending.len();
@@ -182,12 +234,10 @@ fn apply_event(
     conn: &Connection,
     id: &Identity,
     s: &Secrets,
-    authors: &BTreeMap<String, VerifiedDevice>,
+    authors: &Authors,
     e: &Event,
 ) -> Result<Option<Notice>> {
-    let author = authors
-        .get(&e.author_device_id)
-        .with_context(|| format!("author device {} has no valid member certificate", e.author_device_id))?;
+    let author = authors.get(&e.author_device_id, e.seq)?;
     let ct = B64.decode(&e.ciphertext)?;
     let msg = protocol::event_message(&id.group_id, &e.author_device_id, &e.kind, e.key_version, &ct);
     crypto::verify(&author.sign_pk, &msg, &B64.decode(&e.signature)?).context("bad author signature")?;
@@ -420,31 +470,18 @@ fn latest_key(app: &App, id: &Identity) -> Result<GroupKey> {
     secrets::latest_group_key(&app.db(), &s)
 }
 
-pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()> {
-    let id = app.require_active()?;
-    let text = text.trim();
-    if text.len() > MAX_TEXT {
-        bail!("that post is too long");
-    }
-    if staged.len() > MAX_PHOTOS {
-        bail!("at most {MAX_PHOTOS} photos per post");
-    }
-    let photos: Vec<crate::photo::Processed> = {
-        let map = app.staged.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(missing) = staged.iter().find(|k| !map.contains_key(*k)) {
-            bail!("photo {missing} is no longer attached; add it again");
-        }
-        staged.iter().map(|k| map.get(k).expect("checked").clone()).collect()
-    };
-    if text.is_empty() && photos.is_empty() {
-        bail!("write something or add a photo");
-    }
-    let gk = latest_key(app, &id)?;
-    let api = app.api(&id)?;
+/// What `post_once` returns: the post's event id, the key it used, its photo
+/// references and the digests of the encrypted blobs.
+type Posted = (String, GroupKey, Vec<PhotoRef>, Vec<([u8; 32], [u8; 32])>);
+
+/// Upload a post's photos and the post itself under the latest key.
+async fn post_once(app: &App, id: &Identity, text: &str, photos: &[crate::photo::Processed]) -> Result<Posted> {
+    let gk = latest_key(app, id)?;
+    let api = app.api(id)?;
     let ad = protocol::media_ad(&id.group_id);
     let mut refs = Vec::new();
     let mut local = Vec::new();
-    for p in &photos {
+    for p in photos {
         let enc_full = crypto::encrypt(&gk, &p.full, &ad);
         let enc_thumb = crypto::encrypt(&gk, &p.thumb, &ad);
         let (fd, td) = (crypto::blob_digest(&enc_full), crypto::blob_digest(&enc_thumb));
@@ -469,6 +506,50 @@ pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()>
     }
     let media_ids = refs.iter().flat_map(|r| [r.full.clone(), r.thumb.clone()]).collect();
     let post_id = send_event(app, "post", &body, &gk, media_ids).await?;
+    Ok((post_id, gk, refs, local))
+}
+
+/// Send a comment, reaction or delete under the latest key. If the relay says
+/// a newer key exists (a rotation not picked up yet), fetch it and try again.
+async fn send_fresh(app: &App, kind: &str, body: &serde_json::Value) -> Result<String> {
+    let id = app.require_active()?;
+    match send_event(app, kind, body, &latest_key(app, &id)?, vec![]).await {
+        Err(e) if is_stale_key(&e) => {
+            manage::refresh_keys_now(app).await?;
+            send_event(app, kind, body, &latest_key(app, &id)?, vec![]).await
+        }
+        r => r,
+    }
+}
+
+pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()> {
+    let id = app.require_active()?;
+    let text = text.trim();
+    if text.len() > MAX_TEXT {
+        bail!("that post is too long");
+    }
+    if staged.len() > MAX_PHOTOS {
+        bail!("at most {MAX_PHOTOS} photos per post");
+    }
+    let photos: Vec<crate::photo::Processed> = {
+        let map = app.staged.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(missing) = staged.iter().find(|k| !map.contains_key(*k)) {
+            bail!("photo {missing} is no longer attached; add it again");
+        }
+        staged.iter().map(|k| map.get(k).expect("checked").clone()).collect()
+    };
+    if text.is_empty() && photos.is_empty() {
+        bail!("write something or add a photo");
+    }
+    let (post_id, gk, refs, local) = match post_once(app, &id, text, &photos).await {
+        // A rotation we hadn't picked up: get the new key and redo it (the
+        // first uploads become orphans, which the relay prunes after a day).
+        Err(e) if is_stale_key(&e) => {
+            manage::refresh_keys_now(app).await?;
+            post_once(app, &id, text, &photos).await?
+        }
+        r => r?,
+    };
 
     // We already have the plaintext photos: keep them, so sync doesn't download them back.
     for (i, (p, r)) in photos.iter().zip(&refs).enumerate() {
@@ -500,26 +581,24 @@ fn require_post(app: &App, post_id: &str) -> Result<String> {
 }
 
 pub async fn add_comment(app: &App, post_id: &str, text: &str) -> Result<()> {
-    let id = app.require_active()?;
+    app.require_active()?;
     let text = text.trim();
     if text.is_empty() || text.len() > MAX_TEXT {
         bail!("write a comment first");
     }
     require_post(app, post_id)?;
-    let gk = latest_key(app, &id)?;
-    send_event(app, "comment", &serde_json::json!({ "post": post_id, "text": text }), &gk, vec![]).await?;
+    send_fresh(app, "comment", &serde_json::json!({ "post": post_id, "text": text })).await?;
     sync_once(app).await?;
     Ok(())
 }
 
 pub async fn set_reaction(app: &App, post_id: &str, emoji: &str) -> Result<()> {
-    let id = app.require_active()?;
+    app.require_active()?;
     if !emoji.is_empty() && !valid_emoji(emoji) {
         bail!("not an emoji");
     }
     require_post(app, post_id)?;
-    let gk = latest_key(app, &id)?;
-    send_event(app, "reaction", &serde_json::json!({ "post": post_id, "emoji": emoji }), &gk, vec![]).await?;
+    send_fresh(app, "reaction", &serde_json::json!({ "post": post_id, "emoji": emoji })).await?;
     sync_once(app).await?;
     Ok(())
 }
@@ -529,8 +608,7 @@ pub async fn delete_post(app: &App, post_id: &str) -> Result<()> {
     if require_post(app, post_id)? != id.member_id {
         bail!("you can only delete your own posts");
     }
-    let gk = latest_key(app, &id)?;
-    send_event(app, "delete", &serde_json::json!({ "post": post_id }), &gk, vec![]).await?;
+    send_fresh(app, "delete", &serde_json::json!({ "post": post_id })).await?;
     sync_once(app).await?;
     Ok(())
 }
@@ -674,7 +752,7 @@ mod tests {
         id: Identity,
         s: Secrets,
         gk: GroupKey,
-        authors: BTreeMap<String, VerifiedDevice>,
+        authors: Authors,
         ana: sidetray_crypto::DeviceKeys,
         seq: i64,
     }
@@ -716,7 +794,7 @@ mod tests {
             },
         );
         conn.execute("INSERT INTO members (id, display_name, role) VALUES ('m_ana', 'Ana', 'member')", []).unwrap();
-        Fixture { conn, id, s, gk, authors, ana, seq: 0 }
+        Fixture { conn, id, s, gk, authors: Authors { current: authors, former: BTreeMap::new() }, ana, seq: 0 }
     }
 
     impl Fixture {
@@ -834,6 +912,18 @@ mod tests {
         let (p, _) = f.event("post", serde_json::json!({ "text": "", "photos": [photo] }));
         assert_eq!(f.apply(&p).unwrap().unwrap().text, "shared a photo");
         assert_eq!(snippet(&"x".repeat(200), 0).chars().count(), 141);
+    }
+
+    #[test]
+    fn removed_authors_count_only_up_to_their_cut_off() {
+        let mut f = fixture();
+        let (before, _) = f.event("post", serde_json::json!({ "text": "before I left" }));
+        let (after, _) = f.event("post", serde_json::json!({ "text": "after" }));
+        let ana = f.authors.current.remove("d_ana").unwrap();
+        f.authors.former.insert("d_ana".into(), (ana, before.seq));
+        assert!(f.apply(&before).unwrap().is_some());
+        let err = f.apply(&after).unwrap_err();
+        assert!(format!("{err}").contains("removed"), "{err}");
     }
 
     #[test]

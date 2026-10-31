@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS identity (
     device_id     TEXT NOT NULL,
     display_name  TEXT NOT NULL,
     email         TEXT NOT NULL,
-    status        TEXT NOT NULL,          -- pending / active / denied
+    status        TEXT NOT NULL,          -- pending / active / denied / removed / revoked
     role          TEXT NOT NULL,          -- member / keymaster
     enc_pubkey    BLOB NOT NULL,
     sign_pubkey   BLOB NOT NULL,
@@ -114,6 +114,9 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(SCHEMA).context("creating tables")?;
     add_column(&conn, "sync_state", "unread", "INTEGER NOT NULL DEFAULT 0")?;
+    // Phase 6: set when the relay pruned events this device never got.
+    add_column(&conn, "sync_state", "missed_at", "INTEGER")?;
+    add_column(&conn, "sync_state", "missed_days", "REAL")?;
     Ok(conn)
 }
 
@@ -220,7 +223,7 @@ pub fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM identity; DELETE FROM group_keys; DELETE FROM secrets; DELETE FROM anchors;
          DELETE FROM members; DELETE FROM member_devices; DELETE FROM posts; DELETE FROM comments;
-         DELETE FROM reactions; DELETE FROM media; UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0;",
+         DELETE FROM reactions; DELETE FROM media; UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0, missed_at = NULL, missed_days = NULL;",
     )?;
     Ok(())
 }
@@ -275,6 +278,28 @@ pub fn add_unread(conn: &Connection, n: i64) -> Result<()> {
 
 pub fn clear_unread(conn: &Connection) -> Result<()> {
     conn.execute("UPDATE sync_state SET unread = 0 WHERE id = 1", [])?;
+    Ok(())
+}
+
+/// The relay deleted events this device never downloaded (it was away longer
+/// than the retention window). Shown until dismissed.
+pub fn set_missed(conn: &Connection, retention_days: f64) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_state SET missed_at = ?1, missed_days = ?2 WHERE id = 1",
+        params![crate::now(), retention_days],
+    )?;
+    Ok(())
+}
+
+/// (when it was noticed, the server's retention window in days)
+pub fn missed(conn: &Connection) -> Result<Option<(i64, f64)>> {
+    Ok(conn.query_row("SELECT missed_at, missed_days FROM sync_state WHERE id = 1", [], |r| {
+        Ok(r.get::<_, Option<i64>>(0)?.map(|at| (at, r.get::<_, Option<f64>>(1).ok().flatten().unwrap_or(90.0))))
+    })?)
+}
+
+pub fn clear_missed(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE sync_state SET missed_at = NULL, missed_days = NULL WHERE id = 1", [])?;
     Ok(())
 }
 

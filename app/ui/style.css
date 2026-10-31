@@ -209,3 +209,30 @@ button.ghost.danger:hover { border-color: var(--danger); }
 .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-right: 5px; vertical-align: 1px; }
 .post.highlight { box-shadow: 0 0 0 2px var(--accent), var(--shadow); transition: box-shadow .4s; }
 .banner { max-width: 648px; width: calc(100% - 32px); box-sizing: border-box; margin: 12px auto 0; padding: 10px 14px; border-radius: var(--radius); background: var(--danger-soft); }
+
+/* Phase 6: members, confirmations, removal, missed posts */
+.banner { display: flex; align-items: center; gap: 12px; }
+.banner > span { flex: 1; }
+.banner.warn { background: var(--code-bg); border: 1px solid var(--code-line); width: 100%; margin: 0 0 16px; }
+#readonly-banner { background: var(--surface-2); border: 1px solid var(--line); }
+.member { border-top: 1px solid var(--line); padding: 14px 0; }
+.member:first-child { border-top: none; }
+.member-head { display: flex; align-items: center; gap: 10px; }
+.member-who { flex: 1; min-width: 0; }
+.member-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.m-cert.ok { color: var(--accent); }
+.m-cert.bad { color: var(--danger); }
+.devices { list-style: none; margin: 8px 0 0 46px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.devices li { display: flex; align-items: center; gap: 8px; font-size: .85rem; color: var(--muted); }
+.devices li > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.devices .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .8rem; }
+.devices .bad { color: var(--danger); }
+dialog#confirm { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); box-shadow: var(--shadow); padding: 22px; max-width: 440px; width: calc(100% - 32px); }
+dialog#confirm::backdrop { background: rgba(10, 10, 10, .45); }
+dialog#confirm p { margin: 0; }
+button.primary.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+/* A removed device reading its saved posts: nothing that would send anything. */
+.readonly .tabs, .readonly .sync, .readonly #composer, .readonly .comment-form,
+.readonly .react.add, .readonly .post-delete, .readonly #missed-banner { display: none !important; }
+.readonly .react { pointer-events: none; }
+@media (max-width: 560px) { .devices { margin-left: 0; } .member-head { flex-wrap: wrap; } }

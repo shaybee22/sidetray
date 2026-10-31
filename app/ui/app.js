@@ -69,6 +69,8 @@ function route() {
     case "pending":
     case "denied": return startWaiting();
     case "active": return startMain();
+    case "removed":
+    case "revoked": return startRemoved();
     default: $("#screen-loading p").textContent = `Unexpected state: ${view.stage}`;
   }
 }
@@ -243,7 +245,10 @@ confirmClick($("#wt-cancel"), "Click again to cancel the request", startOver);
 
 function startMain() {
   showScreen("screen-main");
+  $("#screen-main").classList.remove("readonly");
+  $("#readonly-banner").hidden = true;
   $("#tb-group").textContent = view.group_name;
+  renderMissed();
   $("#tab-km-btn").hidden = !view.keymaster;
   $("#km-code").textContent = view.safety_code;
   renderSyncStatus();
@@ -260,6 +265,7 @@ function selectTab(name) {
     pendingTimer = setInterval(loadPending, 10000);
   }
   if (name === "device") { renderDevice(); loadSettings(); }
+  if (name === "members") loadMembers();
   if (name === "feed") markReadIfViewed();
 }
 for (const t of $$(".tab")) t.addEventListener("click", () => selectTab(t.dataset.tab));
@@ -301,7 +307,11 @@ listen("push-status", async (ev) => {
   renderSyncStatus();
 });
 
-listen("removed", () => { $("#removed-banner").hidden = false; });
+// The relay confirmed this device was removed or revoked: syncing has stopped.
+listen("removed", async () => {
+  view = await invoke("get_state");
+  route();
+});
 
 // A notification was clicked: show what it was about.
 listen("open-item", async (ev) => {
@@ -339,10 +349,12 @@ listen("synced", async (ev) => {
   const r = ev.payload;
   const wasKm = view.keymaster;
   view = await invoke("get_state");
-  if (view.stage !== "active") return;
+  if (view.stage !== "active") return route();
   $("#sync-status").title = "";
   renderSyncStatus();
+  renderMissed();
   if (view.keymaster !== wasKm) startMain();
+  if (!$("#panel-members").hidden && (r.rotated || r.new_events)) loadMembers();
   const badge = $("#km-badge");
   badge.textContent = String(r.pending_joins);
   badge.hidden = !r.pending_joins;
@@ -689,6 +701,240 @@ function renderPending(p) {
   });
   return el;
 }
+
+// --- confirmations ---------------------------------------------------------------------------
+
+/** A modal yes/no. Cancel has the focus, so Enter alone never confirms. */
+function askConfirm({ title, body, ok, danger = false }) {
+  const dlg = $("#confirm");
+  $("#cf-title").textContent = title;
+  $("#cf-body").textContent = body;
+  $("#cf-ok").textContent = ok;
+  $("#cf-ok").classList.toggle("danger", danger);
+  dlg.returnValue = "";
+  dlg.showModal();
+  $("#cf-cancel").focus();
+  return new Promise((resolve) => {
+    dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true });
+  });
+}
+
+// --- members ---------------------------------------------------------------------------------
+
+function lastSeen(ts) {
+  return ts ? `last seen ${when(ts)}` : "";
+}
+
+async function loadMembers() {
+  const err = $("#members-err");
+  let list;
+  try {
+    list = await invoke("list_members");
+    hideError(err);
+  } catch (e) {
+    $("#members-loading").hidden = true;
+    return showError(err, e);
+  }
+  $("#members-loading").hidden = true;
+  $("#members").replaceChildren(...list.map(renderMember));
+}
+
+function renderMember(m) {
+  const el = $("#tpl-member").content.firstElementChild.cloneNode(true);
+  el.dataset.member = m.id;
+  avatar($(".avatar", el), m.name);
+  $(".m-name", el).textContent = m.name;
+  $(".m-role", el).hidden = m.role !== "keymaster";
+  $(".m-you", el).hidden = !m.me;
+  const cert = $(".m-cert", el);
+  const n = m.devices.length;
+  if (m.cert_status === "verified") {
+    cert.textContent = `Verified · ${n} device${n === 1 ? "" : "s"}`;
+    cert.className = "small m-cert ok";
+  } else if (m.cert_status === "partial") {
+    cert.textContent = "Partly verified: a device has no valid certificate, and its posts are ignored";
+    cert.className = "small m-cert bad";
+  } else {
+    cert.textContent = "Unverified: no certificate from a Key Master this app trusts. Name as the server reports it; posts are ignored";
+    cert.className = "small m-cert bad";
+  }
+
+  const devices = $(".devices", el);
+  for (const d of m.devices) {
+    const li = document.createElement("li");
+    const label = document.createElement("span");
+    const name = document.createElement("span");
+    name.className = "mono";
+    name.textContent = d.this_device ? "This device" : d.id;
+    const facts = [d.verified ? `certified by ${d.certified_by}` : "no valid certificate", lastSeen(d.last_seen)].filter(Boolean);
+    const rest = document.createElement("span");
+    rest.textContent = " · " + facts.join(" · ");
+    if (!d.verified) rest.className = "bad";
+    label.append(name, rest);
+    li.append(label);
+    if (view.keymaster && !d.this_device) {
+      const b = document.createElement("button");
+      b.className = "ghost small danger";
+      b.textContent = "Revoke";
+      b.title = "For a lost or replaced device";
+      b.addEventListener("click", () => revokeDevice(m, d, b));
+      li.append(b);
+    }
+    devices.append(li);
+  }
+
+  if (view.keymaster && !m.me) {
+    const promote = $(".m-promote", el);
+    promote.hidden = m.role === "keymaster" || m.cert_status !== "verified";
+    promote.addEventListener("click", () => promoteMember(m, promote));
+    const remove = $(".m-remove", el);
+    remove.hidden = false;
+    remove.addEventListener("click", () => removeMember(m, remove));
+  }
+  return el;
+}
+
+function showMembersNote(text) {
+  const note = $("#members-note");
+  note.textContent = text;
+  note.hidden = false;
+}
+
+function keyNote(c) {
+  if (c.rotated && c.rotated.devices) {
+    const n = c.rotated.devices;
+    return ` The group key was changed (version ${c.rotated.key_version}) and sent to the ${n} remaining device${n === 1 ? "" : "s"}.`;
+  }
+  if (c.rotated) return ` The group key was already changed (version ${c.rotated.key_version}).`;
+  return ` Changing the group key didn't finish (${c.rotate_error}). The app tries again on the next sync.`;
+}
+
+async function promoteMember(m, button) {
+  const yes = await askConfirm({
+    title: `Make ${m.name} a Key Master?`,
+    body: `${m.name} will be able to approve new members, remove people and change the group key. Your app signs a Key Master certificate for each of their devices.`,
+    ok: "Make Key Master",
+  });
+  if (!yes) return;
+  hideError($("#members-err"));
+  await busy(button, async () => {
+    button.textContent = "Promoting…";
+    try {
+      const name = await invoke("promote_member", { memberId: m.id });
+      showMembersNote(`${name} is now a Key Master.`);
+      await loadMembers();
+    } catch (e) {
+      showError($("#members-err"), e);
+    }
+  });
+}
+
+async function removeMember(m, button) {
+  const yes = await askConfirm({
+    title: `Remove ${m.name} from the group?`,
+    body: `Their devices are disconnected right away and the group key is changed, so they can't read anything posted from now on. They keep the posts already on their devices. To come back they'd have to ask to join again.`,
+    ok: "Remove",
+    danger: true,
+  });
+  if (!yes) return;
+  hideError($("#members-err"));
+  await busy(button, async () => {
+    button.textContent = "Removing…";
+    try {
+      const c = await invoke("remove_member", { memberId: m.id });
+      showMembersNote(`${c.name} was removed.` + keyNote(c));
+      view = await invoke("get_state");
+      await loadMembers();
+    } catch (e) {
+      showError($("#members-err"), e);
+    }
+  });
+}
+
+async function revokeDevice(m, d, button) {
+  const seen = d.last_seen ? ` It was ${lastSeen(d.last_seen)}.` : "";
+  const yes = await askConfirm({
+    title: `Revoke this device of ${m.name}?`,
+    body: `Device ${d.id} is disconnected right away and the group key is changed, so it can't read anything new.${seen} ${m.name} stays in the group; their other devices keep working, and they can join again from a new one.`,
+    ok: "Revoke device",
+    danger: true,
+  });
+  if (!yes) return;
+  hideError($("#members-err"));
+  await busy(button, async () => {
+    button.textContent = "Revoking…";
+    try {
+      const c = await invoke("revoke_device", { deviceId: d.id });
+      showMembersNote(`Revoked ${c.name}.` + keyNote(c));
+      view = await invoke("get_state");
+      await loadMembers();
+    } catch (e) {
+      showError($("#members-err"), e);
+    }
+  });
+}
+
+// --- missed posts ------------------------------------------------------------------------------
+
+function renderMissed() {
+  const banner = $("#missed-banner");
+  if (!view.missed) { banner.hidden = true; return; }
+  const days = Math.round(view.missed[1]);
+  $("#missed-text").textContent = `You missed some posts. This device was away longer than the server keeps posts (${days} days), so some were deleted before it could download them. Other members' apps still have them.`;
+  banner.hidden = false;
+}
+
+$("#missed-dismiss").addEventListener("click", async () => {
+  try { await invoke("dismiss_missed"); } catch (e) { console.warn("dismiss_missed", e); }
+  view.missed = null;
+  renderMissed();
+});
+
+// --- removed --------------------------------------------------------------------------------------
+
+function startRemoved() {
+  showScreen("screen-removed");
+  $("#rm-group").textContent = view.group_name || "";
+  if (view.stage === "removed") {
+    $("#rm-title").textContent = "You've been removed from this group";
+    $("#rm-body").textContent = `A Key Master removed you from ${view.group_name}. This app has stopped syncing and can't read anything posted from now on.`;
+  } else {
+    $("#rm-title").textContent = "This device was disconnected";
+    $("#rm-body").textContent = `A Key Master revoked this device's access to ${view.group_name}, for example because it was reported lost. It has stopped syncing. If that's a mistake, ask a Key Master: you can join again as a new device.`;
+  }
+  hideError($("#rm-err"));
+}
+
+$("#rm-archive").addEventListener("click", async () => {
+  showScreen("screen-main");
+  $("#screen-main").classList.add("readonly");
+  $("#tb-group").textContent = view.group_name;
+  $("#readonly-banner").hidden = false;
+  $("#readonly-text").textContent = view.stage === "removed"
+    ? `Saved posts from ${view.group_name}. You're no longer in this group, so this is read only.`
+    : `Saved posts from ${view.group_name}. This device was disconnected, so this is read only.`;
+  for (const p of $$(".panel")) p.hidden = p.id !== "panel-feed";
+  await loadFeed();
+});
+
+$("#readonly-back").addEventListener("click", () => startRemoved());
+
+$("#rm-restart").addEventListener("click", async () => {
+  const yes = await askConfirm({
+    title: "Delete the saved posts?",
+    body: `This deletes everything this app saved from ${view.group_name}, photos included, and starts the setup again so you can ask to join a group. It can't be undone.`,
+    ok: "Delete and start over",
+    danger: true,
+  });
+  if (!yes) return;
+  try {
+    await invoke("reset");
+  } catch (e) {
+    return showError($("#rm-err"), e);
+  }
+  view = await invoke("get_state");
+  route();
+});
 
 // --- this device ---------------------------------------------------------------------------
 
