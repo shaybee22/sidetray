@@ -97,6 +97,8 @@ pub struct SyncReport {
     /// New direct messages from others, for the unread count and notifications.
     #[serde(skip)]
     pub dm_notices: Vec<crate::dm::DmNotice>,
+    /// A certified name or role changed (say, a Key Master accepted a new name): redraw names.
+    pub names_changed: bool,
 }
 
 /// Who may author events: verified devices in the roster now, and former
@@ -137,12 +139,14 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
     let id = app.require_active()?;
     let api = app.api(&id)?;
     let s = app.secrets(&id)?;
+    let names_before = roster_names(&app.db())?;
     let roster = account::refresh_roster(app, &id, &api).await?;
     let dm_former = roster.former_dm;
     let authors = Authors { current: roster.verified, former: roster.former };
     // The roster refresh may have recorded a promotion.
     let id = app.require_active()?;
     let mut report = SyncReport { initial: db::last_seq(&app.db())? == 0, ..Default::default() };
+    report.names_changed = roster_names(&app.db())? != names_before;
     // Key Masters check every time, to notice a rotation left pending.
     let km_keys = if id.is_keymaster() { Some(manage::refresh_keys(app, &id, &api, &authors.current).await?) } else { None };
     let mut keys_checked = km_keys.is_some();
@@ -228,6 +232,16 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
     drop(conn);
     crate::alerts::after_sync(app, &report);
     Ok(report)
+}
+
+/// The cached roster's names and roles, to notice when a sync changed them.
+fn roster_names(conn: &Connection) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(group_concat(id || '=' || display_name || '/' || role, char(10)), '')
+         FROM (SELECT * FROM members ORDER BY id)",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 /// One line for a notification: whitespace collapsed, cut at 140 characters.

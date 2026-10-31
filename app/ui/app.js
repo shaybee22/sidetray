@@ -431,9 +431,11 @@ listen("synced", async (ev) => {
   const badge = $("#km-badge");
   badge.textContent = String(r.pending_joins);
   badge.hidden = !r.pending_joins;
-  if (!$("#panel-feed").hidden && (r.new_events || r.avatars)) loadFeed();
+  if (!$("#panel-feed").hidden && (r.new_events || r.avatars || r.names_changed)) loadFeed();
+  if (!$("#panel-members").hidden && r.names_changed) loadMembers();
+  if (r.names_changed) renderDevice();
   if (!$("#panel-km").hidden) loadPending();
-  if (!$("#panel-messages").hidden && (r.new_dms || r.avatars || r.new_events)) refreshMessages();
+  if (!$("#panel-messages").hidden && (r.new_dms || r.avatars || r.names_changed)) refreshMessages();
   renderDmBadge();
   markReadIfViewed();
 });

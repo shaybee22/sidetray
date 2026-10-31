@@ -300,7 +300,8 @@ dialog#crop p { margin: 0; }
 .conv-last { color: var(--muted); font-size: .9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv.unread .conv-last { color: var(--text); font-weight: 600; }
 .conv .badge { flex: none; }
-.chat { display: flex; flex-direction: column; height: calc(100vh - 96px); min-height: 380px; padding: 0; overflow: hidden; }
+#panel-messages { padding-bottom: 16px; }
+.chat { display: flex; flex-direction: column; height: calc(100vh - 90px); min-height: 380px; padding: 0; overflow: hidden; }
 .chat-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .chat-head b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-log { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 4px; }

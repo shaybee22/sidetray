@@ -208,6 +208,13 @@ Private one-to-one conversations (text and photos) between two members, relayed 
 - **Chat screen**: messages as bubbles (mine on the right), photos inline with the same resize, EXIF stripping and lightbox as posts, a composer at the bottom (Ctrl+Enter sends).
 - Notifications: "Ana sent you a message" with the first line, click opens the conversation. DM unread counts go into the tray badge.
 
+**As built** (where it differs from or adds to the plan above):
+
+- `GET /dms` returns every sealed key of a message, not just the caller's: the signature covers them all, so a recipient needs them to check it. They're ciphertext to other devices, so nothing leaks.
+- Message numbers count per group (`seq`), like event numbers, and `/members` lists a former device's `revoked_dm_seq`, so a message a removed member sent just before the removal still verifies on a device that syncs later.
+- The relay also requires a message's photos to be uploaded by the sending device and not already used by a post or another message, and a post can't reference a message's photo.
+- A message pushes `new_dm` only to the devices it was sealed to.
+
 **Done when** two members exchange text and a photo, the sender's second device shows the conversation too, a third member's device gets nothing from `GET /dms` and can't fetch the photo, and both messages disappear from the server once every participant device has acked them.
 
 ## Phase 6b: Real servers, invites, avatars, more groups
@@ -246,7 +253,7 @@ Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, 
 - The image is encrypted with the group key, uploaded with `POST /media`, and announced in a new signed event, `kind: profile`, payload `{"display_name"?, "avatar": {"id", "digest"} | null}`. The media id also goes in the event's clear `media_ids`. `null` removes the avatar.
 - Every profile event states the whole profile (an absent `display_name` means the certified name), because the latest one wins outright and is all the relay keeps. So changing only the name sends the current photo again, re-encrypted under the current group key.
 - Clients use the latest valid profile event per member. Initials on a coloured circle remain the fallback whenever there's no avatar, it hasn't downloaded yet, or it fails its digest check.
-- A display name change rides the same event. Member certificates still carry the name a Key Master certified, so the Members screen shows both until a Key Master accepts the new name (one click, which re-signs that member's certificates: `POST /members/{id}/name`). Posts show the new name straight away.
+- A display name change rides the same event, but it's only a request: everyone keeps seeing the certified name (in posts, comments, the member list, messages and notifications) until a Key Master accepts the new one (one click, which re-signs that member's certificates: `POST /members/{id}/name`; the relay then pushes `roster` so every app updates at once). Until then Key Masters see a "name change pending" marker. That stops someone renaming themselves "Mom" to scam people. Avatars change straight away.
 - The relay never prunes a member's latest profile event or its avatar, so devices that join later still see everyone's face; older profile events prune normally.
 
 **Multiple groups per server**

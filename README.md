@@ -2,7 +2,7 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: Phase 6b (real servers, invites, avatars, more groups).** A Tauri 2 desktop app
+**Status: Phase 5b (direct messages), after 6b.** A Tauri 2 desktop app
 (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
 comments and reactions. It keeps a local SQLite archive and syncs the moment the
@@ -19,9 +19,11 @@ a fresh Debian or Ubuntu machine, and the relay enforces rate limits (see
 [Run your own server](#run-your-own-server)). The app trusts a server on a
 domain through the public certificate roots, and a test server only after its
 person confirmed the root certificate's fingerprint. Key Masters invite people
-with a `sidetray://` link or QR code, and everyone can set a photo and the name
-the group sees. Still to come: direct messages (5b) and release builds (7),
-specified in SPEC.md.
+with a `sidetray://` link or QR code, and everyone can set a photo and ask
+for a new name, which shows once a Key Master accepts it. Members send each
+other end-to-end encrypted direct messages (text and photos) that only the
+two people's devices can read. Still to come: release builds (7), specified
+in SPEC.md.
 
 ## Layout
 
@@ -87,6 +89,38 @@ setup token only when the server has no group and no unused token, or with
 `--new-group`. Tokens are stored hashed, so a lost one can't be shown again;
 issue a new one instead.
 
+### Updating a server
+
+Updating is the same command as installing: get the new code, then run the
+installer again. From the checkout you installed from:
+
+```sh
+cd ~/sidetray          # wherever your checkout is
+git pull
+sudo ./install.sh --yes
+```
+
+From a release instead: `curl -fsSL <release url>/install.sh | sudo
+SIDETRAY_SOURCE_URL=<release tarball> bash -s -- --yes`.
+
+`--yes` keeps every setting as it is (domain or IP, retention). The installer
+copies the new `compose.yaml`, `server/` and `install.sh` into `/opt/sidetray`
+(keeping a `.bak` of anything it replaces), rebuilds the api image and
+restarts the stack. The data volumes and `.env` are kept, and the relay
+upgrades its database by itself when it starts (new tables and columns are
+added in place; nothing is deleted). Clients don't need updating at the same
+time: an older app just doesn't use what's new. To check afterwards:
+
+```sh
+sudo sidetray-admin list-groups                       # every group still there, with counts
+cd /opt/sidetray && sudo docker compose logs api --tail 20
+```
+
+If you installed from a plain copy of the files rather than a git checkout,
+switch to a checkout once (`git clone <repository> ~/sidetray`) and run the
+installer from there; it only needs `compose.yaml`, `server/` and
+`install.sh` next to each other.
+
 ### More groups, and other admin commands
 
 One server can host several groups. They're separate: a device's token only
@@ -109,8 +143,8 @@ never go out over the API.
 
 | What | Limit | Key | Setting in `.env` |
 | --- | --- | --- | --- |
-| `POST /events` | 30 per minute | device | `SIDETRAY_EVENTS_PER_MINUTE` |
-| `POST /media` | 50 MB per hour | device | `SIDETRAY_MEDIA_MB_PER_HOUR` |
+| `POST /events` and `POST /dms` together | 30 per minute | device | `SIDETRAY_EVENTS_PER_MINUTE` |
+| `POST /media` (posts, avatars and message photos) | 50 MB per hour | device | `SIDETRAY_MEDIA_MB_PER_HOUR` |
 | `POST /join` | 10 attempts per hour | client IP | `SIDETRAY_JOINS_PER_HOUR` |
 | `GET /group?name=` | 60 per hour | client IP | `SIDETRAY_LOOKUPS_PER_HOUR` |
 
@@ -179,7 +213,7 @@ base64. The server never decrypts.
 | GET | /joins/pending | Key Master | | `{pending[]}` with each device's public keys |
 | POST | /joins/{device_id}/approve | Key Master | `{sealed_keys: [{key_version, sealed_blob, signature}], cert, anchors[], anchors_signature}` | `{status: active}` |
 | POST | /joins/{device_id}/deny | Key Master | | `{status: denied}` |
-| GET | /members | member | | `{members: [{id, display_name, role, devices: [{id, enc_pubkey, sign_pubkey, certs[], last_seen?, joined_at?}]}], former: [...]}` |
+| GET | /members | member | | `{members: [{id, display_name, role, devices: [{id, enc_pubkey, sign_pubkey, certs[], last_seen?, joined_at?}]}], former: [...]}` (former devices also carry `revoked_seq` and `revoked_dm_seq`) |
 | POST | /certs | Key Master | `{certs: [{device_id, role, display_name, signature}]}` | `{stored}` |
 | POST | /members/{id}/role | Key Master | `{role: "keymaster", certs[]}`, one per active device | `{role}` |
 | POST | /members/{id}/name | Key Master | `{display_name, certs[]}`, one per active device, carrying the new name | `{member_id, display_name}` |
@@ -189,7 +223,10 @@ base64. The server never decrypts.
 | GET | /events | member | `?after=<seq>&limit=<1..500>` | `{events[], last_seq, has_more, pruned_through, retention_days, key_version}` |
 | POST | /ack | member | `{seq}` (only moves forward) | `{last_seq}` |
 | POST | /media | member | raw bytes, max 10 MB | `{id, size_bytes}` |
-| GET | /media/{id} | member | | the bytes |
+| GET | /media/{id} | member | | the bytes. A direct message's photo only for the devices it was sealed to and the sender's (`404` for anyone else) |
+| POST | /dms | member | `{conversation_id, recipient_member_id, ciphertext, signature, media_ids[], sealed_keys: [{device_id, sealed_key}]}` | `{seq}` |
+| GET | /dms | member | `?after=<seq>&limit=<1..500>` | `{messages: [{seq, conversation_id, sender_device_id, sender_member_id, recipient_member_id, ciphertext, signature, media_ids[], created_at, sealed_keys[]}], last_seq, has_more}`, only messages sealed to the calling device |
+| POST | /dms/ack | member | `{seq}` (only moves forward) | `{last_seq}` |
 | WS | /ws | member | `Authorization: Bearer` on the upgrade request | push messages, below |
 
 - **Creating a group:** `POST /join` with a valid `setup_token` creates a group
@@ -226,6 +263,8 @@ comes from `GET /events`. A missing, unknown, pending or revoked token gets HTTP
 | --- | --- | --- |
 | `{"type":"hello","device_id"}` | the new socket | connected |
 | `{"type":"new_event","seq","kind"}` | every active device except the author's | an event was appended: sync |
+| `{"type":"new_dm","seq"}` | the devices a direct message was sealed to (the recipient's, and the sender's other devices) | sync direct messages |
+| `{"type":"roster"}` | every active device | a Key Master accepted a new name: sync, so it shows everywhere |
 | `{"type":"join_request","device_id","display_name","existing_member"}` | Key Masters' devices | someone is waiting for approval |
 | `{"type":"key_rotated","key_version"}` | every active device | a Key Master rotated the group key: fetch `GET /keys` |
 | `{"type":"removed","scope"}` | the revoked device; then the socket closes | `scope` is `member` (the member was removed) or `device` (just this device was revoked). Also sent by the socket itself if it notices the device is no longer active |
@@ -268,7 +307,10 @@ proxies the upgrade with no extra configuration.
   that every active device has acked, and anything older than
   `SIDETRAY_RETENTION_DAYS`. Revoked devices and removed members don't hold
   anything back; a device that has never acked holds everything back.
-  Uploads no event refers to go after a day. Each active member's latest
+  Uploads no event or message refers to go after a day. Direct messages
+  count only their own devices: one goes (with its photos) once every
+  still-active device it was sealed to has acked it (`POST /dms/ack`), or
+  past the retention window. Each active member's latest
   `profile` event and its avatar are never pruned, so devices that join later
   still see names and faces. The relay records the highest seq
   it pruned; `GET /events` returns it as `pruned_through`, and a returning
@@ -305,7 +347,7 @@ the UI is plain files in `app/ui/`, embedded at build time.
 ```sh
 cd app/src-tauri
 cargo build --release          # target/release/sidetray-app(.exe)
-cargo test                     # photos, events, notices, keys, badge, invites, fingerprints, profiles
+cargo test                     # photos, events, notices, keys, badge, invites, fingerprints, profiles, messages
 ```
 
 Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
@@ -344,16 +386,21 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
   and each device with who certified it. Key Masters also see when each device
   was last seen and get *Make Key Master*, *Remove* and, per device, *Revoke*.
   Each asks for confirmation in a dialog (Cancel has the focus). Remove and
-  Revoke then rotate the group key and say how many devices got it. Someone
-  who chose a new name is listed under their certified name with "goes by ..."
-  until a Key Master clicks *Accept new name*, which re-signs their
-  certificates with it (`POST /members/{id}/name`). Posts use the new name
-  right away.
+  Revoke then rotate the group key and say how many devices got it.
+- **Names.** A new name chosen under *Profile* is only a request. Everyone,
+  everywhere (feed, comments, members, messages, notifications), keeps
+  seeing the certified name until a Key Master clicks *Accept new name* on
+  the Members tab, which re-signs that member's certificates with it
+  (`POST /members/{id}/name`); the relay then pushes `roster` so every app
+  shows the new name at once. Until then Key Masters, and only they, see a
+  "name change pending" marker on the member and on their posts. This stops
+  someone renaming themselves "Mom" to fool people. A photo change shows
+  straight away.
 - **Removed.** When the relay says this device was removed or revoked (a
   `removed` push, or a `401` confirmed by `/join/status`), the app stops
   syncing, shows a notification and a "You've been removed from this group"
   screen (or "This device was disconnected"). The archive stays: *Look through
-  saved posts* opens the feed read-only. *Delete them and join a group again*
+  saved posts* opens the feed read-only, with a switch to the saved messages. *Delete them and join a group again*
   wipes the local data and restarts the wizard.
 - **Missed posts.** A device that comes back after the relay pruned events it
   never got shows a dismissible notice at the top of the feed.
@@ -366,15 +413,28 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
   `pull`: an event counts only if its author has a member certificate chaining
   to a pinned Key Master, the signature verifies and it decrypts. Anything else
   is skipped and counted under *This device*.
+- **Messages.** The *Messages* tab lists conversations, newest first, with
+  the other person's photo and name, the last message and an unread count.
+  *New message* picks someone from the verified roster, and *Message* next to
+  a member on the Members tab opens the conversation with them. The chat
+  shows bubbles (yours on the right), photos inline (same resize, EXIF
+  stripping and lightbox as posts), and a composer (Ctrl+Enter sends). Each
+  message has its own random key, sealed to every device of the other person
+  and your own other devices (from the verified roster) and signed by this
+  device; see [Direct messages](#direct-messages-phase-5b). Someone who was
+  removed can't be messaged, and a removed device can't send; conversations
+  already on a device stay readable there.
 - **Tray.** Closing the window hides it; the app keeps running in the system
   tray. Left-click the icon (or its *Open Side Tray* menu item) to bring it back;
   *Quit* is the only way to exit. Launching the app again focuses the running
   copy. The icon gets a red badge with the number of new posts and comments by
-  others (plus waiting join requests for Key Masters), "9+" past nine, and the
-  tooltip spells it out. The count clears when the feed is on screen in a
-  focused window. A new device's first sync (the backlog) doesn't count.
+  others, unread direct messages (plus waiting join requests for Key
+  Masters), "9+" past nine, and the tooltip spells it out. The feed count
+  clears when the feed is on screen in a focused window, a conversation's when
+  it's open in a focused window. A new device's first sync (the backlog) doesn't count.
 - **Notifications.** Native toasts for posts by others, comments by others on
-  your posts, and, for Key Masters, new join requests. More than three at once
+  your posts, direct messages ("Ana sent you a message" and its first line;
+  a click opens the conversation), and, for Key Masters, new join requests. More than three at once
   become one summary. Nothing pops up while the window is in front. Clicking a
   toast opens the app scrolled to that post (or to the Key Master tab). On
   Windows the app registers its AppUserModelID (`org.sidetray.app`) under
@@ -414,8 +474,10 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
 - **Local data** lives in the app data dir (`%APPDATA%\org.sidetray.app` on
   Windows; `SIDETRAY_DATA_DIR` overrides it, and lets test copies run side by
   side without the single-instance check). `sidetray.db` holds the spec's
-  client tables plus `anchors` and `member_devices`, and `media/` holds the
-  decrypted photos. Posts are plaintext on disk (SPEC: rely on OS disk
+  client tables plus `anchors`, `member_devices`, `conversations`,
+  `dm_messages` and `dm_photos`, and `media/` holds the decrypted photos.
+  Each message's key is kept wrapped like the group keys, so its photos can
+  be fetched later. Posts are plaintext on disk (SPEC: rely on OS disk
   encryption). The device's private keys, its token and a local wrapping key
   are kept in one Windows Credential Manager / macOS Keychain entry. Group keys
   sit in SQLite, encrypted under that wrapping key. Linux has no keychain
@@ -440,6 +502,45 @@ it without breaking the signature.
 
 A post's photo media ids (and a profile's avatar id) also go in the event's
 clear `media_ids` field, so the server can prune them with the event.
+
+## Direct messages (Phase 5b)
+
+Only the two people's devices can read a conversation: not other members,
+not Key Masters, not the relay.
+
+- **Sending.** A fresh 32-byte message key encrypts the payload
+  `{"text", "photos"?: [...]}` (photo references as in posts) with AD
+  `protocol::dm_ad(group, conversation)`, and each photo and thumbnail with AD
+  `protocol::dm_media_ad(group, conversation)`. The key is sealed
+  (`crypto_box_seal`) to every device of the recipient and every other device
+  of the sender, with public keys from the verified roster only; the app
+  refuses to send if one of those devices has no valid certificate. The
+  sending device signs `protocol::dm_message`: group, conversation, sending
+  device, every `(device id, sealed key)` sorted by device id, and the
+  ciphertext (`crypto::dm::seal_dm`).
+- **The conversation id** is `crypto::dm::conversation_id(group, a, b)`, 32
+  hex characters of a hash of the group and both member ids (either order),
+  so both sides, and the relay, compute the same one.
+- **The relay** only accepts a message to an active member of the same group,
+  with the conversation id for the two members, and with sealed keys for
+  exactly the active devices of both members other than the sending one.
+  Photos must be uploaded by the sending device and not belong to anything
+  else. It stores the device list (`dm_keys`), returns a message only to
+  those devices, with every sealed key so they can check the signature, and
+  serves its photos only to them and the sender. Message numbers count per
+  group, like event numbers.
+- **Receiving** (`crypto::dm::open_dm`): the sender device must be verified
+  (or a former device, for messages up to its `revoked_dm_seq`), the relay's
+  sender and recipient must match the device and the signed conversation id,
+  the signature over the whole recipient list must verify, and this device
+  must be on it. Anything else is rejected and counted under *This device*.
+- **A new device** of yours only gets messages sent after it joined, and
+  someone removed stops receiving at once (their devices are revoked, so the
+  next message isn't sealed to them).
+- **What the relay sees:** who writes to whom and when, sizes, and which
+  devices each message is for. Not the text or photos. Members can also tell
+  roughly how many messages their group exchanges, from gaps in the message
+  numbers.
 
 ## CLI (Phase 3)
 
@@ -484,6 +585,9 @@ will use the OS keychain instead.
 | `blob_digest` | BLAKE2b-256, domain-separated | 32 bytes; pins an encrypted photo to its post |
 | `grant_group_key` / `open_key_grant` | seal + Ed25519 over `protocol::key_grant_message` | used for join approvals and key rotation |
 | `event_id` | BLAKE2b-256 of an event's ciphertext, domain-separated | 32 hex characters |
+| `dm::MessageKey` | 32 random bytes; XChaCha20-Poly1305 | `nonce[24] ‖ ct ‖ tag[16]`, AD as given (no key version) |
+| `dm::seal_dm` / `dm::open_dm` | `crypto_box_seal` of the message key per device + Ed25519 over `protocol::dm_message` | sealed key 80 bytes |
+| `dm::conversation_id` | BLAKE2b-256 of the group and both member ids, domain-separated | 32 hex characters |
 
 ```sh
 cd crypto && cargo test
@@ -511,7 +615,9 @@ It comes from the public-domain [12dicts](http://wordlist.aspell.net/12dicts/) l
   tokens, isolation, the per-group numbering migration and the rate limits,
   and `server/tests/test_profiles.py` covers profile events (and the events
   table rebuild that allows them), keeping each member's latest profile and
-  avatar through pruning, and accepting a new name
+  avatar through pruning, and accepting a new name, and
+  `server/tests/test_dms.py` covers direct messages: who can send to whom,
+  the device list, who can fetch messages and photos, acks and pruning
   (`cd server && python -m unittest discover tests`; needs `httpx` for the
-  last two).
+  last three).
 - Footprint on the test VM: ~35 MB (api) + ~70 MB (caddy), with 256 MB / 128 MB caps.

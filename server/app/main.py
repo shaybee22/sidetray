@@ -584,6 +584,14 @@ def push_key_rotated(group_id: str, key_version: int) -> None:
     hub.send(to, {"type": "key_rotated", "key_version": key_version})
 
 
+def push_roster(group_id: str) -> None:
+    """Names or roles in the certificates changed (a Key Master accepted a new
+    name): every active device syncs, so the new name shows everywhere at once."""
+    with db() as conn:
+        to = active_device_ids(conn, group_id)
+    hub.send(to, {"type": "roster"})
+
+
 def push_removed(device_ids: list[str], scope: str) -> None:
     """These devices were revoked: tell them, then close their sockets. `scope`
     is "member" (the member was removed) or "device" (just this device).
@@ -1330,6 +1338,7 @@ def set_name(member_id: str, body: NameIn, km: Device = Depends(keymaster_device
             store_cert(conn, km, c, m["role"])
             conn.execute("DELETE FROM member_certs WHERE device_id = ? AND display_name != ?",
                          (c.device_id, body.display_name))
+    push_roster(km.group_id)
     return {"member_id": member_id, "display_name": body.display_name}
 
 
@@ -1675,6 +1684,7 @@ async def ws(websocket: WebSocket):
       {"type": "hello", "device_id"}            once, on connect
       {"type": "new_event", "seq", "kind"}      someone else appended an event
       {"type": "new_dm", "seq"}                 a direct message for this device: GET /dms
+      {"type": "roster"}                        names in the certificates changed: sync
       {"type": "join_request", "device_id", "display_name", "existing_member"}  Key Masters only
       {"type": "key_rotated", "key_version"}    fetch GET /keys
       {"type": "removed", "scope"}              this device was revoked ("device") or its
