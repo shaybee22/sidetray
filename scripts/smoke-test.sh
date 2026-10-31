@@ -10,7 +10,9 @@
 #    channel (who gets join_request and new_event, idle sockets dropped),
 #    and Phase 6: member removal, single-device revocation, key rotation
 #    (exactly the active devices, next version only, stale keys refused) and
-#    the prune job (acked by every active device, and past retention).
+#    the prune job (acked by every active device, and past retention), and
+#    Phase 6b: a second group from `sidetray-admin new-group`, the two groups
+#    unable to see each other, and the rate limits.
 #    Keys, signatures and ciphertext are random bytes: the relay never checks
 #    them (clients do), only that certificates describe the right device.
 set -euo pipefail
@@ -35,6 +37,7 @@ call() {
   [ -n "$tok" ] && args+=(-H "Authorization: Bearer $tok")
   [ -n "$data" ] && args+=(-H 'Content-Type: application/json' -d "$data")
   [ -n "${CACERT:-}" ] && args+=(--cacert "$CACERT")
+  [ -n "${XFF:-}" ] && args+=(-H "X-Forwarded-For: $XFF")
   local code; code=$(curl "${args[@]}" "$url")
   echo "$code $(cat "$TMP/body")"
 }
@@ -50,7 +53,8 @@ echo "== live stack (https://$SIDETRAY_HOST)"
 docker compose exec -T caddy cat /data/caddy/pki/authorities/local/root.crt > "$TMP/root.crt"
 CACERT=$TMP/root.crt B="https://$SIDETRAY_HOST/api/v1"
 [ "$(expect 200 GET /health | j '["ok"]')" = True ] && pass "health over TLS with Caddy's root" || fail "health over TLS with Caddy's root"
-EXISTS=$(expect 200 GET /group | j '["exists"]'); pass "GET /group (exists=$EXISTS)"
+expect 400 GET /group >/dev/null && pass "GET /group without a name -> 400 (groups aren't listed)" || fail "GET /group without a name -> 400"
+[ "$(expect 200 GET "/group?name=no-such-group-$$" | j '["exists"]')" = False ] && pass "GET /group?name=<unknown> -> exists false" || fail "GET /group?name=<unknown>"
 expect 401 GET /events >/dev/null && pass "no token -> 401" || fail "no token -> 401"
 expect 401 GET /events bogus-token >/dev/null && pass "unknown token -> 401" || fail "unknown token -> 401"
 expect 401 GET /join/status bogus-token >/dev/null && pass "unknown token on /join/status -> 401" || fail "unknown token on /join/status -> 401"
@@ -61,11 +65,12 @@ unset CACERT
 
 echo "== full API on a throwaway container"
 docker compose run -d --rm --no-deps --name "$SMOKE" -p 127.0.0.1::8000 \
-  -e SIDETRAY_DATA=/tmp/smoke -e SIDETRAY_SETUP_TOKEN=smoke-setup -e SIDETRAY_WS_IDLE_SECONDS=6 -e SIDETRAY_PRUNE_EVERY_SECONDS=2 api >/dev/null
+  -e SIDETRAY_DATA=/tmp/smoke -e SIDETRAY_SETUP_TOKEN=smoke-setup -e SIDETRAY_WS_IDLE_SECONDS=6 -e SIDETRAY_PRUNE_EVERY_SECONDS=2 \
+  -e SIDETRAY_JOINS_PER_HOUR=40 api >/dev/null
 PORT=$(docker port "$SMOKE" 8000/tcp | head -1 | sed 's/.*://')
 B="http://127.0.0.1:$PORT/api/v1"
 for _ in $(seq 50); do curl -sf "$B/health" >/dev/null 2>&1 && break; sleep 0.2; done
-[ "$(expect 200 GET /group | j '["exists"]')" = False ] && pass "fresh server has no group" || fail "fresh server has no group"
+[ "$(expect 200 GET "/group?name=Smoke%20Family" | j '["exists"]')" = False ] && pass "fresh server has no Smoke Family" || fail "fresh server has no Smoke Family"
 
 KM_SIGN=$(rand32)
 join_body() {  # name email [setup_token] [group] [sign_pubkey]
@@ -77,7 +82,7 @@ cert() {  # device role display_name
   echo "{\"device_id\":\"$1\",\"role\":\"$2\",\"display_name\":\"$3\",\"signature\":\"$(sig64)\"}"
 }
 
-expect 403 POST /join "" "$(join_body Eve e@x.test)" >/dev/null && pass "join with no group and no setup token -> 403" || fail "join with no group and no setup token -> 403"
+expect 404 POST /join "" "$(join_body Eve e@x.test)" >/dev/null && pass "joining a group that does not exist (no setup token) -> 404" || fail "joining a group that does not exist -> 404"
 expect 403 POST /join "" "$(join_body Eve e@x.test wrong)" >/dev/null && pass "wrong setup token -> 403" || fail "wrong setup token -> 403"
 expect 422 POST /join "" '{"group_name":"G","display_name":"A","email":"a@x.test","enc_pubkey":"c2hvcnQ=","sign_pubkey":"c2hvcnQ="}' >/dev/null \
   && pass "short public keys -> 422" || fail "short public keys -> 422"
@@ -86,14 +91,14 @@ KM=$(expect 201 POST /join "" "$(join_body Kim kim@x.test smoke-setup "" "$KM_SI
 KM_TOK=$(echo "$KM" | j '["token"]'); KM_DEV=$(echo "$KM" | j '["device_id"]'); KM_MEM=$(echo "$KM" | j '["member_id"]')
 [ "$(echo "$KM" | j '["role"]')" = keymaster ] && [ "$(echo "$KM" | j '["status"]')" = active ] \
   && pass "setup token creates the group; first device is an active Key Master ($KM_DEV)" || fail "setup token creates the group; first device is an active Key Master ($KM_DEV)"
-[ "$(expect 200 GET /group | j '["name"]')" = "Smoke Family" ] && pass "GET /group names it" || fail "GET /group names it"
+[ "$(expect 200 GET "/group?name=smoke%20FAMILY" | j '["name"]')" = "Smoke Family" ] && pass "GET /group?name= finds it, ignoring case" || fail "GET /group?name= finds it"
 expect 422 POST /certs "$KM_TOK" "{\"certs\":[$(cert "$KM_DEV" member Kim)]}" >/dev/null \
   && pass "self-certificate with the wrong role -> 422" || fail "self-certificate with the wrong role -> 422"
 expect 422 POST /certs "$KM_TOK" "{\"certs\":[$(cert "$KM_DEV" keymaster Kimberly)]}" >/dev/null \
   && pass "certificate with the wrong display name -> 422" || fail "certificate with the wrong display name -> 422"
 expect 200 POST /certs "$KM_TOK" "{\"certs\":[$(cert "$KM_DEV" keymaster Kim)]}" >/dev/null \
   && pass "founder stores a self-signed Key Master certificate" || fail "founder stores a self-signed Key Master certificate"
-expect 409 POST /join "" "$(join_body Eve e@x.test smoke-setup)" >/dev/null && pass "second create -> 409" || fail "second create -> 409"
+expect 403 POST /join "" "$(join_body Eve e@x.test smoke-setup "Eve Group")" >/dev/null && pass "the .env setup token is spent once a group exists -> 403" || fail "spent .env setup token -> 403"
 expect 404 POST /join "" "$(join_body Eve e@x.test "" "Other Group")" >/dev/null && pass "wrong group name -> 404" || fail "wrong group name -> 404"
 
 AL=$(expect 201 POST /join "" "$(join_body Al al@x.test "" "smoke family")")
@@ -333,11 +338,62 @@ GOT=$(expect 200 GET "/events?after=0" "$KM_TOK")
 expect 404 GET "/media/$MID" "$KM_TOK" >/dev/null && pass "the pruned post's media is gone" || fail "the pruned post's media is gone"
 OLD=$(expect 201 POST /events "$KM_TOK" "{\"kind\":\"post\",\"key_version\":3,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | j '["seq"]')
 expect 200 POST /ack "$KM_TOK" "{\"seq\":$OLD}" >/dev/null
-docker exec "$SMOKE" python -c "import sqlite3; c = sqlite3.connect('/tmp/smoke/sidetray.db'); c.execute('UPDATE events SET created_at = created_at - 91 * 86400 WHERE seq = ?', ($OLD,)); c.commit()"
+docker exec "$SMOKE" python -c "import sqlite3; c = sqlite3.connect('/tmp/smoke/sidetray.db'); c.execute('UPDATE events SET created_at = created_at - 91 * 86400 WHERE gseq = ? AND group_id = (SELECT group_id FROM devices WHERE id = ?)', ($OLD, '$KM_DEV')); c.commit()"
 PRUNED=$(docker exec "$SMOKE" python -m app.admin prune)
 [ "$(echo "$PRUNED" | j '["events"]')" -le 1 ] || fail "admin prune: $PRUNED"
 GOT=$(expect 200 GET "/events?after=$LAST" "$YAN_TOK")
 [ "$(echo "$GOT" | j '["events"]')" = "[]" ] && [ "$(echo "$GOT" | j '["pruned_through"]')" = "$OLD" ] \
   && pass "an event past the 90-day window is pruned though Yan never got it; pruned_through ($OLD) > Yan's cursor ($LAST) tells Yan it missed posts" \
   || fail "retention prune: $GOT"
+echo "== several groups (Phase 6b)"
+TOK2=$(docker exec "$SMOKE" sidetray-admin new-group | sed -n 's/^ *\(st_[A-Za-z0-9_-]*\)$/\1/p')
+[ -n "$TOK2" ] && pass "sidetray-admin new-group prints a one-time setup token" || fail "sidetray-admin new-group prints a token"
+expect 409 POST /join "" "$(join_body Bo bo@x.test "$TOK2" "SMOKE family")" >/dev/null && pass "a second group can't take an existing name (any case) -> 409" || fail "duplicate group name -> 409"
+BO=$(expect 201 POST /join "" "$(join_body Bo bo@x.test "$TOK2" "Second Group")")
+BO_TOK=$(echo "$BO" | j '["token"]'); BO_GID=$(echo "$BO" | j '["group_id"]')
+[ "$(echo "$BO" | j '["role"]')" = keymaster ] && [ "$BO_GID" != "$(echo "$KM" | j '["group_id"]')" ] \
+  && pass "the token creates Second Group; Bo is its Key Master" || fail "the token creates Second Group"
+expect 403 POST /join "" "$(join_body Cy cy@x.test "$TOK2" "Third Group")" >/dev/null && pass "the token works once -> 403 the second time" || fail "setup token reused -> 403"
+[ "$(expect 200 GET "/group?name=second%20group" | j '["name"]')" = "Second Group" ] && pass "GET /group?name= finds Second Group" || fail "GET /group?name=second group"
+LIST=$(docker exec "$SMOKE" sidetray-admin list-groups)
+echo "$LIST" | grep -q "Smoke Family" && echo "$LIST" | grep -q "Second Group" && echo "$LIST" | grep -q "Unused setup tokens: none" \
+  && pass "sidetray-admin list-groups shows both groups, no unused tokens" || fail "list-groups: $LIST"
+
+PAT=$(expect 201 POST /join "" "$(join_body Pat pat@x.test)")
+PAT_DEV=$(echo "$PAT" | j '["device_id"]')
+[ "$(echo "$PAT" | j '["group_id"]')" = "$(echo "$KM" | j '["group_id"]')" ] && pass "joining Smoke Family by name lands there" || fail "join by name"
+[ "$(expect 200 GET /joins/pending "$BO_TOK" | j '["pending"]')" = "[]" ] && pass "Bo doesn't see Smoke Family's pending join" || fail "Bo sees other group's pending join"
+expect 404 POST "/joins/$PAT_DEV/deny" "$BO_TOK" >/dev/null && pass "Bo can't deny it (404, as if it didn't exist)" || fail "cross-group deny -> 404"
+expect 404 POST "/members/$KM_MEM/remove" "$BO_TOK" >/dev/null && pass "Bo can't remove Kim (404)" || fail "cross-group remove -> 404"
+expect 404 POST "/devices/$KM_DEV/revoke" "$BO_TOK" >/dev/null && pass "Bo can't revoke Kim's device (404)" || fail "cross-group revoke -> 404"
+[ "$(expect 200 GET /members "$BO_TOK" | python3 -c "import sys,json; r=json.load(sys.stdin); print([m['display_name'] for m in r['members']], r['former'])")" = "['Bo'] []" ] \
+  && pass "Bo's roster is just Bo" || fail "Bo's roster"
+B1=$(expect 201 POST /events "$BO_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | j '["seq"]')
+[ "$B1" = 1 ] && pass "Second Group's first event is seq 1 (numbers are per group, so no gaps from Smoke Family's $OLD)" || fail "Second Group's first seq is $B1"
+[ "$(expect 200 GET "/events?after=0" "$BO_TOK" | python3 -c "import sys,json; print([e['seq'] for e in json.load(sys.stdin)['events']])")" = "[1]" ] \
+  && pass "Bo pulls only Second Group's event" || fail "Bo's events"
+[ "$(expect 200 GET "/events?after=$OLD" "$KM_TOK" | j '["events"]')" = "[]" ] && pass "Kim doesn't get Bo's event" || fail "Kim got Bo's event"
+expect 422 POST /ack "$BO_TOK" "{\"seq\":$OLD}" >/dev/null && pass "Bo can't ack past Second Group's own events" || fail "Bo acks other group's seq"
+KMID=$(curl -sS --fail-with-body -H "Authorization: Bearer $KM_TOK" --data-binary @"$TMP/blob" "$B/media" | j '["id"]')
+expect 404 GET "/media/$KMID" "$BO_TOK" >/dev/null && pass "Bo can't download Smoke Family's media" || fail "cross-group media"
+expect 422 POST /events "$BO_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\",\"media_ids\":[\"$KMID\"]}" >/dev/null \
+  && pass "Bo can't attach Smoke Family's media to a post" || fail "cross-group media_ids"
+
+echo "== rate limits"
+# Bo has used 2 of 30 this minute: one post and one refused (attempts count).
+codes=""; for _ in $(seq 28); do codes="$codes $(call POST "$B/events" "$BO_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | cut -d' ' -f1)"; done
+[ "$(echo $codes | tr ' ' '\n' | sort -u)" = 201 ] && pass "30 event attempts in a minute from one device are fine" || fail "30 events: $codes"
+expect 429 POST /events "$BO_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" >/dev/null && pass "the 31st -> 429" || fail "31st event -> 429"
+expect 201 POST /events "$KM_TOK" "{\"kind\":\"post\",\"key_version\":3,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" >/dev/null && pass "another device still posts (the limit is per device)" || fail "per-device event limit"
+head -c 10485760 /dev/urandom > "$TMP/big"
+up() { curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" --data-binary @"$TMP/big" "$B/media"; }
+codes=""; for _ in 1 2 3 4 5; do codes="$codes $(up "$BO_TOK")"; done
+[ "$codes" = " 201 201 201 201 201" ] && pass "50 MB of uploads in an hour from one device are fine" || fail "50 MB of uploads: $codes"
+[ "$(up "$BO_TOK")" = 429 ] && pass "the next upload -> 429" || fail "upload past 50 MB/hour -> 429"
+codes=""; for _ in $(seq 40); do codes="$codes $(XFF=198.51.100.7 call POST "$B/join" "" "$(join_body Spam s@x.test "" "No Such Group")" | cut -d' ' -f1)"; done
+[ "$(echo $codes | tr ' ' '\n' | sort -u)" = 404 ] || fail "join attempts under the limit: $codes"
+[ "$(XFF=198.51.100.7 call POST "$B/join" "" "$(join_body Spam s@x.test "" "Smoke Family")" | cut -d' ' -f1)" = 429 ] \
+  && pass "join attempts per IP are limited (wrong names count): the 41st -> 429" || fail "join limit per IP"
+[ "$(XFF=198.51.100.8 call POST "$B/join" "" "$(join_body Quinn q@x.test "" "No Such Group")" | cut -d' ' -f1)" = 404 ] \
+  && pass "another address can still try" || fail "join limit is per IP"
 echo "All smoke checks passed."

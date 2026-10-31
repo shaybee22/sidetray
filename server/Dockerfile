@@ -4,6 +4,8 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
+# `sidetray-admin new-group`, `list-groups`, ... (see app/admin.py)
+COPY --chmod=755 sidetray-admin /usr/local/bin/sidetray-admin
 RUN useradd --system --uid 1000 sidetray && mkdir -p /data && chown sidetray /data
 USER sidetray
 ENV SIDETRAY_DATA=/data

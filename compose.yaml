@@ -1,12 +1,23 @@
+# Project name pinned so the data volumes keep their names wherever this file lives
+# (a checkout, or /opt/sidetray from install.sh).
+name: sidetray
+
 services:
   api:
     build: ./server
     restart: unless-stopped
     environment:
-      # Lets the first device create the group (and become Key Master). Unset = disabled.
+      # Lets the first device create the server's first group (and become its Key Master).
+      # Later groups use `sidetray-admin new-group`. Unset = disabled.
       SIDETRAY_SETUP_TOKEN: ${SIDETRAY_SETUP_TOKEN:-}
       # Days the relay keeps events and photos nobody has fetched yet (prune job, hourly).
       SIDETRAY_RETENTION_DAYS: ${SIDETRAY_RETENTION_DAYS:-90}
+      # Rate limits; empty means the defaults (30 events/minute and 50 MB of
+      # uploads/hour per device; 10 join attempts and 60 group lookups/hour per IP).
+      SIDETRAY_EVENTS_PER_MINUTE: ${SIDETRAY_EVENTS_PER_MINUTE:-}
+      SIDETRAY_MEDIA_MB_PER_HOUR: ${SIDETRAY_MEDIA_MB_PER_HOUR:-}
+      SIDETRAY_JOINS_PER_HOUR: ${SIDETRAY_JOINS_PER_HOUR:-}
+      SIDETRAY_LOOKUPS_PER_HOUR: ${SIDETRAY_LOOKUPS_PER_HOUR:-}
     volumes:
       - api_data:/data
     mem_limit: 256m
@@ -23,6 +34,8 @@ services:
       - api
     environment:
       SIDETRAY_HOST: ${SIDETRAY_HOST:?set SIDETRAY_HOST in .env}
+      # Let's Encrypt account email; only the production Caddyfile from install.sh uses it.
+      SIDETRAY_ACME_EMAIL: ${SIDETRAY_ACME_EMAIL:-}
     ports:
       - "80:80"
       - "443:443"

@@ -2,7 +2,7 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: Phase 6 (pruning, removal, key rotation).** A Tauri 2 desktop app
+**Status: Phase 6b-1 (server side of real servers and more groups).** A Tauri 2 desktop app
 (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
 comments and reactions. It keeps a local SQLite archive and syncs the moment the
@@ -13,17 +13,21 @@ with a Key Master by phone, and receive the group key sealed to them and signed 
 the approving Key Master. Key Masters manage members from the app: promote,
 remove, or revoke a lost device, after which their app rotates the group key
 for everyone left. The relay prunes what every device has fetched, and anything
-past 90 days. The dev CLI (`cli/`) speaks the same formats. Rate limits are
-still to come; direct messages (5b) and real-server setup, invite links,
-avatars and more groups per server (6b) are specified in SPEC.md.
+past 90 days. The dev CLI (`cli/`) speaks the same formats. A server can host
+several groups that can't see or find each other, `install.sh` sets one up on
+a fresh Debian or Ubuntu machine, and the relay enforces rate limits (see
+[Run your own server](#run-your-own-server)). Still to come: the app's side of
+6b (public certificates, invite links, avatars, asking for the group name
+first) and direct messages (5b), both specified in SPEC.md.
 
 ## Layout
 
 ```
+install.sh            server installer: Docker, /opt/sidetray, HTTPS, first setup token
 compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS)
-Caddyfile             TLS via Caddy's internal CA (no domain yet)
+Caddyfile             TLS via Caddy's internal CA, for a dev checkout on a LAN IP
 server/app/main.py    the relay
-server/app/admin.py   operator commands (`python -m app.admin prune`)
+server/app/admin.py   operator commands (`sidetray-admin new-group | list-groups | prune`)
 scripts/smoke-test.sh live TLS checks + full API run on a throwaway container
 scripts/ws_probe.py   stdlib-only WebSocket client the smoke test uses for /ws
 crypto/               Rust crate: keys, sealing, encryption, signatures, safety codes
@@ -32,34 +36,122 @@ app/src-tauri/        desktop app backend (Rust, Tauri 2)
 app/ui/               desktop app frontend (plain HTML/CSS/JS, no build step)
 ```
 
-## Run
+## Run your own server
+
+You need a small Debian or Ubuntu machine (1 vCPU, 1 GB RAM and 25 GB of disk
+is plenty; tested on Ubuntu 26.04) with ports 80 and 443 free. For real use,
+also get a domain name with an A (and/or AAAA) record pointing at the server.
+From a checkout or release folder, as root:
+
+```sh
+sudo ./install.sh
+```
+
+It asks:
+
+1. **How people reach the server.** Either a **domain name** plus an email
+   address for Let's Encrypt (production: a publicly trusted certificate,
+   renewed automatically), or a **LAN IP address** (test mode: Caddy signs
+   with its own CA, so each app needs that root certificate pasted under
+   *Advanced* in the wizard). For a domain, it checks that the name resolves
+   to this machine before going on.
+2. **Retention**: how many days the relay keeps posts and photos that not
+   every device has fetched yet (default 90).
+
+Then it installs Docker Engine and the Compose plugin from Docker's apt
+repository (if missing), writes `/opt/sidetray` (`compose.yaml`, `Caddyfile`,
+`.env`, `server/`), builds and starts the stack, waits until
+`https://<address>/api/v1/health` answers, and prints a **setup token**. Give
+the token to whoever will run the group: in the app's wizard they enter the
+server address, a name for the group, their name and email, and the token,
+and they become the group's first Key Master. In test mode it also saves the
+root certificate as `/opt/sidetray/sidetray-root.crt` and prints its SHA-256
+fingerprint.
+
+For unattended runs, every question has a flag:
+`--domain tray.example.org --email you@example.org` or `--ip 10.1.1.191`,
+`--retention 90`, `--yes` (keep existing settings), and `--new-group` (also print a
+token for another group). Piped from a release, `curl -fsSL <url>/install.sh |
+sudo SIDETRAY_SOURCE_URL=<release tarball> bash` works the same way.
+
+**Re-running it is safe.** It updates the code and restarts the stack. The data
+volumes (`sidetray_api_data`, `sidetray_caddy_data`) and `.env` are kept;
+only the settings you change are rewritten, and the old file is saved as
+`.env.bak`. Other files it replaces are saved as `.bak` too. It issues a new
+setup token only when the server has no group and no unused token, or with
+`--new-group`. Tokens are stored hashed, so a lost one can't be shown again;
+issue a new one instead.
+
+### More groups, and other admin commands
+
+One server can host several groups. They're separate: a device's token only
+works inside its own group, event numbers count per group, and the API never
+lists groups. `GET /group?name=` only says whether a group of that exact name
+exists. Group names are unique per server (case doesn't matter).
+
+```sh
+sudo sidetray-admin new-group      # one-time setup token, valid 7 days (--days N)
+sudo sidetray-admin list-groups    # groups with member/device/event counts, unused tokens
+sudo sidetray-admin prune          # run the hourly prune job now
+```
+
+`sidetray-admin` on the host runs the same command inside the api container
+(`docker compose exec api sidetray-admin ...`, which also works in a dev
+checkout). `list-groups` is for the operator only; group names and counts
+never go out over the API.
+
+### Rate limits
+
+| What | Limit | Key | Setting in `.env` |
+| --- | --- | --- | --- |
+| `POST /events` | 30 per minute | device | `SIDETRAY_EVENTS_PER_MINUTE` |
+| `POST /media` | 50 MB per hour | device | `SIDETRAY_MEDIA_MB_PER_HOUR` |
+| `POST /join` | 10 attempts per hour | client IP | `SIDETRAY_JOINS_PER_HOUR` |
+| `GET /group?name=` | 60 per hour | client IP | `SIDETRAY_LOOKUPS_PER_HOUR` |
+
+Over the limit, the relay answers `429` with a `Retry-After` header. Attempts
+count whether or not they succeed, so wrong group names and setup tokens use up
+the join budget too. That stops one address from flooding Key Masters with
+join requests or guessing group names. Each group also holds at most 20 pending
+requests. The client IP comes from Caddy's `X-Forwarded-For`, which Caddy sets
+itself and doesn't take from the client, so a forged header doesn't get
+around the limit. The counters live in memory (the relay is one process), so a
+restart resets them.
+
+### Files and data
+
+Data lives in the `api_data` volume (`/data/sidetray.db` and `/data/media/`).
+The prune job runs hourly. Caddy's CA and certificates live in `caddy_data`;
+keep that volume, or test-mode clients will need the new root.
+
+## Run from a checkout (development)
 
 Needs Docker Engine with the Compose plugin.
 
 ```sh
 cp .env.example .env     # set SIDETRAY_HOST and SIDETRAY_SETUP_TOKEN
 docker compose up -d --build
-./scripts/smoke-test.sh  # never touches the real group
+./scripts/smoke-test.sh  # never touches the real groups
 ```
 
-Data lives in the `api_data` volume (`/data/sidetray.db` and `/data/media/`).
-`SIDETRAY_RETENTION_DAYS` in `.env` (default 90) sets how long the relay keeps
-events and photos that not every device has fetched yet. The prune job runs
-hourly; `docker compose exec api python -m app.admin prune` runs it now.
-Caddy's CA and certs live in `caddy_data`; keep that volume or clients will need the new root.
+`SIDETRAY_SETUP_TOKEN` creates the server's first group; later ones need
+`docker compose exec api sidetray-admin new-group`. The smoke test sources
+`./.env` and runs `docker compose`, so on a server set up with `install.sh`, run
+it from a checkout with `.env` linked to `/opt/sidetray/.env` (the Compose
+project is named `sidetray` either way).
 
 ## Trusting the test certificate
 
-There's no domain yet, so Caddy signs a cert for the IP with its own local CA.
-Export the root and point curl at it:
+In test mode (a LAN IP, no domain), Caddy signs a cert for the IP with its own
+local CA. `install.sh` saves the root as `/opt/sidetray/sidetray-root.crt`; in a
+dev checkout, export it and point curl at it:
 
 ```sh
 docker compose exec -T caddy cat /data/caddy/pki/authorities/local/root.crt > sidetray-root.crt
 curl --cacert sidetray-root.crt https://10.1.1.188/api/v1/health
 ```
 
-When a domain exists, set `SIDETRAY_HOST` to it and remove `tls internal`
-from the Caddyfile to get a Let's Encrypt cert.
+For a Let's Encrypt cert, run `install.sh` with a domain (production mode).
 
 ## API
 
@@ -70,7 +162,7 @@ base64. The server never decrypts.
 | Method | Path | Who | Body / params | Returns |
 | --- | --- | --- | --- | --- |
 | GET | /health | anyone | | `{ok}` |
-| GET | /group | anyone | | `{exists, id?, name?}` |
+| GET | /group | anyone | `?name=<group name>` (required; 400 without) | `{exists, name?}` |
 | POST | /join | anyone | `{group_name, display_name, email, enc_pubkey, sign_pubkey, setup_token?}` | `{group_id, group_name, member_id, device_id, token, status, role}` |
 | GET | /join/status | any device token | | `{status: pending\|active\|denied\|removed\|revoked, role?, sealed_keys[]?}` |
 | GET | /keys | member | | `{sealed_keys[], key_version, rotation_pending}` |
@@ -90,11 +182,14 @@ base64. The server never decrypts.
 | GET | /media/{id} | member | | the bytes |
 | WS | /ws | member | `Authorization: Bearer` on the upgrade request | push messages, below |
 
-- **Creating the group:** on a server with no group, `POST /join` with the
-  operator's `SIDETRAY_SETUP_TOKEN` creates it, and that device becomes the active
-  Key Master. Without the right token it's refused, so nobody else can claim an
-  empty server. Once the group exists the setup token does nothing.
-- **Joining:** anyone else's join is `pending`. A pending token works only for
+- **Creating a group:** `POST /join` with a valid `setup_token` creates a group
+  named `group_name`, and that device becomes its active Key Master. Valid
+  tokens are one-time tokens from `sidetray-admin new-group` (unused, under 7
+  days old) and, while the server has no group yet, the operator's
+  `SIDETRAY_SETUP_TOKEN`. A wrong, used or expired token gets `403`, and a
+  name that's already taken (ignoring case) gets `409`.
+- **Joining:** without a setup token, `POST /join` goes to the group of that
+  name, or gets `404` if there's none. The join is `pending`. A pending token works only for
   `/join/status`. Joining with the email of an existing member adds a device to
   that member (the pending list flags it).
 - **Approving:** a Key Master uploads the group key (every version) sealed to the
@@ -211,6 +306,9 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
   the same check as the CLI's `status --km-code`. Nothing is stored or trusted
   until it matches. On a server with no group, the wizard offers to create one
   with the operator's setup token, and you become its Key Master.
+  **Not yet updated for 6b-1:** the wizard still calls `GET /group` without a
+  name, which a 6b-1 relay refuses (`400`), so it can't join a 6b-1 server
+  until the app asks for the group name first (6b-2). The CLI works.
 - **Key Master screen.** Lists pending joins without their codes: you type the
   code you heard, and the app approves only if it matches the keys the server
   relayed. It then shows your own code to read back. You can also deny.
@@ -357,11 +455,18 @@ It comes from the public-domain [12dicts](http://wordlist.aspell.net/12dicts/) l
 
 ## Notes
 
-- Every table carries `group_id`; the MVP has one group per server.
+- Every table carries `group_id`, and every authenticated call works inside the
+  calling device's group; another group's devices, members and media look like
+  they don't exist (`404`). Event `seq` numbers count per group (the
+  `events.gseq` column): a server from before 6b keeps its existing numbers,
+  and each group's counter continues from the old server-wide one.
 - Tokens are stored as SHA-256 hashes.
 - Every startup removes the Phase 1 seed (group `g_test`). The cleanup is a no-op
   once the seed is gone, and touches only rows with `group_id = 'g_test'`; real ids
   are `g_` plus 16 random characters. `server/tests/test_legacy_cleanup.py` checks this,
-  and `server/tests/test_prune.py` covers the prune job and the removed/revoked
-  statuses (`cd server && python -m unittest discover tests`).
+  `server/tests/test_prune.py` covers the prune job and the removed/revoked
+  statuses, and `server/tests/test_groups.py` covers several groups, setup
+  tokens, isolation, the per-group numbering migration and the rate limits
+  (`cd server && python -m unittest discover tests`; needs `httpx` for the
+  last one).
 - Footprint on the test VM: ~35 MB (api) + ~70 MB (caddy), with 256 MB / 128 MB caps.

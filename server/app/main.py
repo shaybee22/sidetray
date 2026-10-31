@@ -12,6 +12,11 @@ to sync; the content itself is only ever fetched with GET /events.
 Phase 6: an hourly prune job deletes what every active device has acked and
 anything past the retention window; Key Masters remove members, revoke lost
 devices and rotate the group key (sealed and signed by their app, as at join).
+
+Phase 6b: several groups per server. Each is created with a one-time setup
+token (`sidetray-admin new-group`), the server never lists them, and every
+authenticated call stays inside the calling device's group, down to event
+numbers, which count per group. Rate limits per device and per client IP.
 """
 
 import asyncio
@@ -22,7 +27,9 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Literal
@@ -36,8 +43,10 @@ from pydantic import BaseModel, Field, field_validator
 DATA_DIR = Path(os.environ.get("SIDETRAY_DATA", "./data"))
 DB_PATH = DATA_DIR / "sidetray.db"
 MEDIA_DIR = DATA_DIR / "media"
-# Operator secret that allows creating the group; unset means no group can be created.
+# Operator secret that creates a server's first group (later ones need a
+# one-time token from `sidetray-admin new-group`). Unset means disabled.
 SETUP_TOKEN = os.environ.get("SIDETRAY_SETUP_TOKEN", "")
+SETUP_TOKEN_DAYS = 7
 MAX_MEDIA_BYTES = int(os.environ.get("SIDETRAY_MAX_MEDIA_BYTES", 10 * 1024 * 1024))
 PAGE_SIZE = 500
 MAX_PENDING = 20
@@ -54,6 +63,19 @@ PRUNE_EVERY_SECONDS = float(os.environ.get("SIDETRAY_PRUNE_EVERY_SECONDS") or 36
 # Uploaded media that no event refers to (an upload whose post never came) is
 # dropped after this long.
 ORPHAN_MEDIA_SECONDS = 24 * 3600
+
+
+def env_int(name: str, default: int) -> int:
+    v = os.environ.get(name, "").strip()
+    return int(v) if v else default
+
+
+# Rate limits (SPEC): per device, and per client IP for the unauthenticated
+# calls, so nobody can flood Key Masters with join requests or guess group names.
+EVENTS_PER_MINUTE = env_int("SIDETRAY_EVENTS_PER_MINUTE", 30)
+MEDIA_BYTES_PER_HOUR = env_int("SIDETRAY_MEDIA_MB_PER_HOUR", 50) * 1024 * 1024
+JOINS_PER_HOUR = env_int("SIDETRAY_JOINS_PER_HOUR", 10)
+LOOKUPS_PER_HOUR = env_int("SIDETRAY_LOOKUPS_PER_HOUR", 60)
 
 # Seeded by the Phase 1 skeleton for its hardcoded test token; removed on startup.
 LEGACY_TEST_GROUP_ID = "g_test"
@@ -129,11 +151,25 @@ CREATE TABLE IF NOT EXISTS acks (
     last_seq   INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+-- One-time tokens from `sidetray-admin new-group`; whoever joins with one
+-- creates a new group and becomes its Key Master.
+CREATE TABLE IF NOT EXISTS setup_tokens (
+    token_hash  TEXT PRIMARY KEY,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER,
+    group_id    TEXT REFERENCES groups(id)
+);
 """
 
 
 def now() -> int:
     return int(time.time())
+
+
+def name_key(name: str) -> str:
+    """Group names are unique per server, ignoring case and repeated spaces."""
+    return " ".join(name.split()).casefold()
 
 
 def hash_token(token: str) -> str:
@@ -208,12 +244,35 @@ def init_db() -> None:
         add_column(conn, "devices", "revoked_reason", "TEXT")  # denied / removed / revoked
         add_column(conn, "devices", "revoked_at", "INTEGER")
         add_column(conn, "devices", "revoked_seq", "INTEGER")  # last event seq when it was cut off
+        drop_legacy_test_group(conn)  # before group names become unique
+        # Phase 6b: several groups. Event numbers (`gseq`, what the API calls
+        # seq) count per group, so one group can't read another's activity in
+        # the gaps. Existing events keep their number (gseq = seq) and each
+        # group's counter starts from the old server-wide one, so cursors and
+        # acks already on devices stay valid.
+        add_column(conn, "groups", "name_key", "TEXT")
+        for g in conn.execute("SELECT id, name FROM groups WHERE name_key IS NULL").fetchall():
+            conn.execute("UPDATE groups SET name_key = ? WHERE id = ?", (name_key(g["name"]), g["id"]))
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS groups_name_key ON groups (name_key)")
+        if "gseq" not in {r["name"] for r in conn.execute("PRAGMA table_info(events)")}:
+            conn.execute("ALTER TABLE events ADD COLUMN gseq INTEGER")
+            add_column(conn, "groups", "event_seq", "INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE events SET gseq = seq")
+            hw = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events'").fetchone()
+            conn.execute("UPDATE groups SET event_seq = ?", (hw[0] if hw else 0,))
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_group_gseq ON events (group_id, gseq)")
+        # Numbers each new event within its group, inside the inserting transaction.
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS events_number AFTER INSERT ON events WHEN NEW.gseq IS NULL BEGIN"
+            " UPDATE groups SET event_seq = event_seq + 1 WHERE id = NEW.group_id;"
+            " UPDATE events SET gseq = (SELECT event_seq FROM groups WHERE id = NEW.group_id)"
+            " WHERE seq = NEW.seq; END"
+        )
         conn.execute(
             "UPDATE groups SET key_version = MAX(key_version,"
             " (SELECT COALESCE(MAX(key_version), 1) FROM sealed_keys WHERE group_id = groups.id),"
             " (SELECT COALESCE(MAX(key_version), 1) FROM events WHERE group_id = groups.id))"
         )
-        drop_legacy_test_group(conn)
 
 
 def prune(t: int | None = None) -> dict:
@@ -238,9 +297,9 @@ def prune(t: int | None = None) -> dict:
                 (gid,),
             ).fetchone()
             acked = row["low"] if row["n"] else 0
-            where = "group_id = ? AND (seq <= ? OR created_at < ?)"
+            where = "group_id = ? AND (gseq <= ? OR created_at < ?)"
             args = (gid, acked, cutoff)
-            top = conn.execute(f"SELECT MAX(seq) FROM events WHERE {where}", args).fetchone()[0]
+            top = conn.execute(f"SELECT MAX(gseq) FROM events WHERE {where}", args).fetchone()[0]
             if top is None:
                 continue
             for r in conn.execute(f"SELECT media_ids FROM events WHERE {where} AND media_ids != ''", args):
@@ -327,6 +386,64 @@ class Hub:
 hub = Hub()
 
 
+class Limiter:
+    """Sliding-window limit per key (a device id or a client IP). In memory,
+    like the Hub, so it relies on the single process. `take` records `amount`
+    and returns None if it fits, otherwise the seconds until it would."""
+
+    def __init__(self, limit: int, window: float) -> None:
+        self.limit, self.window = limit, window
+        self.hits: dict[str, deque] = {}
+        self.lock = threading.Lock()
+
+    def _used(self, key: str, t: float) -> tuple[deque, int]:
+        q = self.hits.setdefault(key, deque())
+        while q and q[0][0] <= t - self.window:
+            q.popleft()
+        return q, sum(a for _, a in q)
+
+    def room(self, key: str) -> int:
+        with self.lock:
+            return self.limit - self._used(key, time.monotonic())[1]
+
+    def take(self, key: str, amount: int = 1) -> int | None:
+        t = time.monotonic()
+        with self.lock:
+            if len(self.hits) > 10_000:  # forget idle keys now and then
+                for k in [k for k, q in self.hits.items() if not q or q[-1][0] <= t - self.window]:
+                    del self.hits[k]
+            q, used = self._used(key, t)
+            if used + amount <= self.limit:
+                q.append((t, amount))
+                return None
+            # Wait until enough of the oldest hits age out.
+            need, freed = used + amount - self.limit, 0
+            for ts, a in q:
+                freed += a
+                if freed >= need:
+                    return max(1, int(ts + self.window - t) + 1)
+            return int(self.window)  # bigger than the whole limit
+
+
+event_limit = Limiter(EVENTS_PER_MINUTE, 60)
+media_limit = Limiter(MEDIA_BYTES_PER_HOUR, 3600)
+join_limit = Limiter(JOINS_PER_HOUR, 3600)
+lookup_limit = Limiter(LOOKUPS_PER_HOUR, 3600)
+
+
+def limit(limiter: Limiter, key: str, what: str, amount: int = 1) -> None:
+    wait = limiter.take(key, amount)
+    if wait is not None:
+        raise HTTPException(429, f"too many {what}; try again in {wait} seconds",
+                            headers={"Retry-After": str(wait)})
+
+
+def client_ip(request: Request) -> str:
+    """The caller's address. Behind Caddy, uvicorn takes it from
+    X-Forwarded-For, which Caddy sets itself (it ignores the client's own)."""
+    return request.client.host if request.client else "unknown"
+
+
 def active_device_ids(conn: sqlite3.Connection, group_id: str, keymasters_only: bool = False) -> list[str]:
     sql = ("SELECT d.id FROM devices d JOIN members m ON m.id = d.member_id"
            " WHERE d.group_id = ? AND d.status = 'active' AND m.status = 'active'")
@@ -365,9 +482,32 @@ def push_removed(device_ids: list[str], scope: str) -> None:
     hub.send(device_ids, {"type": "removed", "scope": scope}, close=True)
 
 
-def the_group(conn: sqlite3.Connection) -> sqlite3.Row | None:
-    """The MVP has one group per server."""
-    return conn.execute("SELECT id, name FROM groups ORDER BY created_at LIMIT 1").fetchone()
+def group_by_name(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT id, name FROM groups WHERE name_key = ?", (name_key(name),)).fetchone()
+
+
+def check_setup_token(conn: sqlite3.Connection, token: str) -> str | None:
+    """Whether `token` may create a group: "env" for the operator's
+    SIDETRAY_SETUP_TOKEN (only while the server has no group yet), the
+    token's hash for an unused, unexpired one from `sidetray-admin new-group`,
+    otherwise None."""
+    if SETUP_TOKEN and secrets.compare_digest(token.encode(), SETUP_TOKEN.encode()):
+        return None if conn.execute("SELECT 1 FROM groups LIMIT 1").fetchone() else "env"
+    h = hash_token(token)
+    row = conn.execute(
+        "SELECT 1 FROM setup_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?", (h, now())
+    ).fetchone()
+    return h if row else None
+
+
+def issue_setup_token(days: float = SETUP_TOKEN_DAYS) -> tuple[str, int]:
+    """A fresh one-time token for a new group, stored hashed. Returns (token, expires_at)."""
+    token = "st_" + secrets.token_urlsafe(24)
+    t = now()
+    with db() as conn:
+        conn.execute("INSERT INTO setup_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
+                     (hash_token(token), t, t + int(days * 86400)))
+    return token, t + int(days * 86400)
 
 
 def new_id(prefix: str) -> str:
@@ -562,7 +702,7 @@ async def lifespan(_app: FastAPI):
     pruner.cancel()
 
 
-app = FastAPI(title="Side Tray relay", version="0.6.0", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="Side Tray relay", version="0.6.1", docs_url=None, redoc_url=None, lifespan=lifespan)
 api = APIRouter(prefix="/api/v1")
 
 
@@ -572,32 +712,43 @@ def health():
 
 
 @api.get("/group")
-def get_group():
+def get_group(request: Request, name: str | None = Query(default=None, max_length=100)):
+    """Whether a group of exactly this name (ignoring case) exists here. The
+    server never lists its groups, so without a name there's no answer."""
+    if not name or not name.strip():
+        raise HTTPException(400, "pass ?name=<group name>; this server doesn't list its groups")
+    limit(lookup_limit, client_ip(request), "group lookups from your address")
     with db() as conn:
-        g = the_group(conn)
-    return {"exists": True, "id": g["id"], "name": g["name"]} if g else {"exists": False}
+        g = group_by_name(conn, name)
+    return {"exists": True, "name": g["name"]} if g else {"exists": False}
 
 
 @api.post("/join", status_code=201)
-def join(body: JoinIn):
+def join(body: JoinIn, request: Request):
+    # Every attempt counts, wrong names and tokens included.
+    limit(join_limit, client_ip(request), "join requests from your address")
     enc_pk = pubkey(body.enc_pubkey, "enc_pubkey")
     sign_pk = pubkey(body.sign_pubkey, "sign_pubkey")
     token = secrets.token_urlsafe(32)
     t = now()
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        g = the_group(conn)
-        if g is None:
-            # Creating the group: the operator's setup token makes this device its Key Master.
-            if not SETUP_TOKEN or not body.setup_token or not secrets.compare_digest(
-                body.setup_token, SETUP_TOKEN
-            ):
-                raise HTTPException(403, "no group yet; creating one needs the server's setup token")
+        g = group_by_name(conn, body.group_name)
+        if body.setup_token is not None:
+            # Creating a group: a valid setup token makes this device its Key Master.
+            used = check_setup_token(conn, body.setup_token)
+            if used is None:
+                raise HTTPException(403, "that setup token isn't valid here (wrong, already used or expired)")
+            if g is not None:
+                raise HTTPException(409, "a group with that name already exists on this server; pick another")
             group_id, member_id, device_id = new_id("g"), new_id("m"), new_id("d")
             conn.execute(
-                "INSERT INTO groups (id, name, created_at) VALUES (?, ?, ?)",
-                (group_id, body.group_name, t),
+                "INSERT INTO groups (id, name, name_key, created_at) VALUES (?, ?, ?, ?)",
+                (group_id, body.group_name, name_key(body.group_name), t),
             )
+            if used != "env":
+                conn.execute("UPDATE setup_tokens SET used_at = ?, group_id = ? WHERE token_hash = ?",
+                             (t, group_id, used))
             conn.execute(
                 "INSERT INTO members (id, group_id, display_name, email, role, status, created_at)"
                 " VALUES (?, ?, ?, ?, 'keymaster', 'active', ?)",
@@ -611,9 +762,7 @@ def join(body: JoinIn):
             return {"group_id": group_id, "group_name": body.group_name, "member_id": member_id,
                     "device_id": device_id, "token": token, "status": "active", "role": "keymaster"}
 
-        if body.setup_token is not None:
-            raise HTTPException(409, "the group already exists; join it instead")
-        if body.group_name.casefold() != g["name"].casefold():
+        if g is None:
             raise HTTPException(404, "no group with that name on this server")
         pending = conn.execute(
             "SELECT COUNT(*) FROM devices WHERE group_id = ? AND status = 'pending'", (g["id"],)
@@ -684,10 +833,9 @@ def revoked_status(device_id: str) -> str:
     return "revoked"
 
 
-def last_seq(conn: sqlite3.Connection) -> int:
-    """The highest event seq ever issued (pruning doesn't lower it)."""
-    hw = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events'").fetchone()
-    return hw[0] if hw else 0
+def last_seq(conn: sqlite3.Connection, group_id: str) -> int:
+    """The highest event seq issued in this group (pruning doesn't lower it)."""
+    return conn.execute("SELECT event_seq FROM groups WHERE id = ?", (group_id,)).fetchone()[0]
 
 
 def group_row(conn: sqlite3.Connection, group_id: str) -> sqlite3.Row:
@@ -1001,7 +1149,7 @@ def remove_member(member_id: str, km: Device = Depends(keymaster_device)):
         conn.execute("UPDATE members SET status = 'removed' WHERE id = ?", (member_id,))
         conn.execute(
             "UPDATE devices SET revoked_seq = ? WHERE member_id = ? AND status = 'active'",
-            (last_seq(conn), member_id),
+            (last_seq(conn, km.group_id), member_id),
         )
         conn.execute(
             "UPDATE devices SET status = 'revoked', revoked_reason = 'removed', revoked_at = ?"
@@ -1033,7 +1181,7 @@ def revoke_device(device_id: str, km: Device = Depends(keymaster_device)):
         if device_id == km.id:
             raise HTTPException(409, "you can't revoke the device you're using")
         conn.execute("UPDATE devices SET status = 'revoked', revoked_reason = 'revoked', revoked_at = ?,"
-                     " revoked_seq = ? WHERE id = ?", (now(), last_seq(conn), device_id))
+                     " revoked_seq = ? WHERE id = ?", (now(), last_seq(conn, km.group_id), device_id))
         conn.execute("UPDATE groups SET rotation_pending = 1 WHERE id = ?", (km.group_id,))
     push_removed([device_id], "device")
     return {"device_id": device_id, "status": "revoked", "rotation_pending": True}
@@ -1041,6 +1189,7 @@ def revoke_device(device_id: str, km: Device = Depends(keymaster_device)):
 
 @api.post("/events", status_code=201)
 def post_event(ev: EventIn, dev: Device = Depends(current_device)):
+    limit(event_limit, dev.id, "events from this device")
     with db() as conn:
         cur = group_row(conn, dev.group_id)["key_version"]
         if ev.key_version < cur:
@@ -1068,7 +1217,7 @@ def post_event(ev: EventIn, dev: Device = Depends(current_device)):
                 now(),
             ),
         )
-        seq = cur.lastrowid
+        seq = conn.execute("SELECT gseq FROM events WHERE seq = ?", (cur.lastrowid,)).fetchone()[0]
     # After the commit, so a device that syncs on this push finds the event.
     push_new_event(dev.group_id, dev.id, seq, ev.kind)
     return {"seq": seq}
@@ -1082,8 +1231,8 @@ def get_events(
 ):
     with db() as conn:
         rows = conn.execute(
-            "SELECT seq, kind, author_device_id, key_version, ciphertext, signature, media_ids, created_at"
-            " FROM events WHERE group_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+            "SELECT gseq AS seq, kind, author_device_id, key_version, ciphertext, signature, media_ids, created_at"
+            " FROM events WHERE group_id = ? AND gseq > ? ORDER BY gseq LIMIT ?",
             (dev.group_id, after, limit + 1),
         ).fetchall()
         g = group_row(conn, dev.group_id)
@@ -1116,7 +1265,7 @@ def get_events(
 @api.post("/ack")
 def ack(body: AckIn, dev: Device = Depends(current_device)):
     with db() as conn:
-        ceiling = last_seq(conn)
+        ceiling = last_seq(conn, dev.group_id)
         if body.seq > ceiling:
             raise HTTPException(422, f"seq {body.seq} is beyond the latest event ({ceiling})")
         # Acks only move forward.
@@ -1135,6 +1284,9 @@ async def upload_media(request: Request, dev: Device = Depends(current_device)):
     declared = request.headers.get("content-length")
     if declared and int(declared) > MAX_MEDIA_BYTES:
         raise HTTPException(413, f"media larger than {MAX_MEDIA_BYTES} bytes")
+    hourly = f"uploads from this device (limit {MEDIA_BYTES_PER_HOUR // (1024 * 1024)} MB per hour)"
+    if media_limit.room(dev.id) < max(int(declared or 0), 1):
+        limit(media_limit, dev.id, hourly, max(int(declared or 0), 1))  # raises 429 with Retry-After
     media_id = secrets.token_urlsafe(16)
     group_dir = MEDIA_DIR / dev.group_id
     group_dir.mkdir(parents=True, exist_ok=True)
@@ -1150,6 +1302,7 @@ async def upload_media(request: Request, dev: Device = Depends(current_device)):
                 f.write(chunk)
         if size == 0:
             raise HTTPException(422, "empty body")
+        limit(media_limit, dev.id, hourly, size)
         tmp.rename(final)
     finally:
         tmp.unlink(missing_ok=True)
