@@ -32,7 +32,7 @@ Someone in your family runs Side Tray for the group (the *Key Master*). This
 is how you get it onto your Windows computer.
 
 1. **Download the installer.** Your Key Master sends you a link to a file
-   called something like `Side Tray_0.1.0_x64-setup.exe`. Download it.
+   called something like `Side.Tray_0.1.0_x64-setup.exe`. Download it.
 2. **Open it.** Double-click the file (or click it in your browser's
    downloads list). You don't need an administrator password.
 3. **Windows will probably warn you.** A blue box appears that says
@@ -42,7 +42,7 @@ is how you get it onto your Windows computer.
    isn't signed with a paid certificate yet, so Windows doesn't recognise
    it (see [Code signing](#code-signing) for what that would change).
    - Click the small underlined **More info** link under the message.
-   - The box now also shows *App: Side Tray_0.1.0_x64-setup.exe* and
+   - The box now also shows *App: Side.Tray_0.1.0_x64-setup.exe* and
      *Publisher: Unknown publisher*, and a second button appears:
      **Run anyway**. Click it.
 
@@ -58,7 +58,7 @@ is how you get it onto your Windows computer.
    │ from starting. Running this app  │     │ from starting. Running this app  │
    │ might put your PC at risk.       │     │ might put your PC at risk.       │
    │ More info   <── click this       │     │                                  │
-   │                                  │     │ App:       Side Tray_0.1.0_x64-  │
+   │                                  │     │ App:       Side.Tray_0.1.0_x64-  │
    │                                  │     │            setup.exe             │
    │                                  │     │ Publisher: Unknown publisher     │
    │                                  │     │                                  │
