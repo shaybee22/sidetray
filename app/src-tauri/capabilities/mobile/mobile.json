@@ -1,0 +1,8 @@
+{
+  "$schema": "../../gen/schemas/mobile-schema.json",
+  "identifier": "mobile",
+  "description": "Android: the notification plugin's own startup script checks its permission.",
+  "windows": ["main"],
+  "platforms": ["android", "iOS"],
+  "permissions": ["notification:default"]
+}

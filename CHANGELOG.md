@@ -3,6 +3,23 @@
 All notable changes to Side Tray. Versions follow [Semantic Versioning](https://semver.org/);
 the app, the Rust crates and the relay share one version number.
 
+## [Unreleased]
+
+### Android app (phase A1)
+
+- Side Tray builds for Android (debug APK; see the README's *Android app*
+  section). A phone joins as its own device with the usual safety-code check,
+  and has the feed, posts with photos, comments, reactions, direct messages
+  and the Key Master tab. It syncs while it's open.
+- The phone's private keys and token are encrypted with a key held in the
+  Android Keystore.
+- `sidetray://` invite links open the app on a phone too.
+
+### Desktop app
+
+- No visible changes. Internally the app is now a library plus a small
+  executable, so the same code builds for Android.
+
 ## [0.1.1] - 2026-10-31
 
 Adding pictures is now as easy as on Facebook. App only: the relay is

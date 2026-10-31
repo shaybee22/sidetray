@@ -338,3 +338,34 @@ dialog#crop p { margin: 0; }
 .photos.small-grid { grid-template-columns: repeat(auto-fill, minmax(96px, 120px)); margin-top: 6px; border-radius: 8px; }
 .photos.small-grid .photo, .photos.small-grid .photo img { aspect-ratio: 1; }
 #dm-hint { margin: 6px 0 0; }
+
+/* A1 (Android): the desktop layout made usable on a phone; real mobile polish is A2 */
+.mobile-only { display: none; }
+html.mobile .desktop-only { display: none !important; }
+html.mobile .mobile-only { display: revert; }
+/* Edge-to-edge: keep content clear of the status bar, notch and gesture bar. */
+html.mobile .topbar { padding-top: calc(10px + env(safe-area-inset-top)); padding-left: calc(12px + env(safe-area-inset-left)); padding-right: calc(12px + env(safe-area-inset-right)); }
+html.mobile .screen-center { padding-top: calc(24px + env(safe-area-inset-top)); padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
+html.mobile .panel { padding-left: calc(10px + env(safe-area-inset-left)); padding-right: calc(10px + env(safe-area-inset-right)); padding-bottom: calc(48px + env(safe-area-inset-bottom)); }
+html.mobile .panel .card { padding: 14px; }
+/* The chat fills the screen above the keyboard (dvh follows the keyboard and browser bars). */
+html.mobile #panel-messages { padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+html.mobile .chat { height: calc(100dvh - 128px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); min-height: 300px; }
+html.mobile .bubble { max-width: 85%; }
+html.mobile .tabs { gap: 2px; justify-content: space-between; overflow-x: auto; scrollbar-width: none; }
+html.mobile .tab { flex: 0 1 auto; padding: 8px 3px; font-size: .88rem; }
+html.mobile .tab .badge { font-size: .68rem; padding: 0 5px; min-width: 16px; }
+html.mobile .facts { grid-template-columns: 1fr; gap: 2px; }
+html.mobile .facts dd { margin-bottom: 8px; }
+html.mobile .invite-link { flex-wrap: wrap; }
+html.mobile #lightbox { padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+html.mobile .lightbox-close { top: calc(12px + env(safe-area-inset-top)); }
+/* Fingers, not a mouse: bigger targets, and 16 px inputs so nothing zooms on focus. */
+@media (pointer: coarse) {
+  button, .button { min-height: 40px; }
+  button.small, .button.small { min-height: 36px; }
+  .react { min-height: 36px; }
+  .react-picker button { min-width: 40px; min-height: 40px; font-size: 1.35rem; }
+  input, textarea { font-size: 16px; }
+  .conv:hover, .pick:hover { background: none; }
+}

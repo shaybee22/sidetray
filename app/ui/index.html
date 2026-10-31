@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Side Tray</title>
   <link rel="stylesheet" href="style.css">
   <script src="app.js" defer></script>
@@ -24,7 +24,7 @@
   <div class="card narrow">
     <p class="eyebrow">Side Tray</p>
     <h1>Welcome</h1>
-    <p class="lede">A private feed for one group of friends and family. Posts are encrypted on this computer before they leave it.</p>
+    <p class="lede">A private feed for one group of friends and family. Posts are encrypted on this device before they leave it.</p>
 
     <p class="note" id="wz-invite-note" hidden>Opened from an invite link.</p>
 
@@ -119,7 +119,7 @@
     <p class="eyebrow" id="rm-group"></p>
     <h1 id="rm-title">You've been removed from this group</h1>
     <p id="rm-body"></p>
-    <p class="hint">Posts and photos already on this computer stay here. Nothing new arrives.</p>
+    <p class="hint">Posts and photos already on this device stay here. Nothing new arrives.</p>
     <div class="actions center"><button class="primary" id="rm-archive">Look through saved posts</button></div>
     <button class="link" id="rm-restart">Delete them and join a group again</button>
     <p class="error" id="rm-err" hidden></p>
@@ -206,7 +206,7 @@
         <div class="staged" id="dm-photos"></div>
         <div class="chat-input-row">
           <label class="button ghost" title="Add photos">Photo<input id="dm-file" type="file" accept="image/*" multiple hidden></label>
-          <textarea id="dm-text" rows="2" maxlength="20000" placeholder="Write a message… (Ctrl+Enter sends)"></textarea>
+          <textarea id="dm-text" rows="2" maxlength="20000" placeholder="Write a message…"></textarea>
           <button class="primary" id="dm-send">Send</button>
         </div>
         <p class="muted small" id="dm-hint" hidden></p>
@@ -276,8 +276,9 @@
     </div>
     <div class="card">
       <h2>Settings</h2>
-      <label class="check"><input type="checkbox" id="set-autostart"> Start Side Tray when I sign in <span class="hint">It opens quietly in the tray.</span></label>
-      <p class="hint">Closing the window keeps Side Tray running in the tray so it can tell you about new posts. To stop it, right-click the tray icon and choose Quit.</p>
+      <label class="check desktop-only"><input type="checkbox" id="set-autostart"> Start Side Tray when I sign in <span class="hint">It opens quietly in the tray.</span></label>
+      <p class="hint desktop-only">Closing the window keeps Side Tray running in the tray so it can tell you about new posts. To stop it, right-click the tray icon and choose Quit.</p>
+      <p class="hint mobile-only">On a phone, Side Tray syncs while it's open. Notifications while it's closed come in a later version.</p>
       <p class="error" id="set-err" hidden></p>
     </div>
     <div class="card">
@@ -354,7 +355,7 @@
 <dialog id="crop" aria-labelledby="crop-title">
   <form method="dialog" class="stack">
     <h2 id="crop-title">Position your photo</h2>
-    <p class="hint">Drag to move it, and zoom with the slider or the mouse wheel. Only what's inside the circle is kept.</p>
+    <p class="hint">Drag to move it, and zoom with the slider<span class="desktop-only"> or the mouse wheel</span>. Only what's inside the circle is kept.</p>
     <div class="crop-frame" id="crop-frame" tabindex="0" aria-label="Photo position: arrow keys move it, plus and minus zoom">
       <img id="crop-img" alt="" draggable="false">
     </div>

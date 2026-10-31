@@ -3,8 +3,10 @@
 //!
 //! They live in one OS keychain entry (Windows Credential Manager, macOS
 //! Keychain), named after the install's random `local_id`. That entry stays the
-//! same size however many group key versions pile up. Where there's no native
-//! keychain (Linux for now) they go in the database's `secrets` table instead.
+//! same size however many group key versions pile up. On Android the entry goes
+//! in the database's `secrets` table, encrypted by a non-exportable Android
+//! Keystore key (`keystore.rs`). Where there's no native keychain (Linux for
+//! now) it goes in that table as is.
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -124,14 +126,31 @@ pub fn delete(_conn: &Connection, local_id: &str) -> Result<()> {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "android")]
+fn store_raw(conn: &Connection, local_id: &str, bytes: &[u8]) -> Result<()> {
+    let _ = SERVICE;
+    let wrapped = crate::keystore::wrap(bytes)?;
+    conn.execute("INSERT OR REPLACE INTO secrets (name, value) VALUES (?1, ?2)", params![local_id, wrapped])?;
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn load_raw(conn: &Connection, local_id: &str) -> Result<Vec<u8>> {
+    let wrapped: Vec<u8> = conn
+        .query_row("SELECT value FROM secrets WHERE name = ?1", params![local_id], |r| r.get(0))
+        .optional()?
+        .context("this device's keys are missing")?;
+    crate::keystore::unwrap(&wrapped)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
 fn store_raw(conn: &Connection, local_id: &str, bytes: &[u8]) -> Result<()> {
     let _ = SERVICE;
     conn.execute("INSERT OR REPLACE INTO secrets (name, value) VALUES (?1, ?2)", params![local_id, bytes])?;
     Ok(())
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
 fn load_raw(conn: &Connection, local_id: &str) -> Result<Vec<u8>> {
     conn.query_row("SELECT value FROM secrets WHERE name = ?1", params![local_id], |r| r.get(0))
         .optional()?

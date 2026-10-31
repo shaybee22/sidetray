@@ -51,7 +51,32 @@ function hue(name) {
 
 // --- routing ------------------------------------------------------------------------
 
+/** A phone (Android): no tray, autostart or self-update; the layout leans on this class too. */
+let mobile = false;
+
+/**
+ * A file's bytes as an invoke argument. Desktop sends them as the raw request
+ * body. Android's IPC only carries JSON, so there they go as one base64 string
+ * (far smaller than a JSON array of numbers); the Rust side takes either.
+ */
+async function bytesArg(blob) {
+  if (!mobile) return new Uint8Array(await blob.arrayBuffer());
+  const url = await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+  return { b64: url.slice(url.indexOf(",") + 1) };
+}
+
 async function boot() {
+  try {
+    mobile = (await invoke("get_settings")).mobile;
+  } catch (_) {}
+  document.documentElement.classList.toggle("mobile", mobile);
+  if (!mobile) $("#dm-text").placeholder = "Write a message… (Ctrl+Enter sends)";
+  invoke("update_status").then(renderUpdate).catch(() => {});
   try {
     view = await invoke("get_state");
   } catch (e) {
@@ -728,7 +753,7 @@ class Attachments {
   addFiles(files) {
     return this.add(files.map((f) => ({
       label: f.name,
-      load: async () => invoke("stage_photo", new Uint8Array(await f.arrayBuffer())),
+      load: async () => invoke("stage_photo", await bytesArg(f)),
     })));
   }
 
@@ -1608,8 +1633,7 @@ $("#crop-save").addEventListener("click", async () => {
     $("#crop-save").textContent = "Uploading…";
     try {
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      const p = await invoke("set_avatar", bytes);
+      const p = await invoke("set_avatar", await bytesArg(blob));
       $("#crop").close();
       renderProfile(p);
       view = await invoke("get_state");
@@ -1718,9 +1742,35 @@ async function openChat(memberId) {
   chatWith = memberId;
   $("#dm-list-view").hidden = true;
   $("#dm-chat-view").hidden = false;
+  fitChat();
   await loadChat(true);
-  if (!$("#dm-composer").hidden && !$("#screen-main").classList.contains("readonly")) $("#dm-text").focus();
+  // On a phone, focusing would throw the keyboard up before they've read anything.
+  if (!mobile && !$("#dm-composer").hidden && !$("#screen-main").classList.contains("readonly")) $("#dm-text").focus();
 }
+
+/**
+ * Phone: make the chat fill exactly what's visible below the top bar. Android
+ * doesn't shrink an edge-to-edge page for the keyboard (only the visual
+ * viewport shrinks), so CSS heights would leave the composer under the keyboard
+ * or scroll the header away; size it from the visual viewport instead.
+ */
+function fitChat() {
+  const chat = $("#dm-chat-view");
+  if (!mobile || chat.hidden || $("#panel-messages").hidden) return;
+  const vv = window.visualViewport;
+  const height = vv ? vv.height : innerHeight;
+  const keyboard = innerHeight - height > 80;
+  const log = $("#dm-log");
+  const atEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  window.scrollTo(0, 0);
+  const top = chat.getBoundingClientRect().top;
+  // Below the chat: the panel's padding, which includes the gesture bar (under the keyboard when it's up).
+  const below = keyboard ? 8 : parseFloat(getComputedStyle($("#panel-messages")).paddingBottom) || 8;
+  chat.style.height = `${Math.max(220, Math.floor(height - top - below))}px`;
+  if (atEnd) log.scrollTop = log.scrollHeight;
+}
+window.visualViewport?.addEventListener("resize", fitChat);
+window.addEventListener("resize", fitChat);
 
 $("#dm-back").addEventListener("click", () => {
   chatWith = null;
@@ -1898,7 +1948,9 @@ function renderUpdate(u) {
     $("#update-text").textContent = `Side Tray ${u.version} is ready to install. The app closes for a moment and comes back.`;
   }
   const status = {
-    off: `Side Tray ${u.current_version}. This copy wasn't set up with the installer, so it doesn't update itself.`,
+    off: mobile
+      ? `Side Tray ${u.current_version}. On a phone, new versions come as a new app download for now.`
+      : `Side Tray ${u.current_version}. This copy wasn't set up with the installer, so it doesn't update itself.`,
     idle: `Side Tray ${u.current_version}. ` + (u.checked_at ? `Up to date (checked ${when(u.checked_at)}).` : "It checks for updates every few hours."),
     checking: `Side Tray ${u.current_version}. Checking for updates…`,
     downloading: `Downloading Side Tray ${u.version}…`,
@@ -1930,7 +1982,5 @@ $("#update-install").addEventListener("click", async (ev) => {
     $("#update-text").textContent = String(e);
   }
 });
-
-invoke("update_status").then(renderUpdate).catch(() => {});
 
 boot();

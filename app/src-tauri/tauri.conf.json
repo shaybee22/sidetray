@@ -24,6 +24,15 @@
   },
   "plugins": {
     "deep-link": {
+      "mobile": [
+        {
+          "scheme": [
+            "sidetray"
+          ],
+          "host": "join",
+          "appLink": false
+        }
+      ],
       "desktop": {
         "schemes": [
           "sidetray"

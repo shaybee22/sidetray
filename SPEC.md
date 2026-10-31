@@ -268,7 +268,7 @@ Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, 
 
 ## Android app
 
-Side Tray 0.1.1 runs on Windows and Linux. This section plans a phone app for Android. Nothing here is built yet.
+Side Tray 0.1.1 runs on Windows and Linux. This section plans a phone app for Android. A1 is built (see "As built" under A1); A2 to A4 are not.
 
 **Decisions**
 
@@ -295,6 +295,13 @@ Side Tray 0.1.1 runs on Windows and Linux. This section plans a phone app for An
 - Feed, posts with photos, comments, reactions, Messages tab and chat, Key Master tab (approve joins from the phone too). Sync and `/ws` run while the app is in the foreground; nothing in the background yet.
 - The existing layout made usable on a phone screen; the real mobile polish is A2.
 - **Done when** a phone joins a group, a Key Master desktop approves it after comparing codes, and the phone posts, comments and exchanges direct messages with a desktop.
+- **As built:**
+  - The app crate is now a library (`sidetray_app_lib::run()`, which the Android build loads) plus a thin desktop `main.rs`. Tray, updater, autostart and single-instance are `cfg(desktop)`; `tray_mobile.rs` and `update_mobile.rs` stand in on a phone.
+  - Keystore wrapping is done in Rust over JNI (`keystore.rs`, using the JavaVM from `ndk-context`), not a Kotlin plugin, so it works from any thread, including the main thread that runs synchronous commands. The wrapped secrets blob goes in the database's `secrets` table; the group keys stay wrapped by the local key inside it, as on desktop.
+  - Android's IPC carries only JSON, so photo bytes go to Rust as base64 there (`{b64}`); desktop still sends a raw body.
+  - The page is edge to edge: safe-area padding, and on a phone the chat is sized from the visual viewport (Android doesn't shrink the page for the keyboard). A phone hides desktop-only settings (`html.mobile`).
+  - Coming back to the foreground (`RunEvent::Resumed`) syncs at once and nudges the push loop.
+  - Tested on a Motorola razr ultra 2025 (Android, arm64) against a relay on the build PC through `adb reverse`: join approved from a desktop Key Master, the phone approving a desktop's join, posts with a photo from the system photo picker, comments and reactions both ways, direct messages with photos both ways (and on the sender's other device), a `sidetray://` invite link to an HTTPS test server with the fingerprint step on a freshly cleared app, and a public-certificate HTTPS check.
 
 What this Windows machine needs to build for Android:
 

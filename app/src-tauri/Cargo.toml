@@ -3,9 +3,15 @@ name = "sidetray-app"
 version = "0.1.1"
 edition = "2021"
 rust-version = "1.90"
-description = "Side Tray desktop client"
+description = "Side Tray client (desktop and Android)"
 license = "MIT OR Apache-2.0"
 publish = false
+
+# The app is a library so the Android build can load it (cdylib); the desktop
+# binary in src/main.rs just calls run().
+[lib]
+name = "sidetray_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "sidetray-app"
@@ -42,18 +48,26 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 webpki-roots = "1.0.11"
-# A second launch focuses the running app (it may be hidden in the tray), and
-# hands it any sidetray:// invite link it was started with.
-tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
 # sidetray://join?server=...&group=... invite links.
 tauri-plugin-deep-link = "2.6.3"
 # The invite link as a QR code (SVG).
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 # SHA-256 fingerprints of a test server's root certificate.
 sha2 = "0.10.9"
+
+# Desktop only: the phone has no second launch, no autostart and updates by APK (A4).
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# A second launch focuses the running app (it may be hidden in the tray), and
+# hands it any sidetray:// invite link it was started with.
+tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
 # "Start with Windows" (login item on macOS, autostart entry on Linux).
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-updater = "2.14.1"
+
+# Android: the device's secrets are wrapped by a Keystore key, reached over JNI.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
+ndk-context = "0.1.1"
 
 # Device secrets go to the OS keychain where there's a native one; elsewhere
 # they stay in the local database (SPEC.md: "where available").
