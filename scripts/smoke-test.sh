@@ -56,7 +56,7 @@ expect 401 GET /events bogus-token >/dev/null && pass "unknown token -> 401" || 
 expect 401 GET /join/status bogus-token >/dev/null && pass "unknown token on /join/status -> 401" || fail "unknown token on /join/status -> 401"
 probe() { python3 scripts/ws_probe.py "$@"; }
 [ "$(probe "wss://$SIDETRAY_HOST/api/v1/ws" --cacert "$CACERT" || true)" = "rejected 403" ]   && pass "/ws through Caddy without a token -> 403" || fail "/ws through Caddy without a token -> 403"
-[ "$(probe "wss://$SIDETRAY_HOST/api/v1/ws" --cacert "$CACERT" --token bogus-token || true)" = "rejected 403" ]   && pass "/ws through Caddy with an unknown token -> 403" || fail "/ws through Caddy with an unknown token -> 403"
+[ "$(probe "wss://$SIDETRAY_HOST/api/v1/ws" --cacert "$CACERT" --token=bogus-token || true)" = "rejected 403" ]   && pass "/ws through Caddy with an unknown token -> 403" || fail "/ws through Caddy with an unknown token -> 403"
 unset CACERT
 
 echo "== full API on a throwaway container"
@@ -193,16 +193,16 @@ pass "Key Master pulled it, attributed to the member's device"
 echo "== push channel (/ws)"
 W="ws://127.0.0.1:$PORT/api/v1/ws"
 [ "$(probe "$W" || true)" = "rejected 403" ] && pass "/ws without a token -> 403" || fail "/ws without a token -> 403"
-[ "$(probe "$W" --token bogus-token || true)" = "rejected 403" ] && pass "/ws with an unknown token -> 403" || fail "/ws with an unknown token -> 403"
+[ "$(probe "$W" --token=bogus-token || true)" = "rejected 403" ] && pass "/ws with an unknown token -> 403" || fail "/ws with an unknown token -> 403"
 ZED=$(expect 201 POST /join "" "$(join_body Zed zed@x.test)")
 ZED_TOK=$(echo "$ZED" | j '["token"]'); ZED_DEV=$(echo "$ZED" | j '["device_id"]'); ZED_MEM=$(echo "$ZED" | j '["member_id"]')
-[ "$(probe "$W" --token "$ZED_TOK" || true)" = "rejected 403" ] && pass "/ws with a pending token -> 403" || fail "/ws with a pending token -> 403"
-[ "$(probe "$W" --token "$MAL_TOK" || true)" = "rejected 403" ] && pass "/ws with a denied token -> 403" || fail "/ws with a denied token -> 403"
+[ "$(probe "$W" --token="$ZED_TOK" || true)" = "rejected 403" ] && pass "/ws with a pending token -> 403" || fail "/ws with a pending token -> 403"
+[ "$(probe "$W" --token="$MAL_TOK" || true)" = "rejected 403" ] && pass "/ws with a denied token -> 403" || fail "/ws with a denied token -> 403"
 expect 200 POST "/joins/$ZED_DEV/approve" "$KM_TOK" "$(approve_body "$ZED_DEV" Zed)" >/dev/null && pass "Zed approved as a member" || fail "Zed approved as a member"
 
 # Kim (Key Master) and Zed (member) listen; then Yan asks to join, Zed posts, Kim posts.
-probe "$W" --token "$KM_TOK" --count 2 --timeout 15 --ready "$TMP/km.ready" > "$TMP/km.ws" & KM_WS=$!
-probe "$W" --token "$ZED_TOK" --count 1 --timeout 15 --ready "$TMP/zed.ready" > "$TMP/zed.ws" & ZED_WS=$!
+probe "$W" --token="$KM_TOK" --count 2 --timeout 15 --ready "$TMP/km.ready" > "$TMP/km.ws" & KM_WS=$!
+probe "$W" --token="$ZED_TOK" --count 1 --timeout 15 --ready "$TMP/zed.ready" > "$TMP/zed.ws" & ZED_WS=$!
 for _ in $(seq 50); do [ -e "$TMP/km.ready" ] && [ -e "$TMP/zed.ready" ] && break; sleep 0.1; done
 [ -e "$TMP/km.ready" ] && [ -e "$TMP/zed.ready" ] && pass "two devices connected, each got hello and a pong" || fail "two devices connected, each got hello and a pong"
 YAN=$(expect 201 POST /join "" "$(join_body Yan yan@x.test)")
@@ -221,7 +221,7 @@ assert km == [{"type": "join_request", "device_id": yan, "display_name": "Yan", 
 assert zed == [{"type": "new_event", "seq": kseq, "kind": "comment"}], zed
 PY
 pass "Key Master got join_request + Zed's new_event; member Zed got only Kim's new_event, not its own or the join"
-[ "$(probe "$W" --token "$KM_TOK" --count 1 --timeout 12)" = '{"type": "_closed"}' ]   && pass "a socket that stops pinging is closed after the idle timeout" || fail "a socket that stops pinging is closed after the idle timeout"
+[ "$(probe "$W" --token="$KM_TOK" --count 1 --timeout 12)" = '{"type": "_closed"}' ]   && pass "a socket that stops pinging is closed after the idle timeout" || fail "a socket that stops pinging is closed after the idle timeout"
 
 echo "== removal, revocation and key rotation"
 expect 200 POST "/joins/$YAN_DEV/approve" "$KM_TOK" "$(approve_body "$YAN_DEV" Yan)" >/dev/null && pass "Yan approved as a member" || fail "Yan approved as a member"
@@ -229,7 +229,7 @@ expect 403 POST "/members/$KM_MEM/remove" "$YAN_TOK" >/dev/null && pass "member 
 expect 409 POST "/members/$KM_MEM/remove" "$KM_TOK" >/dev/null && pass "Key Master can't remove themselves (409)" || fail "Key Master can't remove themselves (409)"
 expect 404 POST /members/m_nope/remove "$KM_TOK" >/dev/null && pass "unknown member -> 404" || fail "unknown member -> 404"
 
-probe "$W" --token "$ZED_TOK" --count 2 --timeout 15 --ready "$TMP/zed2.ready" > "$TMP/zed2.ws" & ZED_WS=$!
+probe "$W" --token="$ZED_TOK" --count 2 --timeout 15 --ready "$TMP/zed2.ready" > "$TMP/zed2.ws" & ZED_WS=$!
 for _ in $(seq 50); do [ -e "$TMP/zed2.ready" ] && break; sleep 0.1; done
 REM=$(expect 200 POST "/members/$ZED_MEM/remove" "$KM_TOK")
 [ "$(echo "$REM" | j '["revoked_devices"]')" = "['$ZED_DEV']" ] && [ "$(echo "$REM" | j '["rotation_pending"]')" = True ] \
@@ -240,7 +240,7 @@ wait "$ZED_WS" || fail "Zed's socket didn't get removed + close"
 expect 401 GET /events "$ZED_TOK" >/dev/null && pass "removed member's token can't read events" || fail "removed member's token can't read events"
 expect 401 GET /keys "$ZED_TOK" >/dev/null && pass "removed member's token can't fetch keys" || fail "removed member's token can't fetch keys"
 [ "$(expect 200 GET /join/status "$ZED_TOK" | j '["status"]')" = removed ] && pass "/join/status tells Zed's app it was removed" || fail "/join/status tells Zed's app it was removed"
-[ "$(probe "$W" --token "$ZED_TOK" || true)" = "rejected 403" ] && pass "/ws with a removed member's token -> 403" || fail "/ws with a removed member's token -> 403"
+[ "$(probe "$W" --token="$ZED_TOK" || true)" = "rejected 403" ] && pass "/ws with a removed member's token -> 403" || fail "/ws with a removed member's token -> 403"
 expect 409 POST "/members/$ZED_MEM/remove" "$KM_TOK" >/dev/null && pass "removing twice -> 409" || fail "removing twice -> 409"
 [ "$(expect 200 GET /members "$KM_TOK" | python3 -c "import sys,json; print(sorted(m['display_name'] for m in json.load(sys.stdin)['members']))")" = "['Al', 'Kim', 'Yan']" ] \
   && pass "roster no longer lists Zed" || fail "roster no longer lists Zed"
@@ -263,7 +263,7 @@ expect 409 POST /keys/rotate "$KM_TOK" "$(rotate_body 3 "$KM_DEV" "$AL_DEV" "$YA
 expect 422 POST /keys/rotate "$KM_TOK" "$(rotate_body 2 "$KM_DEV" "$AL_DEV")" >/dev/null && pass "leaving an active device out -> 422" || fail "leaving an active device out -> 422"
 expect 422 POST /keys/rotate "$KM_TOK" "$(rotate_body 2 "$KM_DEV" "$AL_DEV" "$YAN_DEV" "$ZED_DEV")" >/dev/null && pass "sealing to the removed device -> 422" || fail "sealing to the removed device -> 422"
 expect 422 POST /keys/rotate "$KM_TOK" "$(rotate_body 2 "$KM_DEV" "$AL_DEV" "$YAN_DEV" "$YAN_DEV")" >/dev/null && pass "two keys for one device -> 422" || fail "two keys for one device -> 422"
-probe "$W" --token "$YAN_TOK" --count 1 --timeout 15 --ready "$TMP/yan.ready" > "$TMP/yan.ws" & YAN_WS=$!
+probe "$W" --token="$YAN_TOK" --count 1 --timeout 15 --ready "$TMP/yan.ready" > "$TMP/yan.ws" & YAN_WS=$!
 for _ in $(seq 50); do [ -e "$TMP/yan.ready" ] && break; sleep 0.1; done
 ROT=$(rotate_body 2 "$KM_DEV" "$AL_DEV" "$YAN_DEV")
 expect 200 POST /keys/rotate "$KM_TOK" "$ROT" >/dev/null && pass "Key Master rotates to v2, sealed to exactly Kim, Al and Yan" || fail "Key Master rotates to v2"
@@ -300,7 +300,7 @@ expect 409 POST "/devices/$AL2_DEV/revoke" "$KM_TOK" >/dev/null && pass "revokin
 expect 200 POST "/joins/$AL2_DEV/approve" "$KM_TOK" "$(v12 "$AL2_DEV" Al keymaster)" >/dev/null && pass "Al's second device approved" || fail "Al's second device approved"
 expect 403 POST "/devices/$AL2_DEV/revoke" "$YAN_TOK" >/dev/null && pass "member can't revoke a device (403)" || fail "member can't revoke a device (403)"
 expect 409 POST "/devices/$KM_DEV/revoke" "$KM_TOK" >/dev/null && pass "Key Master can't revoke the device they're using (409)" || fail "can't revoke own device (409)"
-probe "$W" --token "$AL2_TOK" --count 2 --timeout 15 --ready "$TMP/al2.ready" > "$TMP/al2.ws" & AL2_WS=$!
+probe "$W" --token="$AL2_TOK" --count 2 --timeout 15 --ready "$TMP/al2.ready" > "$TMP/al2.ws" & AL2_WS=$!
 for _ in $(seq 50); do [ -e "$TMP/al2.ready" ] && break; sleep 0.1; done
 expect 200 POST "/devices/$AL2_DEV/revoke" "$KM_TOK" >/dev/null && pass "Key Master revokes Al's second (lost) device" || fail "Key Master revokes Al's second device"
 wait "$AL2_WS" || fail "the lost device's socket didn't get removed + close"
