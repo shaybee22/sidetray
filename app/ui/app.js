@@ -248,7 +248,7 @@ function startMain() {
   $("#km-code").textContent = view.safety_code;
   renderSyncStatus();
   renderDevice();
-  loadFeed();
+  loadFeed().then(markReadIfViewed);
 }
 
 function selectTab(name) {
@@ -259,13 +259,69 @@ function selectTab(name) {
     loadPending();
     pendingTimer = setInterval(loadPending, 10000);
   }
-  if (name === "device") renderDevice();
+  if (name === "device") { renderDevice(); loadSettings(); }
+  if (name === "feed") markReadIfViewed();
 }
 for (const t of $$(".tab")) t.addEventListener("click", () => selectTab(t.dataset.tab));
 
 function renderSyncStatus(text) {
-  $("#sync-status").textContent = text ?? (view.last_sync_at ? `Synced ${when(view.last_sync_at)}` : "Not synced yet");
+  const el = $("#sync-status");
+  if (text == null && view.live) {
+    // Connected to the server's push channel: new posts show up as they're made.
+    const dot = document.createElement("span");
+    dot.className = "live-dot";
+    dot.setAttribute("aria-hidden", "true");
+    el.replaceChildren(dot, "Live");
+    el.title = "Connected: new posts arrive right away";
+    return;
+  }
+  el.textContent = text ?? (view.last_sync_at ? `Synced ${when(view.last_sync_at)}` : "Not synced yet");
 }
+
+// --- unread, notifications, tray ------------------------------------------------------
+
+/** The feed counts as read once it's on screen in a focused window. */
+function feedInView() {
+  return view && view.stage === "active" && !$("#panel-feed").hidden
+    && document.visibilityState === "visible" && document.hasFocus();
+}
+
+async function markReadIfViewed() {
+  if (!feedInView() || !view.unread) return;
+  view.unread = 0;
+  try { await invoke("mark_read"); } catch (e) { console.warn("mark_read", e); }
+}
+
+window.addEventListener("focus", markReadIfViewed);
+document.addEventListener("visibilitychange", markReadIfViewed);
+
+listen("push-status", async (ev) => {
+  if (!view || view.stage !== "active") return;
+  view.live = !!ev.payload;
+  renderSyncStatus();
+});
+
+listen("removed", () => { $("#removed-banner").hidden = false; });
+
+// A notification was clicked: show what it was about.
+listen("open-item", async (ev) => {
+  const t = ev.payload;
+  if (!view || view.stage !== "active") return;
+  if (t.kind === "joins" && view.keymaster) return selectTab("km");
+  selectTab("feed");
+  await loadFeed();
+  if (t.kind === "post") {
+    const el = document.querySelector(`#feed .post[data-id="${CSS.escape(t.post_id)}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("highlight");
+      setTimeout(() => el.classList.remove("highlight"), 2500);
+    }
+  } else {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+  markReadIfViewed();
+});
 
 $("#sync-btn").addEventListener("click", async () => {
   await busy($("#sync-btn"), async () => {
@@ -292,6 +348,7 @@ listen("synced", async (ev) => {
   badge.hidden = !r.pending_joins;
   if (!$("#panel-feed").hidden && r.new_events) loadFeed();
   if (!$("#panel-km").hidden) loadPending();
+  markReadIfViewed();
 });
 
 listen("sync-error", (ev) => {
@@ -657,5 +714,32 @@ function renderDevice() {
     return [dt, dd];
   }));
 }
+
+// --- settings ------------------------------------------------------------------------------
+
+async function loadSettings() {
+  try {
+    const s = await invoke("get_settings");
+    $("#set-autostart").checked = s.start_with_os;
+    hideError($("#set-err"));
+  } catch (e) {
+    showError($("#set-err"), `Couldn't read settings: ${e}`);
+  }
+}
+
+$("#set-autostart").addEventListener("change", async (ev) => {
+  const box = ev.target;
+  box.disabled = true;
+  try {
+    const s = await invoke("set_start_with_os", { enabled: box.checked });
+    box.checked = s.start_with_os;
+    hideError($("#set-err"));
+  } catch (e) {
+    box.checked = !box.checked;
+    showError($("#set-err"), `Couldn't change that: ${e}`);
+  } finally {
+    box.disabled = false;
+  }
+});
 
 boot();

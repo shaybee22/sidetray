@@ -1,27 +1,37 @@
 // No console window in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Side Tray desktop client (SPEC.md Phase 4): first-run wizard, join and
-//! Key Master screens, the feed, a 30-second sync loop, photo upload.
+//! Side Tray desktop client (SPEC.md Phases 4-5): first-run wizard, join and
+//! Key Master screens, the feed, photo upload; sync on WebSocket pushes, a
+//! tray icon with an unread badge, and native notifications.
 
 mod account;
+mod alerts;
 mod api;
 mod db;
 mod feed;
 mod photo;
+mod push;
 mod secrets;
 mod state;
+mod tray;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Serialize;
 use sidetray_crypto as crypto;
 use state::App;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt as _;
 
-/// Sync interval until the WebSocket arrives (Phase 5).
+/// Sync interval while the push socket is down.
 const POLL_EVERY: Duration = Duration::from_secs(30);
+/// While it's up, pushes trigger syncs; this is only a safety net.
+const POLL_WHEN_LIVE: Duration = Duration::from_secs(15 * 60);
+/// Passed by the "start with Windows" entry: start hidden in the tray.
+const MINIMIZED_ARG: &str = "--minimized";
 
 pub fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -51,6 +61,9 @@ struct AppView {
     last_seq: i64,
     last_sync_at: Option<i64>,
     rejected: i64,
+    unread: i64,
+    /// The push socket is connected.
+    live: bool,
 }
 
 #[tauri::command]
@@ -60,6 +73,8 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
     let (last_seq, last_sync_at, rejected) = db::sync_info(&conn).map_err(err)?;
     let trusted = db::anchors(&conn).map_err(err)?.into_iter().map(|(_, name, _)| name).collect();
     let key_versions = secrets::key_versions(&conn).map_err(err)?;
+    let unread = db::unread(&conn).map_err(err)?;
+    let live = app.push_connected.load(Ordering::SeqCst);
     Ok(match id {
         None => AppView {
             stage: "setup".into(),
@@ -75,6 +90,8 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             last_seq,
             last_sync_at,
             rejected,
+            unread,
+            live,
         },
         Some(id) => AppView {
             stage: id.status.clone(),
@@ -90,6 +107,8 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             last_seq,
             last_sync_at,
             rejected,
+            unread,
+            live,
         },
     })
 }
@@ -137,6 +156,7 @@ async fn register(
     .await
     .map_err(err)?;
     app.wake.notify_one();
+    app.push_wake.notify_one();
     Ok(code)
 }
 
@@ -149,6 +169,7 @@ async fn join_progress(app: State<'_, Arc<App>>) -> Res<account::JoinProgress> {
 async fn confirm_approval(app: State<'_, Arc<App>>, code: String) -> Res<()> {
     account::confirm_approval(&app, &code).await.map_err(err)?;
     app.wake.notify_one();
+    app.push_wake.notify_one();
     Ok(())
 }
 
@@ -249,6 +270,33 @@ async fn delete_post(app: State<'_, Arc<App>>, post_id: String) -> Res<()> {
     feed::delete_post(&app, &post_id).await.map_err(err)
 }
 
+/// The feed was looked at: clear the unread badge.
+#[tauri::command]
+fn mark_read(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<()> {
+    db::clear_unread(&app.db()).map_err(err)?;
+    tray::refresh(&handle, &app);
+    Ok(())
+}
+
+// --- settings ----------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct Settings {
+    start_with_os: bool,
+}
+
+#[tauri::command]
+fn get_settings(handle: AppHandle) -> Res<Settings> {
+    Ok(Settings { start_with_os: handle.autolaunch().is_enabled().map_err(|e| e.to_string())? })
+}
+
+#[tauri::command]
+fn set_start_with_os(handle: AppHandle, enabled: bool) -> Res<Settings> {
+    let launcher = handle.autolaunch();
+    if enabled { launcher.enable() } else { launcher.disable() }.map_err(|e| e.to_string())?;
+    get_settings(handle)
+}
+
 // --- photos for the webview ------------------------------------------------------------
 
 /// `media://localhost/<id>.webp` (`http://media.localhost/...` on Windows):
@@ -287,8 +335,9 @@ fn spawn_sync_loop(handle: AppHandle, app: Arc<App>) {
                     }
                 }
             }
+            let every = if app.push_connected.load(Ordering::SeqCst) { POLL_WHEN_LIVE } else { POLL_EVERY };
             tokio::select! {
-                _ = tokio::time::sleep(POLL_EVERY) => {}
+                _ = tokio::time::sleep(every) => {}
                 _ = app.wake.notified() => {}
             }
         }
@@ -296,7 +345,29 @@ fn spawn_sync_loop(handle: AppHandle, app: Arc<App>) {
 }
 
 fn main() {
-    tauri::Builder::default()
+    // SIDETRAY_DATA_DIR lets several copies run side by side (testing); otherwise
+    // a second launch just brings the running app forward.
+    let side_by_side = std::env::var_os("SIDETRAY_DATA_DIR").is_some();
+    let mut builder = tauri::Builder::default();
+    if !side_by_side {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|handle, _args, _cwd| tray::show_main(handle)));
+    }
+    #[cfg(not(windows))]
+    {
+        builder = builder.plugin(tauri_plugin_notification::init());
+    }
+    builder
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![MINIMIZED_ARG]),
+        ))
+        // Closing the window keeps the app running in the tray; Quit is in the tray menu.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .register_uri_scheme_protocol("media", |ctx, req| {
             let app = ctx.app_handle().state::<Arc<App>>();
             serve_media(&app, req.uri().path())
@@ -307,9 +378,21 @@ fn main() {
                 Some(d) => d.into(),
                 None => tauri_app.path().app_data_dir()?,
             };
-            let app = Arc::new(App::open(dir)?);
+            let app = Arc::new(App::open(dir.clone())?);
+            let handle = tauri_app.handle().clone();
+            let _ = app.handle.set(handle.clone());
             tauri_app.manage(app.clone());
-            spawn_sync_loop(tauri_app.handle().clone(), app);
+            #[cfg(windows)]
+            if let Err(e) = alerts::register_app_id(&handle, &dir) {
+                eprintln!("registering for notifications: {e:#}");
+            }
+            tray::create(&handle)?;
+            tray::refresh(&handle, &app);
+            if !std::env::args().any(|a| a == MINIMIZED_ARG) {
+                tray::show_main(&handle);
+            }
+            spawn_sync_loop(handle.clone(), app.clone());
+            push::spawn(handle, app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -331,7 +414,16 @@ fn main() {
             add_comment,
             set_reaction,
             delete_post,
+            mark_read,
+            get_settings,
+            set_start_with_os,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Side Tray");
+        .build(tauri::generate_context!())
+        .expect("error while starting Side Tray")
+        .run(|_handle, event| {
+            // Hidden windows don't count as open; only the tray's Quit (an explicit exit code) ends the app.
+            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }

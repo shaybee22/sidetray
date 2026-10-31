@@ -2,14 +2,17 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: Phase 4 (desktop client feed).** A Tauri 2 desktop app (`app/`) has a
-first-run wizard (join, or found the group with the setup token), the safety-code
-join flow, a Key Master screen, and a feed with posts, photos, comments and
-reactions. It keeps a local SQLite archive and syncs every 30 seconds. Devices
-join with their public keys, compare safety codes with a Key Master by phone, and
-receive the group key sealed to them and signed by the approving Key Master. The
-dev CLI (`cli/`) speaks the same formats. Tray and notifications, the WebSocket,
-pruning, removal and rate limits come in later phases.
+**Status: Phase 5 (tray, notifications, real-time push).** A Tauri 2 desktop app
+(`app/`) has a first-run wizard (join, or found the group with the setup token),
+the safety-code join flow, a Key Master screen, and a feed with posts, photos,
+comments and reactions. It keeps a local SQLite archive and syncs the moment the
+relay pushes a change over a WebSocket (polling every 30 seconds only while the
+socket is down). It lives in the system tray with an unread badge and shows
+native notifications. Devices join with their public keys, compare safety codes
+with a Key Master by phone, and receive the group key sealed to them and signed by
+the approving Key Master. The dev CLI (`cli/`) speaks the same formats. Pruning,
+removal, key rotation and rate limits come in Phase 6; direct messages are
+specified as Phase 5b in SPEC.md.
 
 ## Layout
 
@@ -18,6 +21,7 @@ compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS)
 Caddyfile             TLS via Caddy's internal CA (no domain yet)
 server/app/main.py    the relay
 scripts/smoke-test.sh live TLS checks + full API run on a throwaway container
+scripts/ws_probe.py   stdlib-only WebSocket client the smoke test uses for /ws
 crypto/               Rust crate: keys, sealing, encryption, signatures, safety codes
 cli/                  Rust dev CLI (`sidetray`): init-group, join, approve, post, pull
 app/src-tauri/        desktop app backend (Rust, Tauri 2)
@@ -74,6 +78,7 @@ base64. The server never decrypts.
 | POST | /ack | member | `{seq}` (only moves forward) | `{last_seq}` |
 | POST | /media | member | raw bytes, max 10 MB | `{id, size_bytes}` |
 | GET | /media/{id} | member | | the bytes |
+| WS | /ws | member | `Authorization: Bearer` on the upgrade request | push messages, below |
 
 - **Creating the group:** on a server with no group, `POST /join` with the
   operator's `SIDETRAY_SETUP_TOKEN` creates it, and that device becomes the active
@@ -95,6 +100,26 @@ base64. The server never decrypts.
   `protocol::anchors_message`. Promotion needs a `keymaster` certificate from the
   calling Key Master for each of the member's devices. Demotion waits for
   revocation (Phase 6).
+
+## Push channel (Phase 5)
+
+`/api/v1/ws` is a WebSocket for "something changed" hints; content still only
+comes from `GET /events`. A missing, unknown, pending or revoked token gets HTTP
+403 instead of a socket. Messages are JSON text frames:
+
+| Message | Sent to | Meaning |
+| --- | --- | --- |
+| `{"type":"hello","device_id"}` | the new socket | connected |
+| `{"type":"new_event","seq","kind"}` | every active device except the author's | an event was appended: sync |
+| `{"type":"join_request","device_id","display_name","existing_member"}` | Key Masters' devices | someone is waiting for approval |
+| `{"type":"key_rotated","key_version"}` | every active device | fetch `GET /keys` (sent by key rotation, Phase 6) |
+| `{"type":"removed"}` | the revoked device; then the socket closes | sent by member removal (Phase 6), and by the socket itself if it notices the device is no longer active |
+| `{"type":"pong"}` | the pinging socket | reply to `{"type":"ping"}` |
+
+Clients send `{"type":"ping"}` every 25 seconds; a socket silent for 75 seconds
+(`SIDETRAY_WS_IDLE_SECONDS`) is closed. Up to 4 sockets per device. The hub is in
+memory, so the relay runs as a single uvicorn worker (it already did). Caddy
+proxies the upgrade with no extra configuration.
 
 ## Roster trust
 
@@ -123,7 +148,7 @@ the UI is plain files in `app/ui/`, embedded at build time.
 ```sh
 cd app/src-tauri
 cargo build --release          # target/release/sidetray-app(.exe)
-cargo test                     # photo stripping, event checks, key storage
+cargo test                     # photo stripping, event checks, notices, key storage, badge
 ```
 
 Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
@@ -140,11 +165,36 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
   code you heard, and the app approves only if it matches the keys the server
   relayed. It then shows your own code to read back. You can also deny.
 - **Feed.** Newest first: posts, photos, comments, one reaction per person per
-  post, and delete for your own posts. It syncs every 30 seconds (the WebSocket
-  comes in Phase 5) and after every action. Sync applies the same rules as
+  post, and delete for your own posts. It syncs after every action and whenever
+  the push socket says something changed. While the socket is down it polls
+  every 30 seconds and reconnects with backoff (1 s doubling to 60 s, with
+  jitter); while it's up, a 15-minute poll is only a safety net. The header shows
+  **Live** while connected. Sync applies the same rules as
   `pull`: an event counts only if its author has a member certificate chaining
   to a pinned Key Master, the signature verifies and it decrypts. Anything else
   is skipped and counted under *This device*.
+- **Tray.** Closing the window hides it; the app keeps running in the system
+  tray. Left-click the icon (or its *Open Side Tray* menu item) to bring it back;
+  *Quit* is the only way to exit. Launching the app again focuses the running
+  copy. The icon gets a red badge with the number of new posts and comments by
+  others (plus waiting join requests for Key Masters), "9+" past nine, and the
+  tooltip spells it out. The count clears when the feed is on screen in a
+  focused window. A new device's first sync (the backlog) doesn't count.
+- **Notifications.** Native toasts for posts by others, comments by others on
+  your posts, and, for Key Masters, new join requests. More than three at once
+  become one summary. Nothing pops up while the window is in front. Clicking a
+  toast opens the app scrolled to that post (or to the Key Master tab). On
+  Windows the app registers its AppUserModelID (`org.sidetray.app`) under
+  `HKCU\Software\Classes\AppUserModelId` at startup, since toasts need one and
+  there's no installer yet. Clicks are handled while the app is running and the
+  toast is on screen; clicking an old toast in the notification centre isn't
+  wired up yet (needs the installer's COM activator, Phase 7). On macOS and
+  Linux toasts go through `tauri-plugin-notification`, which can't report
+  clicks.
+- **Start with Windows.** *This device → Settings* has a toggle, off by default.
+  When on, the app starts at sign-in hidden in the tray (`--minimized`), via
+  `tauri-plugin-autostart` (a `HKCU\...\Run` entry on Windows, a launch agent
+  on macOS, an autostart entry on Linux).
 - **Photos.** Resized so the longest side is 2048 px and saved as WebP at
   quality 80, plus a 400 px thumbnail. The EXIF orientation is applied, then all
   metadata (GPS included) is dropped, because the output is encoded from raw
@@ -154,12 +204,13 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
   checked before decrypting.
 - **HTTPS.** `app/src-tauri/pinned-roots.pem` (Caddy's internal root for the
   test relay) is compiled in. When it's non-empty, the app trusts exactly those
-  roots and no others. The wizard's *Advanced* box can pin a different root PEM
+  roots and no others, for both HTTPS calls and the `wss://` push socket. The wizard's *Advanced* box can pin a different root PEM
   for a server. If the file is emptied, the public web roots are used, for when
   the server gets a real domain. Verification is never off. Plain `http://` is
   accepted only for `127.0.0.1`/`localhost`, for a relay in development.
 - **Local data** lives in the app data dir (`%APPDATA%\org.sidetray.app` on
-  Windows; `SIDETRAY_DATA_DIR` overrides it). `sidetray.db` holds the spec's
+  Windows; `SIDETRAY_DATA_DIR` overrides it, and lets test copies run side by
+  side without the single-instance check). `sidetray.db` holds the spec's
   client tables plus `anchors` and `member_devices`, and `media/` holds the
   decrypted photos. Posts are plaintext on disk (SPEC: rely on OS disk
   encryption). The device's private keys, its token and a local wrapping key

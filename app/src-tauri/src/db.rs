@@ -113,7 +113,19 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(SCHEMA).context("creating tables")?;
+    add_column(&conn, "sync_state", "unread", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(conn)
+}
+
+/// Phase 5+ columns, added in place so existing archives keep working.
+fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let has: bool = conn
+        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+        .exists(params![column])?;
+    if !has {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -208,7 +220,7 @@ pub fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM identity; DELETE FROM group_keys; DELETE FROM secrets; DELETE FROM anchors;
          DELETE FROM members; DELETE FROM member_devices; DELETE FROM posts; DELETE FROM comments;
-         DELETE FROM reactions; DELETE FROM media; UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0;",
+         DELETE FROM reactions; DELETE FROM media; UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0;",
     )?;
     Ok(())
 }
@@ -249,4 +261,43 @@ pub fn sync_info(conn: &Connection) -> Result<(i64, Option<i64>, i64)> {
     Ok(conn.query_row("SELECT last_seq, last_sync_at, rejected FROM sync_state WHERE id = 1", [], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
     })?)
+}
+
+/// Posts and comments by others that arrived since the feed was last looked at.
+pub fn unread(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT unread FROM sync_state WHERE id = 1", [], |r| r.get(0))?)
+}
+
+pub fn add_unread(conn: &Connection, n: i64) -> Result<()> {
+    conn.execute("UPDATE sync_state SET unread = unread + ?1 WHERE id = 1", params![n])?;
+    Ok(())
+}
+
+pub fn clear_unread(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE sync_state SET unread = 0 WHERE id = 1", [])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unread_counts_and_survives_reopening() {
+        let dir = std::env::temp_dir().join(format!("sidetray-db-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = open(&path).unwrap();
+            add_unread(&conn, 3).unwrap();
+            add_unread(&conn, 2).unwrap();
+        }
+        let conn = open(&path).unwrap(); // the migration runs again harmlessly
+        assert_eq!(unread(&conn).unwrap(), 5);
+        clear_unread(&conn).unwrap();
+        assert_eq!(unread(&conn).unwrap(), 0);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "sidetray-app"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.90"
 description = "Side Tray desktop client"
@@ -22,7 +22,7 @@ tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
 sidetray-crypto = { path = "../../crypto" }
-tauri = { version = "2.12", features = [] }
+tauri = { version = "2.12", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -36,13 +36,30 @@ tokio = { version = "1", features = ["sync", "time", "macros"] }
 # Photos: decode common formats, apply EXIF orientation, resize; libwebp for lossy WebP.
 image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 webp = { version = "0.3", default-features = false }
+# Push channel (/ws). Same rustls as reqwest, with a config built from the same pinned roots.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "__rustls-tls"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.15.1"
+webpki-roots = "1.0.11"
+# A second launch focuses the running app (it may be hidden in the tray).
+tauri-plugin-single-instance = "2.5.5"
+# "Start with Windows" (login item on macOS, autostart entry on Linux).
+tauri-plugin-autostart = "2.7.0"
 
 # Device secrets go to the OS keychain where there's a native one; elsewhere
 # they stay in the local database (SPEC.md: "where available").
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3.6", features = ["windows-native"] }
+# Toasts with a click handler, under our own AppUserModelID (registered in HKCU).
+tauri-winrt-notification = "0.8.1"
+winreg = "0.56.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", features = ["apple-native"] }
+
+# Elsewhere notifications go through the plugin (no click handler on desktop).
+[target.'cfg(not(windows))'.dependencies]
+tauri-plugin-notification = "2.8.0"
 
 # Image decoding and resizing are painfully slow unoptimised, even in debug builds.
 [profile.dev.package."*"]

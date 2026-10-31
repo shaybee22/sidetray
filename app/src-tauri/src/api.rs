@@ -54,6 +54,43 @@ fn roots(ca_pem: Option<&str>) -> Result<Vec<reqwest::Certificate>> {
     Ok(certs)
 }
 
+/// rustls config for the push socket, trusting exactly what `Api` trusts:
+/// the user's root, else the pinned roots, else the public web roots.
+pub fn tls_config(ca_pem: Option<&str>) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    use rustls_pki_types::{pem::PemObject, CertificateDer};
+    let pem = ca_pem.filter(|p| !p.trim().is_empty()).unwrap_or(PINNED_ROOTS);
+    let mut store = rustls::RootCertStore::empty();
+    if pem.trim().is_empty() {
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    } else {
+        for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+            store.add(cert.context("reading the pinned root certificate")?).context("adding the pinned root certificate")?;
+        }
+        if store.is_empty() {
+            bail!("the pinned root certificate file has no certificates in it");
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("setting up TLS")?
+        .with_root_certificates(store)
+        .with_no_client_auth();
+    Ok(std::sync::Arc::new(config))
+}
+
+/// `https://host` -> `wss://host/api/v1/ws` (and http -> ws for a local relay).
+pub fn ws_url(server: &str) -> Result<String> {
+    let s = server.trim_end_matches('/');
+    let rest = if let Some(r) = s.strip_prefix("https://") {
+        format!("wss://{r}")
+    } else if let Some(r) = s.strip_prefix("http://") {
+        format!("ws://{r}")
+    } else {
+        bail!("unexpected server address {s}");
+    };
+    Ok(format!("{rest}/api/v1/ws"))
+}
+
 impl Api {
     pub fn new(server: &str, ca_pem: Option<&str>, token: Option<&str>) -> Result<Self> {
         let mut builder = Client::builder()
@@ -332,5 +369,13 @@ mod tests {
     fn pinned_roots_parse() {
         assert!(!roots(None).unwrap().is_empty());
         assert!(roots(Some("not a pem")).is_err());
+        assert!(tls_config(None).is_ok());
+        assert!(tls_config(Some("not a pem")).is_err());
+    }
+
+    #[test]
+    fn socket_addresses() {
+        assert_eq!(ws_url("https://10.1.1.188").unwrap(), "wss://10.1.1.188/api/v1/ws");
+        assert_eq!(ws_url("http://127.0.0.1:8000").unwrap(), "ws://127.0.0.1:8000/api/v1/ws");
     }
 }

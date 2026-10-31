@@ -6,20 +6,31 @@ use crate::photo::Processed;
 use crate::secrets::{self, Secrets};
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 pub struct App {
     pub media_dir: PathBuf,
+    /// Set once Tauri is up; used for notifications and the tray from background tasks.
+    pub handle: OnceLock<tauri::AppHandle>,
     db: Mutex<Connection>,
     secrets: Mutex<Option<Arc<Secrets>>>,
     /// Photos picked in the composer, already resized and encoded, waiting for "Post".
     pub staged: Mutex<HashMap<String, Processed>>,
     /// One sync at a time.
     pub sync_lock: tokio::sync::Mutex<()>,
-    /// Wakes the background sync loop early (after joining, or "Sync now").
+    /// Wakes the background sync loop early (after joining, a push, or "Sync now").
     pub wake: tokio::sync::Notify,
+    /// Wakes the push loop (the device just became active).
+    pub push_wake: tokio::sync::Notify,
+    /// The /ws socket is up; the sync loop then only polls as a slow safety net.
+    pub push_connected: AtomicBool,
+    /// Key Master: join requests waiting, for the tray tooltip.
+    pub pending_joins: AtomicUsize,
+    /// Join requests already notified about (device ids), so each pops up once per run.
+    pub seen_pending: Mutex<HashSet<String>>,
 }
 
 impl App {
@@ -30,11 +41,16 @@ impl App {
         let conn = db::open(&data_dir.join("sidetray.db"))?;
         Ok(App {
             media_dir,
+            handle: OnceLock::new(),
             db: Mutex::new(conn),
             secrets: Mutex::new(None),
             staged: Mutex::new(HashMap::new()),
             sync_lock: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
+            push_wake: tokio::sync::Notify::new(),
+            push_connected: AtomicBool::new(false),
+            pending_joins: AtomicUsize::new(0),
+            seen_pending: Mutex::new(HashSet::new()),
         })
     }
 

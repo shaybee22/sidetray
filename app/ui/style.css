@@ -204,3 +204,8 @@ button.ghost.danger:hover { border-color: var(--danger); }
   .tabs { order: 3; flex-basis: 100%; }
   .card { padding: 16px; }
 }
+
+/* Phase 5: live indicator, the post a notification pointed at, removal banner */
+.live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-right: 5px; vertical-align: 1px; }
+.post.highlight { box-shadow: 0 0 0 2px var(--accent), var(--shadow); transition: box-shadow .4s; }
+.banner { max-width: 648px; width: calc(100% - 32px); box-sizing: border-box; margin: 12px auto 0; padding: 10px 14px; border-radius: var(--radius); background: var(--danger-soft); }

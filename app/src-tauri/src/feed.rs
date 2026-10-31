@@ -76,6 +76,26 @@ pub struct SyncReport {
     pub rejected: usize,
     pub pending_joins: usize,
     pub last_seq: i64,
+    /// This sync started from nothing (a new device catching up on the backlog).
+    pub initial: bool,
+    /// What arrived, for the unread count and notifications.
+    #[serde(skip)]
+    pub notices: Vec<Notice>,
+    /// Key Master: the pending join requests, as (device id, display name).
+    #[serde(skip)]
+    pub pending: Vec<(String, String)>,
+}
+
+/// A new post or comment by someone else.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notice {
+    pub post_id: String,
+    pub author: String,
+    /// The post or comment text, or a stand-in for a photo-only post.
+    pub text: String,
+    pub comment: bool,
+    /// Worth a notification: any post by someone else, or a comment on one of my posts.
+    pub notify: bool,
 }
 
 pub async fn sync_once(app: &App) -> Result<SyncReport> {
@@ -86,7 +106,7 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
     let authors = account::refresh_roster(app, &id, &api).await?;
     // The roster refresh may have recorded a promotion.
     let id = app.require_active()?;
-    let mut report = SyncReport::default();
+    let mut report = SyncReport { initial: db::last_seq(&app.db())? == 0, ..Default::default() };
     loop {
         let after = db::last_seq(&app.db())?;
         let page: EventPage = api.get(&format!("/events?after={after}")).await?;
@@ -97,7 +117,11 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
             for e in &page.events {
                 report.new_events += 1;
                 match apply_event(&tx, &id, &s, &authors, e) {
-                    Ok(counts) => report.new_from_others += counts as usize,
+                    Ok(Some(notice)) => {
+                        report.new_from_others += 1;
+                        report.notices.push(notice);
+                    }
+                    Ok(None) => {}
                     Err(err) => {
                         rejected += 1;
                         eprintln!("event #{} rejected: {err:#}", e.seq);
@@ -119,23 +143,48 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
     if id.is_keymaster() {
         if let Ok(list) = api.get::<PendingList>("/joins/pending").await {
             report.pending_joins = list.pending.len();
+            report.pending = list.pending.into_iter().map(|p| (p.device_id, p.display_name)).collect();
         }
     }
     let conn = app.db();
+    // A new device's first sync is the backlog, not news.
+    if !report.initial {
+        db::add_unread(&conn, report.notices.len() as i64)?;
+    }
     db::mark_synced(&conn)?;
     report.last_seq = db::last_seq(&conn)?;
+    drop(conn);
+    crate::alerts::after_sync(app, &report);
     Ok(report)
 }
 
-/// Verify, decrypt and store one event. Returns whether it's a post or comment
-/// by someone else (for notifications later).
+/// One line for a notification: whitespace collapsed, cut at 140 characters.
+fn snippet(text: &str, photos: usize) -> String {
+    let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.is_empty() {
+        return match photos {
+            0 => String::new(),
+            1 => "shared a photo".into(),
+            n => format!("shared {n} photos"),
+        };
+    }
+    const MAX: usize = 140;
+    if t.chars().count() <= MAX {
+        t
+    } else {
+        format!("{}…", t.chars().take(MAX).collect::<String>().trim_end())
+    }
+}
+
+/// Verify, decrypt and store one event. Returns a notice if it's a new post
+/// or comment by someone else.
 fn apply_event(
     conn: &Connection,
     id: &Identity,
     s: &Secrets,
     authors: &BTreeMap<String, VerifiedDevice>,
     e: &Event,
-) -> Result<bool> {
+) -> Result<Option<Notice>> {
     let author = authors
         .get(&e.author_device_id)
         .with_context(|| format!("author device {} has no valid member certificate", e.author_device_id))?;
@@ -171,7 +220,13 @@ fn apply_event(
                     params![p.full, event_id, i as i64, e.key_version, p.width, p.height, &fd[..], p.thumb, &td[..]],
                 )?;
             }
-            Ok(inserted > 0 && by_other)
+            Ok((inserted > 0 && by_other).then(|| Notice {
+                post_id: event_id.clone(),
+                author: author.display_name.clone(),
+                text: snippet(&body.text, body.photos.len()),
+                comment: false,
+                notify: true,
+            }))
         }
         "comment" => {
             let b: RefBody = serde_json::from_slice(&plain).context("bad comment payload")?;
@@ -182,7 +237,19 @@ fn apply_event(
                 "INSERT OR IGNORE INTO comments (id, seq, post_id, author_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![event_id, e.seq, b.post, member, b.text, e.created_at],
             )?;
-            Ok(inserted > 0 && by_other)
+            if inserted == 0 || !by_other {
+                return Ok(None);
+            }
+            let post_author: Option<String> = conn
+                .query_row("SELECT author_id FROM posts WHERE id = ?1 AND deleted = 0", params![b.post], |r| r.get(0))
+                .optional()?;
+            Ok(Some(Notice {
+                post_id: b.post.clone(),
+                author: author.display_name.clone(),
+                text: snippet(&b.text, 0),
+                comment: true,
+                notify: post_author.as_deref() == Some(id.member_id.as_str()),
+            }))
         }
         "reaction" => {
             let b: RefBody = serde_json::from_slice(&plain).context("bad reaction payload")?;
@@ -198,7 +265,7 @@ fn apply_event(
             } else {
                 bail!("not an emoji reaction");
             }
-            Ok(false)
+            Ok(None)
         }
         "edit" => {
             let b: RefBody = serde_json::from_slice(&plain).context("bad edit payload")?;
@@ -209,7 +276,7 @@ fn apply_event(
                 "UPDATE posts SET body = ?1, edited_at = ?2 WHERE id = ?3 AND author_id = ?4 AND deleted = 0",
                 params![b.text, e.created_at, b.post, member],
             )?;
-            Ok(false)
+            Ok(None)
         }
         "delete" => {
             let b: RefBody = serde_json::from_slice(&plain).context("bad delete payload")?;
@@ -222,7 +289,7 @@ fn apply_event(
                 conn.execute("DELETE FROM reactions WHERE post_id = ?1", params![b.post])?;
                 // The files are removed by the next media pass (rows with no live post).
             }
-            Ok(false)
+            Ok(None)
         }
         other => bail!("unknown event kind {other}"),
     }
@@ -669,7 +736,7 @@ mod tests {
             };
             (e, crypto::event_id(&ct))
         }
-        fn apply(&self, e: &Event) -> Result<bool> {
+        fn apply(&self, e: &Event) -> Result<Option<Notice>> {
             apply_event(&self.conn, &self.id, &self.s, &self.authors, e)
         }
     }
@@ -678,11 +745,14 @@ mod tests {
     fn cli_style_post_comment_reaction_edit_delete() {
         let mut f = fixture();
         let (post, pid) = f.event("post", serde_json::json!({ "text": "hello" }));
-        assert!(f.apply(&post).unwrap());
+        let n = f.apply(&post).unwrap().unwrap();
+        assert_eq!((n.author.as_str(), n.text.as_str(), n.comment, n.notify), ("Ana", "hello", false, true));
         // Replaying the same event is harmless.
-        assert!(!f.apply(&post).unwrap());
+        assert!(f.apply(&post).unwrap().is_none());
         let (c, _) = f.event("comment", serde_json::json!({ "post": pid, "text": "first!" }));
-        assert!(f.apply(&c).unwrap());
+        // A comment on someone else's post counts as unread but doesn't notify.
+        let n = f.apply(&c).unwrap().unwrap();
+        assert!(n.comment && !n.notify && n.post_id == pid);
         let (r1, _) = f.event("reaction", serde_json::json!({ "post": pid, "emoji": "👍" }));
         let (r2, _) = f.event("reaction", serde_json::json!({ "post": pid, "emoji": "❤️" }));
         f.apply(&r2).unwrap();
@@ -748,6 +818,22 @@ mod tests {
         f.apply(&post).unwrap();
         let n: i64 = f.conn.query_row("SELECT COUNT(*) FROM media", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn comments_on_my_posts_notify() {
+        let mut f = fixture();
+        f.conn
+            .execute("INSERT INTO posts (id, seq, author_id, author_device_id, body, created_at) VALUES ('p_me', 0, 'm_me', 'd_me', 'mine', 1)", [])
+            .unwrap();
+        let (c, _) = f.event("comment", serde_json::json!({ "post": "p_me", "text": "  nice\n photo  " }));
+        let n = f.apply(&c).unwrap().unwrap();
+        assert_eq!(n, Notice { post_id: "p_me".into(), author: "Ana".into(), text: "nice photo".into(), comment: true, notify: true });
+        let d = B64.encode([7u8; 32]);
+        let photo = serde_json::json!({ "full": "f1", "full_digest": d, "thumb": "t1", "thumb_digest": d, "width": 1, "height": 1 });
+        let (p, _) = f.event("post", serde_json::json!({ "text": "", "photos": [photo] }));
+        assert_eq!(f.apply(&p).unwrap().unwrap().text, "shared a photo");
+        assert_eq!(snippet(&"x".repeat(200), 0).chars().count(), 141);
     }
 
     #[test]

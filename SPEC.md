@@ -18,7 +18,8 @@ Side Tray is a private, invite-only feed for one group of friends and family: ev
 
 - Multiple groups (schema carries `group_id` so this is a later feature, not a rewrite)
 - Facebook cross-posting browser extension (phase 2)
-- Native phone apps (PWA later), video, DMs, search beyond the local archive
+- Native phone apps (PWA later), video, search beyond the local archive
+- Direct messages come right after the MVP feed (Phase 5b below)
 
 ## Architecture
 
@@ -109,7 +110,7 @@ The feed is an append-only log with a sequence number; each device pulls everyth
 1. On startup, and on every WebSocket `new_event` push, the client calls `GET /events?after=<last_seq>`.
 2. Client decrypts, verifies the author signature, writes to local SQLite, downloads any referenced media.
 3. Client calls `POST /ack` with the highest seq it stored.
-4. Fallback poll every 15 minutes in case the socket drops.
+4. Fallback poll every 30 seconds while the socket is down (it reconnects with backoff), and every 15 minutes as a safety net while it's up.
 
 **Edits and deletes** are new events (`kind: edit` / `delete`) pointing at the original post id, so the log never changes in place.
 
@@ -165,8 +166,47 @@ Each phase ends with something you can run and poke at; hand them to CC one at a
    - Sealed boxes are anonymous, so each sealed group-key blob must be signed with the approving Key Master's Ed25519 key. The new device verifies that signature against a Key Master's signing key before it trusts the unsealed group key.
 4. **Desktop client feed**: Tauri app, first-run wizard, local SQLite, sync loop, post/comment/react, photo resize + upload. Done when two devices see each other's posts.
 5. **Tray and notifications**: minimize to tray, unread badge, native notifications, start with OS (optional toggle).
+   - 5b. **Direct messages**: end-to-end encrypted one-to-one messages; see the next section.
 6. **Pruning and removal**: hourly prune job, member removal, key rotation. Done when a removed device stops receiving and old events disappear from the server.
 7. **Release**: GitHub Actions builds Windows (.msi), macOS (.dmg), Linux (.AppImage / .deb); install page with screenshots.
+
+## Phase 5b: Direct messages
+
+Private one-to-one conversations (text and photos) between two members, relayed by the same server. Not encrypted with the group key: only the two people's devices can read them, so other members, Key Masters and the server can't.
+
+**Encryption**
+
+- Each message gets a fresh 32-byte message key. The text and any photos are encrypted with it (XChaCha20-Poly1305, as for posts).
+- The message key is sealed (`crypto_box_seal`) separately to every active device of the recipient **and** every other active device of the sender, so the sender's laptop sees what they sent from their desktop. Device public keys come from the verified roster only (member certificates chaining to a pinned Key Master), never from the server's word.
+- The sender signs the message with their device's Ed25519 key, over: group, conversation id, sender device, the list of recipient device ids, the ciphertext and each sealed key. Recipients check the signature and that they're on the list before trusting it.
+- A device that joins later (a new laptop) doesn't get earlier messages: they were sealed to the devices that existed then. Archive sharing between a person's own devices can come later.
+- Removed members' devices are revoked and drop out of the roster, so nothing new is sealed to them.
+
+**What the server sees**: who messages whom and when, message sizes, and which devices each message is for. Not the content.
+
+**Server**
+
+| Table | Key columns | Notes |
+| --- | --- | --- |
+| dm_messages | seq, group_id, conversation_id, sender_device_id, ciphertext, signature, media_ids, created_at | `conversation_id` is a hash of the two member ids, so both sides compute the same one |
+| dm_keys | message_seq, device_id, sealed_key | One row per device the message is for |
+| dm_acks | device_id, last_dm_seq | How far each device has synced its messages |
+
+- `POST /dms` with `{conversation_id, recipient_member_id, ciphertext, signature, media_ids, sealed_keys: [{device_id, sealed_key}]}`. The server checks that the sealed keys cover exactly the active devices of both people (minus the sending device), so a sender can't quietly leave a device out or add an outsider.
+- `GET /dms?after=<seq>` returns only messages that have a `dm_keys` row for the calling device, with that row's sealed key. `POST /dms/ack` moves the device's cursor.
+- Photos use `POST /media` as today, but a message's media is readable only by the participants' devices (`GET /media/{id}` checks the message's device list).
+- `/ws` pushes `{"type": "new_dm", "seq"}` to the recipient's devices and the sender's other devices only.
+- **Pruning, participants only**: a message and its media are deleted once every device in its `dm_keys` has acked it, or when it passes the retention window. Other members' devices don't count, unlike the feed.
+- Rate limits shared with posts (30 events/minute, 50 MB media/hour per device).
+
+**Client**
+
+- Local tables `conversations` (id, other member, last message, unread count) and `dm_messages` (seq, conversation, sender, body, created_at, photos), plaintext on disk like posts.
+- **Messages tab**: the conversation list, newest first, with the other person's name, the last message and an unread dot. "New message" picks a member from the verified roster.
+- **Chat screen**: messages as bubbles (mine on the right), photos inline with the same resize, EXIF stripping and lightbox as posts, a composer at the bottom (Ctrl+Enter sends).
+- Notifications: "Ana sent you a message" with the first line, click opens the conversation. DM unread counts go into the tray badge.
+
+**Done when** two members exchange text and a photo, the sender's second device shows the conversation too, a third member's device gets nothing from `GET /dms` and can't fetch the photo, and both messages disappear from the server once every participant device has acked them.
 
 **Distribution**
 
@@ -180,3 +220,6 @@ Each phase ends with something you can run and poke at; hand them to CC one at a
 - Facebook "Send to Side Tray too?" browser extension
 - PWA for phones, then native apps if needed
 - Archive sharing for new members, SQLCipher at rest, email verification via the M365 domain
+- iPhone photos: accept HEIC/HEIF in the photo picker (decode, then the same resize, EXIF strip and WebP encode)
+- Production TLS mode: trust the normal public certificate roots (a Let's Encrypt certificate on a real domain) instead of the pinned Caddy CA, chosen per server in the wizard, still never turning verification off
+- Linux: keep the device's private keys and token in the system keyring (Secret Service / libsecret) instead of the local database

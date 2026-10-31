@@ -109,6 +109,8 @@
     </div>
   </header>
 
+  <p class="banner error" id="removed-banner" hidden>The server says this device has been removed from the group. It won't receive new posts.</p>
+
   <section class="panel" id="panel-feed">
     <form id="composer" class="card composer" novalidate>
       <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
@@ -141,6 +143,12 @@
   </section>
 
   <section class="panel" id="panel-device" hidden>
+    <div class="card">
+      <h2>Settings</h2>
+      <label class="check"><input type="checkbox" id="set-autostart"> Start Side Tray when I sign in <span class="hint">It opens quietly in the tray.</span></label>
+      <p class="hint">Closing the window keeps Side Tray running in the tray so it can tell you about new posts. To stop it, right-click the tray icon and choose Quit.</p>
+      <p class="error" id="set-err" hidden></p>
+    </div>
     <div class="card">
       <h2>This device</h2>
       <dl class="facts" id="device-facts"></dl>
