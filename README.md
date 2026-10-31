@@ -575,7 +575,7 @@ One version number for everything: `app/src-tauri/Cargo.toml` (the app;
 
 1. Bump the four versions, add a section to [CHANGELOG.md](CHANGELOG.md)
    (`## [x.y.z] - date`; it becomes the release notes), commit.
-2. `git tag vX.Y.Z && git push github main vX.Y.Z`.
+2. `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 3. [`.github/workflows/release.yml`](.github/workflows/release.yml) creates a
    **draft** release for the tag with `install.sh` attached, then builds on
    Windows (`nsis`: `Side Tray_X.Y.Z_x64-setup.exe`) and Ubuntu 22.04
