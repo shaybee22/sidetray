@@ -323,3 +323,7 @@ dialog#crop p { margin: 0; }
 .chat-composer .error { margin-top: 8px; }
 .readonly #dm-composer, .readonly #dm-new, .readonly #dm-picker { display: none !important; }
 @media (max-width: 560px) { .chat { height: calc(100vh - 140px); } .bubble { max-width: 85%; } }
+
+/* Phase 7: a downloaded update, and the version under the wizard */
+.banner.update { background: var(--surface-2); border: 1px solid var(--line); }
+.app-version { text-align: center; margin: 16px 0 0; }

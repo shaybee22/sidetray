@@ -1,0 +1,80 @@
+# On a v* tag: build the Windows installer and the Linux packages, sign the
+# update bundles, and attach everything (plus latest.json for the updater and
+# the server's install.sh) to a draft GitHub release.
+#
+# Secrets: TAURI_SIGNING_PRIVATE_KEY (the minisign key from
+# `cargo tauri signer generate`) and TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+# Optional repository variable SIDETRAY_UPDATE_URL: where installed apps look
+# for latest.json (default: this repository's latest release).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: create
+        name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          # This version's section of CHANGELOG.md as the release notes.
+          awk -v v="$version" '
+            /^## / { on = (index($0, "[" v "]") > 0); next }
+            on' CHANGELOG.md > notes.md
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --title "Side Tray $version" --notes-file notes.md
+          fi
+          gh release upload "$TAG" install.sh --clobber
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            bundles: nsis
+          - platform: ubuntu-22.04
+            bundles: deb,appimage
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SIDETRAY_UPDATE_URL: ${{ vars.SIDETRAY_UPDATE_URL }}
+        with:
+          projectPath: app
+          releaseId: ${{ needs.draft.outputs.release_id }}
+          args: --bundles ${{ matrix.bundles }}
+          uploadUpdaterJson: true

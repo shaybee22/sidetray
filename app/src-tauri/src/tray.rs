@@ -1,4 +1,4 @@
-//! System tray icon: Open / Quit menu, and the unread count as a red badge on
+//! System tray icon: Open / Quit menu (and Restart to update), and the unread count as a red badge on
 //! the icon and in the tooltip.
 
 use crate::db;
@@ -16,10 +16,29 @@ const TRAY_ID: &str = "main";
 /// The monogram without its frame, made from app-icon.png by icons/make-small-icons.py.
 const TRAY_ICON: &[u8] = include_bytes!("../icons/tray.png");
 
-pub fn create(handle: &AppHandle) -> Result<()> {
+/// Open / (Restart to update to x.y.z) / Quit.
+fn menu(handle: &AppHandle, update: Option<&str>) -> Result<Menu<tauri::Wry>> {
     let open = MenuItem::with_id(handle, "open", "Open Side Tray", true, None::<&str>)?;
     let quit = MenuItem::with_id(handle, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(handle, &[&open, &PredefinedMenuItem::separator(handle)?, &quit])?;
+    let sep = PredefinedMenuItem::separator(handle)?;
+    Ok(match update {
+        Some(v) => {
+            let up = MenuItem::with_id(handle, "update", format!("Restart to update to {v}"), true, None::<&str>)?;
+            Menu::with_items(handle, &[&open, &up, &sep, &quit])?
+        }
+        None => Menu::with_items(handle, &[&open, &sep, &quit])?,
+    })
+}
+
+/// Show (or drop) the "Restart to update" item.
+pub fn set_update(handle: &AppHandle, version: Option<&str>) {
+    if let (Some(tray), Ok(m)) = (handle.tray_by_id(TRAY_ID), menu(handle, version)) {
+        let _ = tray.set_menu(Some(m));
+    }
+}
+
+pub fn create(handle: &AppHandle) -> Result<()> {
+    let menu = menu(handle, None)?;
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon(0))
         .tooltip("Side Tray")
@@ -28,6 +47,12 @@ pub fn create(handle: &AppHandle) -> Result<()> {
         .on_menu_event(|app, e| match e.id.as_ref() {
             "open" => show_main(app),
             "quit" => app.exit(0),
+            "update" => {
+                if let Err(e) = crate::update::install(app) {
+                    eprintln!("{e:#}");
+                    show_main(app);
+                }
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, e| {

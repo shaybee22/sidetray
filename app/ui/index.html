@@ -9,6 +9,12 @@
 </head>
 <body>
 
+<!-- A downloaded update, on every screen -->
+<div class="banner update" id="update-banner" role="status" hidden>
+  <span id="update-text"></span>
+  <button class="primary small" id="update-install">Restart to update</button>
+</div>
+
 <main id="screen-loading" class="screen screen-center">
   <p class="muted">Opening Side Tray…</p>
 </main>
@@ -68,6 +74,7 @@
         <button class="primary" id="wz-submit">Ask to join</button>
       </div>
     </form>
+    <p class="hint app-version"></p>
   </div>
 </main>
 
@@ -271,6 +278,12 @@
       <label class="check"><input type="checkbox" id="set-autostart"> Start Side Tray when I sign in <span class="hint">It opens quietly in the tray.</span></label>
       <p class="hint">Closing the window keeps Side Tray running in the tray so it can tell you about new posts. To stop it, right-click the tray icon and choose Quit.</p>
       <p class="error" id="set-err" hidden></p>
+    </div>
+    <div class="card">
+      <h2>Updates</h2>
+      <p id="upd-status"></p>
+      <div class="actions start"><button class="ghost" id="upd-check" hidden>Check for updates</button></div>
+      <p class="error" id="upd-err" hidden></p>
     </div>
     <div class="card" id="cert-card">
       <h2>Server certificate</h2>

@@ -44,6 +44,8 @@ from fastapi.responses import FileResponse
 from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field, field_validator
 
+from . import __version__
+
 DATA_DIR = Path(os.environ.get("SIDETRAY_DATA", "./data"))
 DB_PATH = DATA_DIR / "sidetray.db"
 MEDIA_DIR = DATA_DIR / "media"
@@ -884,13 +886,13 @@ async def lifespan(_app: FastAPI):
     pruner.cancel()
 
 
-app = FastAPI(title="Side Tray relay", version="0.7.0", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="Side Tray relay", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan)
 api = APIRouter(prefix="/api/v1")
 
 
 @api.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": __version__}
 
 
 @api.get("/group")

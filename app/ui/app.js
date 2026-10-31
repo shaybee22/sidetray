@@ -386,6 +386,7 @@ listen("removed", async () => {
 // A notification was clicked: show what it was about.
 listen("open-item", async (ev) => {
   const t = ev.payload;
+  if (t.kind === "update") return; // the window is up; the banner says the rest
   if (!view || view.stage !== "active") return;
   if (t.kind === "joins" && view.keymaster) return selectTab("km");
   if (t.kind === "dm") { chatWith = t.member_id; return selectTab("messages"); }
@@ -1736,5 +1737,50 @@ $("#set-autostart").addEventListener("change", async (ev) => {
     box.disabled = false;
   }
 });
+
+// --- updates -------------------------------------------------------------------------------
+
+function renderUpdate(u) {
+  for (const el of $$(".app-version")) el.textContent = `Side Tray ${u.current_version}`;
+  const ready = u.state === "ready";
+  $("#update-banner").hidden = !ready;
+  if (ready) {
+    $("#update-text").textContent = `Side Tray ${u.version} is ready to install. The app closes for a moment and comes back.`;
+  }
+  const status = {
+    off: `Side Tray ${u.current_version}. This copy wasn't set up with the installer, so it doesn't update itself.`,
+    idle: `Side Tray ${u.current_version}. ` + (u.checked_at ? `Up to date (checked ${when(u.checked_at)}).` : "It checks for updates every few hours."),
+    checking: `Side Tray ${u.current_version}. Checking for updates…`,
+    downloading: `Downloading Side Tray ${u.version}…`,
+    ready: `Side Tray ${u.version} is downloaded. Choose Restart to update at the top of the window.`,
+    failed: `Side Tray ${u.current_version}. Couldn't check for updates: ${u.message}`,
+  }[u.state] || "";
+  $("#upd-status").textContent = status;
+  const check = $("#upd-check");
+  check.hidden = u.state === "off" || ready;
+  check.disabled = u.state === "checking" || u.state === "downloading";
+}
+
+listen("update", (ev) => renderUpdate(ev.payload));
+
+$("#upd-check").addEventListener("click", async () => {
+  hideError($("#upd-err"));
+  renderUpdate(await invoke("check_for_updates"));
+});
+
+$("#update-install").addEventListener("click", async (ev) => {
+  const btn = ev.target;
+  btn.disabled = true;
+  btn.textContent = "Installing…";
+  try {
+    await invoke("install_update"); // the app exits and the installer takes over
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "Restart to update";
+    $("#update-text").textContent = String(e);
+  }
+});
+
+invoke("update_status").then(renderUpdate).catch(() => {});
 
 boot();

@@ -2,7 +2,7 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: Phase 5b (direct messages), after 6b.** A Tauri 2 desktop app
+**Status: 0.1.0, the first release** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 desktop app
 (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
 comments and reactions. It keeps a local SQLite archive and syncs the moment the
@@ -22,12 +22,86 @@ person confirmed the root certificate's fingerprint. Key Masters invite people
 with a `sidetray://` link or QR code, and everyone can set a photo and ask
 for a new name, which shows once a Key Master accepts it. Members send each
 other end-to-end encrypted direct messages (text and photos) that only the
-two people's devices can read. Still to come: release builds (7), specified
-in SPEC.md.
+two people's devices can read. Windows gets a per-user installer and Linux an
+AppImage and a .deb, built by GitHub Actions on a version tag; installed
+copies update themselves from signed releases (see [Releases](#releases)).
+
+## For family members
+
+Someone in your family runs Side Tray for the group (the *Key Master*). This
+is how you get it onto your Windows computer.
+
+1. **Download the installer.** Your Key Master sends you a link to a file
+   called something like `Side Tray_0.1.0_x64-setup.exe`. Download it.
+2. **Open it.** Double-click the file (or click it in your browser's
+   downloads list). You don't need an administrator password.
+3. **Windows will probably warn you.** A blue box appears that says
+   **"Windows protected your PC"** and *"Microsoft Defender SmartScreen
+   prevented an unrecognized app from starting."* There's only a
+   **Don't run** button at first. That's expected: Side Tray is new and
+   isn't signed with a paid certificate yet, so Windows doesn't recognise
+   it (see [Code signing](#code-signing) for what that would change).
+   - Click the small underlined **More info** link under the message.
+   - The box now also shows *App: Side Tray_0.1.0_x64-setup.exe* and
+     *Publisher: Unknown publisher*, and a second button appears:
+     **Run anyway**. Click it.
+
+   It looks like this (a dark blue box, in the middle of the screen):
+
+   ```
+   First:                                   After "More info":
+   ┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+   │ Windows protected your PC        │     │ Windows protected your PC        │
+   │                                  │     │                                  │
+   │ Microsoft Defender SmartScreen   │     │ Microsoft Defender SmartScreen   │
+   │ prevented an unrecognized app    │     │ prevented an unrecognized app    │
+   │ from starting. Running this app  │     │ from starting. Running this app  │
+   │ might put your PC at risk.       │     │ might put your PC at risk.       │
+   │ More info   <── click this       │     │                                  │
+   │                                  │     │ App:       Side Tray_0.1.0_x64-  │
+   │                                  │     │            setup.exe             │
+   │                                  │     │ Publisher: Unknown publisher     │
+   │                                  │     │                                  │
+   │                    [ Don't run ] │     │ [ Run anyway ]   [ Don't run ]   │
+   └──────────────────────────────────┘     └──────────────────────────────────┘
+                                                  ^── then this
+   ```
+
+   Only do this for a file your Key Master sent you. If the file name looks
+   different, ask them first. (Some browsers also ask "keep this file?"
+   when you download it; choose *Keep*.)
+4. **Click through the installer.** Click *Next* until you see *Install*,
+   then *Install*. On the last page, leave **Create desktop shortcut**
+   ticked if you'd like an icon on your desktop, and click *Finish*. Side
+   Tray opens.
+5. **Join the group.** The easiest way: click the invite link your Key
+   Master sent you (it starts with `sidetray://`). Side Tray fills in the
+   server and the group for you. Otherwise type the server address and the
+   group name exactly as they were given to you. Then type your name and
+   email address and click *Ask to join*.
+6. **Phone your Key Master.** Side Tray shows a code of four words and two
+   numbers. Read it to your Key Master on the phone; they check it matches
+   on their screen and let you in. They then read you *their* code: type it
+   in, and you're done. (This phone call is what keeps strangers out, so
+   please don't skip it or do it by email.)
+
+**Afterwards.** Side Tray lives next to the clock (in the system tray; you
+may need to click the little **^** arrow to see it). Closing the window
+doesn't stop it, so it can tell you about new posts. Updates download by
+themselves; when one is ready, Side Tray shows **Restart to update** at the
+top of the window (and in the tray icon's menu). Click it whenever it suits
+you: the app closes for a few seconds and comes back with the new version.
+
+**Removing it.** *Settings → Apps → Installed apps → Side Tray →
+Uninstall.* Your posts, messages and keys stay on the computer unless you
+tick *Delete the application data*, so reinstalling picks up where you left
+off.
 
 ## Layout
 
 ```
+CHANGELOG.md          what changed in each release
+.github/workflows/    release.yml: installers and the updater manifest on a v* tag
 install.sh            server installer: Docker, /opt/sidetray, HTTPS, first setup token
 compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS)
 Caddyfile             TLS via Caddy's internal CA, for a dev checkout on a LAN IP
@@ -37,7 +111,7 @@ scripts/smoke-test.sh live TLS checks + full API run on a throwaway container
 scripts/ws_probe.py   stdlib-only WebSocket client the smoke test uses for /ws
 crypto/               Rust crate: keys, sealing, encryption, signatures, safety codes
 cli/                  Rust dev CLI (`sidetray`): init-group, join, approve, post, pull
-app/src-tauri/        desktop app backend (Rust, Tauri 2)
+app/src-tauri/        desktop app backend (Rust, Tauri 2); windows/installer-hooks.nsh for the installer
 app/ui/               desktop app frontend (plain HTML/CSS/JS, no build step)
 ```
 
@@ -203,7 +277,7 @@ base64. The server never decrypts.
 
 | Method | Path | Who | Body / params | Returns |
 | --- | --- | --- | --- | --- |
-| GET | /health | anyone | | `{ok}` |
+| GET | /health | anyone | | `{ok, version}` |
 | GET | /sidetray-root.crt | anyone | served by Caddy, test mode only (not under /api/v1) | Caddy's root certificate (PEM) |
 | GET | /group | anyone | `?name=<group name>` (required; 400 without) | `{exists, name?}` |
 | POST | /join | anyone | `{group_name, display_name, email, enc_pubkey, sign_pubkey, setup_token?}` | `{group_id, group_name, member_id, device_id, token, status, role}` |
@@ -350,8 +424,8 @@ cargo build --release          # target/release/sidetray-app(.exe)
 cargo test                     # photos, events, notices, keys, badge, invites, fingerprints, profiles, messages
 ```
 
-Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
-`cargo tauri build`.
+Installers need the Tauri CLI (`cargo install tauri-cli --version "^2"`);
+see [Releases](#releases).
 
 - **First run.** The wizard asks for the server address and the group's name
   (servers don't list their groups). For a test server it first shows the root
@@ -365,8 +439,8 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
 - **Invite links.** The Key Master tab has an *Invite* button: a
   `sidetray://join?server=...&group=...` link with *Copy*, and the same link as
   a QR code. The app registers `sidetray://` for the current user at every
-  start (`tauri-plugin-deep-link`; on Windows `HKCU\Software\Classes\sidetray`),
-  until the Phase 7 installer does it. Opening a link starts the app, or hands
+  start (`tauri-plugin-deep-link`; on Windows `HKCU\Software\Classes\sidetray`)
+  when it runs from a build; the installer registers it for the installed copy. Opening a link starts the app, or hands
   it to the running copy, and fills in and checks server and group, so the new
   member types only their name and email. Links carry no secret; anything but
   an `https://` server and a group name is refused, and an app that's already
@@ -437,13 +511,22 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
   a click opens the conversation), and, for Key Masters, new join requests. More than three at once
   become one summary. Nothing pops up while the window is in front. Clicking a
   toast opens the app scrolled to that post (or to the Key Master tab). On
-  Windows the app registers its AppUserModelID (`org.sidetray.app`) under
-  `HKCU\Software\Classes\AppUserModelId` at startup, since toasts need one and
-  there's no installer yet. Clicks are handled while the app is running and the
-  toast is on screen; clicking an old toast in the notification centre isn't
-  wired up yet (needs the installer's COM activator, Phase 7). On macOS and
+  Windows toasts need an AppUserModelID (`org.sidetray.app`): the installer
+  puts it on its Start menu and desktop shortcuts and registers its name and
+  icon under `HKCU\Software\Classes\AppUserModelId`; a copy run from a build
+  registers that key itself at startup. Clicks are handled while the app is
+  running and the toast is on screen; clicking an old toast in the
+  notification centre doesn't open the post yet (that needs a COM activator). On macOS and
   Linux toasts go through `tauri-plugin-notification`, which can't report
   clicks.
+- **Updates.** An installed copy (the Windows installer, or the AppImage)
+  checks for a new version 20 seconds after it starts and every 6 hours
+  after that, downloads it in the background and checks its signature, then
+  shows **Restart to update** at the top of the window and in the tray menu
+  (and a notification if the window isn't in front). Nothing installs until
+  someone clicks it. *This device → Updates* shows the version and has
+  *Check for updates*. A copy run from a build never updates itself. See
+  [Releases](#releases).
 - **Start with Windows.** *This device → Settings* has a toggle, off by default.
   When on, the app starts at sign-in hidden in the tray (`--minimized`), via
   `tauri-plugin-autostart` (a `HKCU\...\Run` entry on Windows, a launch agent
@@ -482,6 +565,115 @@ Installers (`.msi` etc.) come with Phase 7 via `cargo install tauri-cli` and
   are kept in one Windows Credential Manager / macOS Keychain entry. Group keys
   sit in SQLite, encrypted under that wrapping key. Linux has no keychain
   backend yet, so there those secrets live in the database.
+
+## Releases
+
+One version number for everything: `app/src-tauri/Cargo.toml` (the app;
+`tauri.conf.json` takes it from there), `crypto/Cargo.toml`,
+`cli/Cargo.toml` and `server/app/__init__.py` (the relay reports it on
+`/api/v1/health`). To release:
+
+1. Bump the four versions, add a section to [CHANGELOG.md](CHANGELOG.md)
+   (`## [x.y.z] - date`; it becomes the release notes), commit.
+2. `git tag vX.Y.Z && git push github main vX.Y.Z`.
+3. [`.github/workflows/release.yml`](.github/workflows/release.yml) creates a
+   **draft** release for the tag with `install.sh` attached, then builds on
+   Windows (`nsis`: `Side Tray_X.Y.Z_x64-setup.exe`) and Ubuntu 22.04
+   (`.deb` and `.AppImage`) with `tauri-apps/tauri-action`. Each build signs
+   its update bundle and adds it, its `.sig` and its entry in `latest.json`
+   to the release. macOS isn't built yet.
+4. Check the draft, then publish it. Installed apps only see a release once
+   it's published (`releases/latest` skips drafts).
+
+**Building an installer locally.** `cargo install tauri-cli --version "^2"`,
+then in `app/src-tauri`: `cargo tauri build --bundles nsis` (Windows; NSIS is
+downloaded on first use) or `--bundles deb,appimage` (Linux). The installer
+lands in `target/release/bundle/`. Without the signing key in the
+environment the build still makes the installer but fails at the updater
+signature; set `TAURI_SIGNING_PRIVATE_KEY` (the key's contents or path) and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+
+**The Windows installer** (Tauri's NSIS template plus
+`app/src-tauri/windows/installer-hooks.nsh`) installs per user into
+`%LOCALAPPDATA%\Side Tray`, so it needs no administrator rights. It adds a
+Start menu shortcut and, ticked by default on the last page, a desktop
+shortcut, both carrying the AppUserModelID `org.sidetray.app` that
+notifications use; registers `sidetray://` links
+(`HKCU\Software\Classes\sidetray`) and the notification name and icon
+(`HKCU\Software\Classes\AppUserModelId\org.sidetray.app`) against the
+installed exe. The installed app then skips registering those itself.
+Uninstalling (Settings → Apps, or `uninstall.exe`) removes the shortcuts, both
+registry keys (the link handler only if it still points at this install),
+the "start at sign-in" entry and the program folder. It keeps
+`%APPDATA%\org.sidetray.app` (posts, photos, keys in Credential Manager)
+unless the person ticks *Delete the application data*. `/S` installs or
+uninstalls silently.
+
+**The updater signing key** is a minisign keypair made with
+`cargo tauri signer generate`. The public key is in `tauri.conf.json`
+(`plugins.updater.pubkey`), so an app only installs updates signed with the
+matching private key, wherever the manifest came from. The private key is
+**not** in the repository: it lives with the release manager (for 0.1.0:
+`%USERPROFILE%\.tauri\sidetray-updater.key`, password in
+`sidetray-updater.key.password` next to it) and in two GitHub Actions
+secrets, `TAURI_SIGNING_PRIVATE_KEY` (the file's contents) and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Keep a backup: losing it means
+installed apps can't be updated any more (people would have to reinstall a
+build with a new public key).
+
+**Where apps look for updates.** By default
+`https://github.com/shaybee22/sidetray/releases/latest/download/latest.json`
+(`plugins.updater.endpoints`). That only works once the repository (or at
+least its releases) is public, because the app can't sign in to GitHub. To
+point apps elsewhere, any of:
+
+- at build time, `SIDETRAY_UPDATE_URL=https://.../latest.json` in the
+  environment (in CI: the repository variable `SIDETRAY_UPDATE_URL`);
+- at run time, `SIDETRAY_UPDATE_URL` in the app's environment (wins over the
+  build-time one);
+- a config overlay: `cargo tauri build --config other.json` with
+  `{"plugins": {"updater": {"endpoints": ["..."]}}}`.
+
+The endpoint must be `https://` with a publicly trusted certificate. Any
+static web server works: upload the new installer and its `latest.json`:
+
+```json
+{
+  "version": "0.1.1",
+  "notes": "What changed",
+  "pub_date": "2026-11-01T12:00:00Z",
+  "platforms": {
+    "windows-x86_64": { "signature": "<contents of the .exe.sig>", "url": "https://.../Side Tray_0.1.1_x64-setup.exe" }
+  }
+}
+```
+
+(`linux-x86_64` takes the AppImage and its `.sig` the same way.) For a test
+on a LAN with plain `http://`, build the test copies with an overlay that
+also sets `"dangerousInsecureTransportProtocol": true`; never ship that in a
+release. The 0.1.0 updater was tested that way: a 0.1.0 installed from the
+installer found 0.1.1 on a static folder on the test server, downloaded and
+verified it, and after *Restart to update* came back as 0.1.1 by itself.
+
+### Code signing
+
+The installer and app aren't Authenticode-signed yet. That's why Windows
+shows "Windows protected your PC" with *Unknown publisher* (the steps are in
+[For family members](#for-family-members)), and some antivirus programs are
+warier of unsigned downloads. The update signature above is separate: it
+stops anyone but us from pushing an update to installed apps, but Windows
+doesn't know about it.
+
+Signing with a code-signing certificate (an OV certificate, roughly
+$100–300 a year, or Azure Trusted Signing at about $10 a month) would make
+the installer and the dialogs show **Side Tray's publisher name** instead of
+*Unknown publisher*, and let SmartScreen build a reputation for that
+publisher, so after enough downloads the warning stops appearing at all (an
+EV certificate skips that waiting period). Tauri can sign during the build
+(`bundle.windows.certificateThumbprint`, or `signCommand` for a cloud
+signing service), so it would be a configuration change in
+`tauri.conf.json` and two more secrets in the workflow. macOS would need an
+Apple Developer account ($99 a year) for signing and notarisation.
 
 ## Event payloads
 

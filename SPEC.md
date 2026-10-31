@@ -171,6 +171,7 @@ Each phase ends with something you can run and poke at; hand them to CC one at a
 6. **Pruning and removal**: hourly prune job, member removal, key rotation. Done when a removed device stops receiving and old events disappear from the server.
    - 6b. **Real servers, invites, avatars, more groups**: `install.sh`, public certificates, invite links, avatars, several groups per server; see below.
 7. **Release**: GitHub Actions builds Windows (.msi), macOS (.dmg), Linux (.AppImage / .deb); install page with screenshots.
+   - As built (0.1.0): a per-user NSIS installer (.exe, no admin) instead of .msi, which registers `sidetray://` and the notification AppUserModelID against the installed exe and has Start menu and optional desktop shortcuts; Linux .AppImage and .deb; no macOS yet. A `v*` tag builds them in GitHub Actions into a draft release with `latest.json`. Installed apps update themselves through the Tauri updater (minisign-signed bundles; endpoint configurable, see the README) after the person clicks *Restart to update*. Unsigned for now (SmartScreen "Run anyway"); the install page is the README's "For family members" section.
 
 ## Phase 5b: Direct messages
 

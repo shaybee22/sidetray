@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Side Tray",
-  "version": "0.6.2",
   "identifier": "org.sidetray.app",
   "build": {
     "frontendDist": "../ui"
@@ -24,17 +23,54 @@
   },
   "plugins": {
     "deep-link": {
-      "desktop": { "schemes": ["sidetray"] }
+      "desktop": {
+        "schemes": [
+          "sidetray"
+        ]
+      }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlENjk3REMxQTU5RkNFODgKUldTSXpwK2x3WDFwbmE4Z3lRQlR6L2k2V28razg0VHlKRU1VdEVreUEzOUs2d3ZCT2xLRWtiRXAK",
+      "endpoints": [
+        "https://github.com/shaybee22/sidetray/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": [
+      "nsis",
+      "deb",
+      "appimage"
+    ],
+    "createUpdaterArtifacts": true,
+    "publisher": "Side Tray",
+    "copyright": "James Powell",
+    "category": "SocialNetworking",
+    "shortDescription": "A private, end-to-end encrypted feed for one group of friends and family",
+    "longDescription": "Side Tray is a private, invite-only feed for one group of friends and family: posts, photos, comments, reactions and direct messages, end-to-end encrypted, with no ads and no algorithm.",
+    "license": "MIT OR Apache-2.0",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "windows/installer-hooks.nsh"
+      }
+    },
+    "linux": {
+      "deb": {
+        "section": "net"
+      }
+    }
   }
 }

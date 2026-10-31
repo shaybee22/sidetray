@@ -25,6 +25,8 @@ pub enum Target {
     /// The conversation with this member.
     Dm { member_id: String },
     Messages,
+    /// A downloaded update is ready to install.
+    Update,
 }
 
 pub fn after_sync(app: &App, r: &SyncReport) {
@@ -102,9 +104,9 @@ pub fn show(handle: &AppHandle, title: &str, body: &str, _target: Target) {
     }
 }
 
-/// Windows shows toasts only for a registered AppUserModelID. An installer
-/// registers one through its Start menu shortcut; until Phase 7 there's no
-/// installer, so register it per user in HKCU (name and icon for the toast).
+/// Windows shows toasts only for a registered AppUserModelID. The installer
+/// registers it (in HKCU, next to its Start menu shortcut); a copy run
+/// straight from a build registers it per user here (name and icon for the toast).
 #[cfg(windows)]
 pub fn register_app_id(handle: &AppHandle, data_dir: &std::path::Path) -> anyhow::Result<()> {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};

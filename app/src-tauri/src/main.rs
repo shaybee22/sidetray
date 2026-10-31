@@ -23,6 +23,7 @@ mod push;
 mod secrets;
 mod state;
 mod tray;
+mod update;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Serialize;
@@ -598,6 +599,23 @@ fn set_start_with_os(handle: AppHandle, enabled: bool) -> Res<Settings> {
     get_settings(handle)
 }
 
+// --- updates -----------------------------------------------------------------------------
+
+#[tauri::command]
+fn update_status(handle: AppHandle) -> update::View {
+    update::view(&handle)
+}
+
+#[tauri::command]
+async fn check_for_updates(handle: AppHandle) -> update::View {
+    update::check(&handle).await
+}
+
+#[tauri::command]
+fn install_update(handle: AppHandle) -> Res<()> {
+    update::install(&handle).map_err(err)
+}
+
 // --- photos for the webview ------------------------------------------------------------
 
 /// `media://localhost/<id>.webp` (`http://media.localhost/...` on Windows):
@@ -667,7 +685,7 @@ fn main() {
         // With the deep-link feature, a second launch's sidetray:// link reaches this copy's on_open_url.
         builder = builder.plugin(tauri_plugin_single_instance::init(|handle, _args, _cwd| tray::show_main(handle)));
     }
-    builder = builder.plugin(tauri_plugin_deep_link::init());
+    builder = builder.plugin(tauri_plugin_deep_link::init()).plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(not(windows))]
     {
         builder = builder.plugin(tauri_plugin_notification::init());
@@ -698,19 +716,28 @@ fn main() {
             let handle = tauri_app.handle().clone();
             let _ = app.handle.set(handle.clone());
             tauri_app.manage(app.clone());
+            tauri_app.manage(update::Updates::default());
+            // The installer registers the notification app id and sidetray:// links
+            // against the installed exe; a copy run from a build does it itself.
+            let installed = update::installed();
             #[cfg(windows)]
-            if let Err(e) = alerts::register_app_id(&handle, &dir) {
-                eprintln!("registering for notifications: {e:#}");
+            if !installed {
+                if let Err(e) = alerts::register_app_id(&handle, &dir) {
+                    eprintln!("registering for notifications: {e:#}");
+                }
             }
             tray::create(&handle)?;
             tray::refresh(&handle, &app);
             if !std::env::args().any(|a| a == MINIMIZED_ARG) {
                 tray::show_main(&handle);
             }
-            // No installer until Phase 7: register sidetray:// for this user (HKCU on Windows) at every start.
+            // Not installed (a build run from a checkout): register sidetray:// for this
+            // user (HKCU on Windows) at every start. An AppImage registers itself too.
             #[cfg(any(windows, target_os = "linux"))]
-            if let Err(e) = tauri_app.deep_link().register_all() {
-                eprintln!("registering sidetray:// links: {e}");
+            if !installed || cfg!(target_os = "linux") {
+                if let Err(e) = tauri_app.deep_link().register_all() {
+                    eprintln!("registering sidetray:// links: {e}");
+                }
             }
             {
                 let (h, a) = (handle.clone(), app.clone());
@@ -727,6 +754,7 @@ fn main() {
                 }
             }
             spawn_sync_loop(handle.clone(), app.clone());
+            update::spawn(handle.clone());
             push::spawn(handle, app);
             Ok(())
         })
@@ -772,6 +800,9 @@ fn main() {
             mark_dm_read,
             get_settings,
             set_start_with_os,
+            update_status,
+            check_for_updates,
+            install_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while starting Side Tray")

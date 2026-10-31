@@ -1,6 +1,6 @@
 [package]
 name = "sidetray-app"
-version = "0.6.2"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.90"
 description = "Side Tray desktop client"
@@ -53,6 +53,7 @@ qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 sha2 = "0.10.9"
 # "Start with Windows" (login item on macOS, autostart entry on Linux).
 tauri-plugin-autostart = "2.7.0"
+tauri-plugin-updater = "2.14.1"
 
 # Device secrets go to the OS keychain where there's a native one; elsewhere
 # they stay in the local database (SPEC.md: "where available").
