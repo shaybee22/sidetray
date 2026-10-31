@@ -313,6 +313,8 @@ pub struct CheckedRoster {
     /// Removed or revoked devices whose certificates verified, with the last
     /// event seq before they were cut off. Their events up to then still count.
     pub former: BTreeMap<String, (VerifiedDevice, i64)>,
+    /// The same devices with the last direct message seq before they were cut off.
+    pub former_dm: BTreeMap<String, (VerifiedDevice, i64)>,
 }
 
 /// Certificates as the server relays them, rebuilt with our own group id and
@@ -353,16 +355,19 @@ pub async fn refresh_roster(app: &App, id: &Identity, api: &Api) -> Result<Check
     let mut all = certs.clone();
     all.extend(certs_of(&id.group_id, &raw.former));
     let everyone = roster::verify_roster(&id.group_id, &anchor_list, &all);
-    let former: BTreeMap<String, (VerifiedDevice, i64)> = raw
-        .former
-        .iter()
-        .flat_map(|m| m.devices.iter().map(move |d| (m, d)))
-        .filter(|(_, d)| !verified.contains_key(&d.id))
-        .filter_map(|(m, d)| {
-            let v = everyone.get(&d.id).filter(|v| v.member_id == m.id)?;
-            Some((d.id.clone(), (v.clone(), d.revoked_seq?)))
-        })
-        .collect();
+    let cut_off = |pick: fn(&crate::api::MemberDevice) -> Option<i64>| -> BTreeMap<String, (VerifiedDevice, i64)> {
+        raw.former
+            .iter()
+            .flat_map(|m| m.devices.iter().map(move |d| (m, d)))
+            .filter(|(_, d)| !verified.contains_key(&d.id))
+            .filter_map(|(m, d)| {
+                let v = everyone.get(&d.id).filter(|v| v.member_id == m.id)?;
+                Some((d.id.clone(), (v.clone(), pick(d)?)))
+            })
+            .collect()
+    };
+    let former = cut_off(|d| d.revoked_seq);
+    let former_dm = cut_off(|d| d.revoked_dm_seq);
 
     // A Key Master whose own key is an anchor but who has no certificate yet
     // (founding's /certs call failed) certifies itself now.
@@ -420,7 +425,7 @@ pub async fn refresh_roster(app: &App, id: &Identity, api: &Api) -> Result<Check
         }
     }
     tx.commit()?;
-    Ok(CheckedRoster { raw, verified, former })
+    Ok(CheckedRoster { raw, verified, former, former_dm })
 }
 
 // --- Key Master: pending joins -------------------------------------------------

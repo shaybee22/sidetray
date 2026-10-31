@@ -7,11 +7,13 @@
 //! removal, device revocation and group key rotation. Phase 6b: per-server
 //! certificate trust (public roots, or a test server's pinned root), invite
 //! links (`sidetray://join?...`), avatars and chosen display names.
+//! Phase 5b: end-to-end encrypted direct messages.
 
 mod account;
 mod alerts;
 mod api;
 mod db;
+mod dm;
 mod feed;
 mod invite;
 mod manage;
@@ -69,6 +71,8 @@ struct AppView {
     last_sync_at: Option<i64>,
     rejected: i64,
     unread: i64,
+    /// Unread direct messages, over every conversation.
+    dm_unread: i64,
     /// The push socket is connected.
     live: bool,
     /// The relay pruned posts this device never got: (when noticed, retention days).
@@ -79,7 +83,7 @@ struct AppView {
     cert_fingerprint: Option<String>,
     /// The server's certificate was refused on the last try (what to tell the person).
     cert_problem: Option<String>,
-    /// What the group sees: the chosen name, or the certified one.
+    /// What the group sees: the certified name (a chosen one waits for a Key Master).
     shown_name: Option<String>,
     avatar: Option<String>,
 }
@@ -92,6 +96,7 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
     let trusted = db::anchors(&conn).map_err(err)?.into_iter().map(|(_, name, _)| name).collect();
     let key_versions = secrets::key_versions(&conn).map_err(err)?;
     let unread = db::unread(&conn).map_err(err)?;
+    let dm_unread = db::dm_unread(&conn).map_err(err)?;
     let live = app.push_connected.load(Ordering::SeqCst);
     let missed = db::missed(&conn).map_err(err)?;
     drop(conn);
@@ -113,6 +118,7 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             last_sync_at,
             rejected,
             unread,
+            dm_unread,
             live,
             missed: None,
             test_server: false,
@@ -141,6 +147,7 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             last_sync_at,
             rejected,
             unread,
+            dm_unread,
             live,
             missed,
         },
@@ -468,7 +475,7 @@ async fn sync_now(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<feed::Sync
 fn get_feed(app: State<'_, Arc<App>>, before: Option<i64>, limit: Option<i64>) -> Res<Vec<feed::PostView>> {
     // A removed device can still read what it saved.
     let id = app.require_archive().map_err(err)?;
-    feed::feed(&app.db(), &id.member_id, before, limit.unwrap_or(50).clamp(1, 500)).map_err(err)
+    feed::feed(&app.db(), &id.member_id, id.is_keymaster(), before, limit.unwrap_or(50).clamp(1, 500)).map_err(err)
 }
 
 #[derive(Serialize)]
@@ -535,6 +542,39 @@ async fn delete_post(app: State<'_, Arc<App>>, post_id: String) -> Res<()> {
 #[tauri::command]
 fn mark_read(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<()> {
     db::clear_unread(&app.db()).map_err(err)?;
+    tray::refresh(&handle, &app);
+    Ok(())
+}
+
+// --- direct messages (Phase 5b) -------------------------------------------------------------
+
+#[tauri::command]
+fn list_conversations(app: State<'_, Arc<App>>) -> Res<Vec<dm::ConversationView>> {
+    app.require_archive().map_err(err)?;
+    dm::conversations(&app.db()).map_err(err)
+}
+
+#[tauri::command]
+fn open_chat(app: State<'_, Arc<App>>, member_id: String) -> Res<dm::ChatView> {
+    let id = app.require_archive().map_err(err)?;
+    dm::chat(&app.db(), &id, &member_id).map_err(err)
+}
+
+#[tauri::command]
+fn dm_recipients(app: State<'_, Arc<App>>) -> Res<Vec<dm::Recipient>> {
+    let id = app.require_active().map_err(err)?;
+    dm::recipients(&app.db(), &id.member_id).map_err(err)
+}
+
+#[tauri::command]
+async fn send_dm(app: State<'_, Arc<App>>, member_id: String, text: String, photos: Vec<String>) -> Res<()> {
+    dm::send(&app, &member_id, &text, &photos).await.map_err(err)
+}
+
+/// The conversation was looked at: clear its unread count (and the badge).
+#[tauri::command]
+fn mark_dm_read(handle: AppHandle, app: State<'_, Arc<App>>, member_id: String) -> Res<()> {
+    dm::mark_read(&app.db(), &member_id).map_err(err)?;
     tray::refresh(&handle, &app);
     Ok(())
 }
@@ -725,6 +765,11 @@ fn main() {
             set_reaction,
             delete_post,
             mark_read,
+            list_conversations,
+            open_chat,
+            dm_recipients,
+            send_dm,
+            mark_dm_read,
             get_settings,
             set_start_with_os,
         ])

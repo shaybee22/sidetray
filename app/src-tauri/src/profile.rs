@@ -6,6 +6,11 @@
 //! keeps once older ones are pruned, so every event states both fields. No
 //! `display_name` means the name in the member's certificate.
 //!
+//! A chosen name is only a request: everyone keeps seeing the certified name
+//! until a Key Master accepts the new one (which re-signs the member's
+//! certificates with it), so nobody can rename themselves "Mom" to fool
+//! people. Key Masters see that a change is pending. Avatars apply at once.
+//!
 //! The avatar is a 256x256 WebP, cropped in the app, encrypted with the group
 //! key (AD `protocol::media_ad`) and uploaded like a photo; `digest` is the
 //! `blob_digest` of the encrypted blob, checked before decrypting. Until it's
@@ -84,7 +89,7 @@ pub fn apply(conn: &Connection, member_id: &str, seq: i64, key_version: u32, pla
     Ok(())
 }
 
-/// The name a member chose in their profile, if any.
+/// The name a member chose in their profile, if any (shown only once a Key Master accepts it).
 pub fn chosen_name(conn: &Connection, member_id: &str) -> Option<String> {
     conn.query_row("SELECT display_name FROM profiles WHERE member_id = ?1", [member_id], |r| r.get(0)).ok().flatten()
 }
@@ -219,7 +224,7 @@ fn flatten(img: &image::DynamicImage) -> image::RgbImage {
 
 #[derive(Serialize)]
 pub struct MyProfile {
-    /// What the group sees: the chosen name, else the certified one.
+    /// What the group sees: the certified name.
     pub display_name: String,
     /// The name in this device's certificate (what a Key Master approved).
     pub certified_name: String,
@@ -240,7 +245,7 @@ pub fn mine(app: &App) -> Result<MyProfile> {
         .optional()?;
     let (chosen, avatar_id, avatar_path) = row.unwrap_or((None, None, None));
     Ok(MyProfile {
-        display_name: chosen.clone().unwrap_or_else(|| id.display_name.clone()),
+        display_name: id.display_name.clone(),
         pending_name: chosen.filter(|c| *c != id.display_name),
         certified_name: id.display_name,
         avatar_pending: avatar_id.is_some() && avatar_path.is_none(),

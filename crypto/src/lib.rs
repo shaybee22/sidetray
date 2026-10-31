@@ -29,6 +29,7 @@ use rand_core::{OsRng, RngCore};
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+pub mod dm;
 pub mod protocol;
 pub mod roster;
 mod wordlist;

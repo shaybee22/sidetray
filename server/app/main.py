@@ -17,6 +17,10 @@ Phase 6b: several groups per server. Each is created with a one-time setup
 token (`sidetray-admin new-group`), the server never lists them, and every
 authenticated call stays inside the calling device's group, down to event
 numbers, which count per group. Rate limits per device and per client IP.
+
+Phase 5b: end-to-end encrypted direct messages. Each one is stored with the
+list of devices its key was sealed to (dm_keys); only those devices can fetch
+it or its photos, and it's pruned once they have all acked it.
 """
 
 import asyncio
@@ -153,6 +157,42 @@ CREATE TABLE IF NOT EXISTS acks (
 );
 -- One-time tokens from `sidetray-admin new-group`; whoever joins with one
 -- creates a new group and becomes its Key Master.
+-- Phase 5b: direct messages. `seq` counts per group, like events.gseq.
+CREATE TABLE IF NOT EXISTS dm_messages (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id             TEXT NOT NULL REFERENCES groups(id),
+    seq                  INTEGER NOT NULL,
+    conversation_id      TEXT NOT NULL,
+    sender_device_id     TEXT NOT NULL REFERENCES devices(id),
+    sender_member_id     TEXT NOT NULL REFERENCES members(id),
+    recipient_member_id  TEXT NOT NULL REFERENCES members(id),
+    ciphertext           BLOB NOT NULL,
+    signature            BLOB NOT NULL,
+    media_ids            TEXT NOT NULL DEFAULT '',
+    created_at           INTEGER NOT NULL,
+    UNIQUE (group_id, seq)
+);
+-- The message key sealed to each device the message is for. Only these
+-- devices (and the sender's) may fetch the message or its photos.
+CREATE TABLE IF NOT EXISTS dm_keys (
+    message_id  INTEGER NOT NULL REFERENCES dm_messages(id) ON DELETE CASCADE,
+    device_id   TEXT NOT NULL REFERENCES devices(id),
+    sealed_key  BLOB NOT NULL,
+    PRIMARY KEY (message_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS dm_keys_device ON dm_keys (device_id, message_id);
+-- Photos of a direct message (no foreign key to media: retention may delete
+-- the upload a moment before the message).
+CREATE TABLE IF NOT EXISTS dm_media (
+    media_id    TEXT PRIMARY KEY,
+    message_id  INTEGER NOT NULL REFERENCES dm_messages(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS dm_acks (
+    group_id    TEXT NOT NULL REFERENCES groups(id),
+    device_id   TEXT PRIMARY KEY REFERENCES devices(id),
+    last_seq    INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS setup_tokens (
     token_hash  TEXT PRIMARY KEY,
     created_at  INTEGER NOT NULL,
@@ -284,6 +324,10 @@ def init_db() -> None:
             hw = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events'").fetchone()
             conn.execute("UPDATE groups SET event_seq = ?", (hw[0] if hw else 0,))
         allow_profile_events(conn)
+        # Phase 5b: direct message numbering per group, and each revoked
+        # device's last DM seq (its messages up to then still count).
+        add_column(conn, "groups", "dm_seq", "INTEGER NOT NULL DEFAULT 0")
+        add_column(conn, "devices", "revoked_dm_seq", "INTEGER")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_group_gseq ON events (group_id, gseq)")
         # Numbers each new event within its group, inside the inserting transaction.
         conn.execute(
@@ -315,7 +359,7 @@ def prune(t: int | None = None) -> dict:
     knows it missed something."""
     t = now() if t is None else t
     cutoff = t - int(RETENTION_DAYS * 86400)
-    out = {"events": 0, "media": 0}
+    out = {"events": 0, "media": 0, "dms": 0}
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         doomed_media: set[str] = set()
@@ -341,11 +385,28 @@ def prune(t: int | None = None) -> dict:
                 doomed_media.update(m for m in r["media_ids"].split(",") if m)
             out["events"] += conn.execute(f"DELETE FROM events WHERE {where}", args).rowcount
             conn.execute("UPDATE groups SET pruned_through = MAX(pruned_through, ?) WHERE id = ?", (top, gid))
+        # Direct messages: only the devices each one is for count. It goes once
+        # every one of them that's still active has acked it, or past retention.
+        dms = conn.execute(
+            "SELECT m.id, m.media_ids FROM dm_messages m WHERE m.created_at < ? OR NOT EXISTS ("
+            " SELECT 1 FROM dm_keys k JOIN devices d ON d.id = k.device_id JOIN members mm ON mm.id = d.member_id"
+            " LEFT JOIN dm_acks a ON a.device_id = k.device_id"
+            " WHERE k.message_id = m.id AND d.status = 'active' AND mm.status = 'active'"
+            " AND COALESCE(a.last_seq, 0) < m.seq)",
+            (cutoff,),
+        ).fetchall()
+        for r in dms:
+            doomed_media.update(m for m in r["media_ids"].split(",") if m)
+            conn.execute("DELETE FROM dm_media WHERE message_id = ?", (r["id"],))
+            conn.execute("DELETE FROM dm_keys WHERE message_id = ?", (r["id"],))
+            conn.execute("DELETE FROM dm_messages WHERE id = ?", (r["id"],))
+        out["dms"] = len(dms)
         # Media: referenced by a deleted event, past retention, or never referenced.
         # Avatars of the kept profile events stay whatever their age.
         live: set[str] = set()
         for r in conn.execute("SELECT media_ids FROM events WHERE media_ids != ''"):
             live.update(m for m in r["media_ids"].split(",") if m)
+        live.update(r["media_id"] for r in conn.execute("SELECT media_id FROM dm_media"))
         kept: set[str] = set()
         for g in conn.execute("SELECT id FROM groups").fetchall():
             for r in conn.execute(f"SELECT media_ids FROM events WHERE seq IN ({KEPT_PROFILES})", (g["id"],)):
@@ -369,8 +430,9 @@ async def prune_loop() -> None:
     while True:
         try:
             n = await run_in_threadpool(prune)
-            if n["events"] or n["media"]:
-                print(f"prune: deleted {n['events']} events, {n['media']} media", flush=True)
+            if n["events"] or n["media"] or n["dms"]:
+                print(f"prune: deleted {n['events']} events, {n['dms']} direct messages, {n['media']} media",
+                      flush=True)
         except Exception as e:  # keep the job alive; it retries next time
             print(f"prune failed: {e!r}", flush=True)
         await asyncio.sleep(PRUNE_EVERY_SECONDS)
@@ -500,6 +562,12 @@ def push_new_event(group_id: str, author_device_id: str, seq: int, kind: str) ->
     hub.send(to, {"type": "new_event", "seq": seq, "kind": kind})
 
 
+def push_new_dm(device_ids: list[str], seq: int) -> None:
+    """The devices a direct message is for (the recipient's, and the sender's
+    other devices): fetch it with GET /dms."""
+    hub.send(device_ids, {"type": "new_dm", "seq": seq})
+
+
 def push_join_request(group_id: str, device_id: str, display_name: str, existing_member: bool) -> None:
     """Key Masters only: someone is waiting for approval."""
     with db() as conn:
@@ -549,6 +617,18 @@ def issue_setup_token(days: float = SETUP_TOKEN_DAYS) -> tuple[str, int]:
         conn.execute("INSERT INTO setup_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
                      (hash_token(token), t, t + int(days * 86400)))
     return token, t + int(days * 86400)
+
+
+def framed(domain: bytes, fields: list[bytes]) -> bytes:
+    """crypto::protocol's framing: the domain, then each field as u32 LE length + bytes."""
+    return domain + b"".join(len(f).to_bytes(4, "little") + f for f in fields)
+
+
+def conversation_id(group_id: str, member_a: str, member_b: str) -> str:
+    """crypto::dm::conversation_id: both members' apps compute the same id."""
+    lo, hi = sorted([member_a, member_b])
+    data = framed(b"", [group_id.encode(), lo.encode(), hi.encode()])
+    return hashlib.blake2b(b"sidetray/conversation-id/v1" + data, digest_size=32).hexdigest()[:32]
 
 
 def new_id(prefix: str) -> str:
@@ -748,6 +828,45 @@ class AckIn(BaseModel):
     seq: int = Field(ge=0)
 
 
+MAX_DM_CIPHERTEXT = 256 * 1024
+SEALED_MESSAGE_KEY_LEN = 80  # crypto_box_seal of a 32-byte key
+
+
+class DmKeyIn(BaseModel):
+    device_id: str = Field(min_length=1, max_length=64)
+    sealed_key: str  # base64, the message key sealed to that device
+
+    @field_validator("sealed_key")
+    @classmethod
+    def check_len(cls, v: str):
+        if len(b64decode(v, "sealed_key")) != SEALED_MESSAGE_KEY_LEN:
+            raise ValueError(f"sealed_key must be {SEALED_MESSAGE_KEY_LEN} bytes")
+        return v
+
+
+class DmIn(BaseModel):
+    conversation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    recipient_member_id: str = Field(min_length=1, max_length=64)
+    ciphertext: str  # base64
+    signature: str  # base64, the sender device's Ed25519 signature over crypto::protocol::dm_message
+    media_ids: list[str] = Field(default_factory=list, max_length=20)
+    sealed_keys: list[DmKeyIn] = Field(min_length=1, max_length=200)
+
+    @field_validator("ciphertext")
+    @classmethod
+    def check_ct(cls, v: str):
+        if len(b64decode(v, "ciphertext")) > MAX_DM_CIPHERTEXT:
+            raise ValueError("message too large")
+        return v
+
+    @field_validator("signature")
+    @classmethod
+    def check_sig(cls, v: str):
+        if len(b64decode(v, "signature")) != 64:
+            raise ValueError("signature must be 64 bytes")
+        return v
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
@@ -757,7 +876,7 @@ async def lifespan(_app: FastAPI):
     pruner.cancel()
 
 
-app = FastAPI(title="Side Tray relay", version="0.6.1", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="Side Tray relay", version="0.7.0", docs_url=None, redoc_url=None, lifespan=lifespan)
 api = APIRouter(prefix="/api/v1")
 
 
@@ -891,6 +1010,11 @@ def revoked_status(device_id: str) -> str:
 def last_seq(conn: sqlite3.Connection, group_id: str) -> int:
     """The highest event seq issued in this group (pruning doesn't lower it)."""
     return conn.execute("SELECT event_seq FROM groups WHERE id = ?", (group_id,)).fetchone()[0]
+
+
+def last_dm_seq(conn: sqlite3.Connection, group_id: str) -> int:
+    """The highest direct message seq issued in this group."""
+    return conn.execute("SELECT dm_seq FROM groups WHERE id = ?", (group_id,)).fetchone()[0]
 
 
 def group_row(conn: sqlite3.Connection, group_id: str) -> sqlite3.Row:
@@ -1129,9 +1253,11 @@ def members(dev: Device = Depends(current_device)):
     # so a device that syncs late doesn't drop posts made before the removal.
     with db() as conn:
         former_rows = conn.execute(
-            "SELECT m.id AS member_id, m.display_name, d.id AS device_id, d.enc_pubkey, d.sign_pubkey, d.revoked_seq"
+            "SELECT m.id AS member_id, m.display_name, d.id AS device_id, d.enc_pubkey, d.sign_pubkey, d.revoked_seq,"
+            " d.revoked_dm_seq"
             " FROM devices d JOIN members m ON m.id = d.member_id JOIN groups g ON g.id = d.group_id"
-            " WHERE d.group_id = ? AND d.status = 'revoked' AND d.revoked_seq > g.pruned_through"
+            " WHERE d.group_id = ? AND d.status = 'revoked' AND (d.revoked_seq > g.pruned_through"
+            "   OR EXISTS (SELECT 1 FROM dm_messages x WHERE x.sender_device_id = d.id))"
             " ORDER BY d.revoked_at",
             (dev.group_id,),
         ).fetchall()
@@ -1140,7 +1266,7 @@ def members(dev: Device = Depends(current_device)):
         m = former.setdefault(r["member_id"], {"id": r["member_id"], "display_name": r["display_name"], "devices": []})
         m["devices"].append({"id": r["device_id"], "enc_pubkey": b64encode(r["enc_pubkey"]),
                              "sign_pubkey": b64encode(r["sign_pubkey"]), "certs": certs.get(r["device_id"], []),
-                             "revoked_seq": r["revoked_seq"]})
+                             "revoked_seq": r["revoked_seq"], "revoked_dm_seq": r["revoked_dm_seq"] or 0})
     return {"members": list(out.values()), "former": list(former.values())}
 
 
@@ -1231,8 +1357,8 @@ def remove_member(member_id: str, km: Device = Depends(keymaster_device)):
         ).fetchone()[0]
         conn.execute("UPDATE members SET status = 'removed' WHERE id = ?", (member_id,))
         conn.execute(
-            "UPDATE devices SET revoked_seq = ? WHERE member_id = ? AND status = 'active'",
-            (last_seq(conn, km.group_id), member_id),
+            "UPDATE devices SET revoked_seq = ?, revoked_dm_seq = ? WHERE member_id = ? AND status = 'active'",
+            (last_seq(conn, km.group_id), last_dm_seq(conn, km.group_id), member_id),
         )
         conn.execute(
             "UPDATE devices SET status = 'revoked', revoked_reason = 'removed', revoked_at = ?"
@@ -1264,7 +1390,8 @@ def revoke_device(device_id: str, km: Device = Depends(keymaster_device)):
         if device_id == km.id:
             raise HTTPException(409, "you can't revoke the device you're using")
         conn.execute("UPDATE devices SET status = 'revoked', revoked_reason = 'revoked', revoked_at = ?,"
-                     " revoked_seq = ? WHERE id = ?", (now(), last_seq(conn, km.group_id), device_id))
+                     " revoked_seq = ?, revoked_dm_seq = ? WHERE id = ?",
+                     (now(), last_seq(conn, km.group_id), last_dm_seq(conn, km.group_id), device_id))
         conn.execute("UPDATE groups SET rotation_pending = 1 WHERE id = ?", (km.group_id,))
     push_removed([device_id], "device")
     return {"device_id": device_id, "status": "revoked", "rotation_pending": True}
@@ -1286,6 +1413,8 @@ def post_event(ev: EventIn, dev: Device = Depends(current_device)):
                 "SELECT 1 FROM media WHERE id = ? AND group_id = ?", (mid, dev.group_id)
             ).fetchone():
                 raise HTTPException(422, f"unknown media id: {mid}")
+            if conn.execute("SELECT 1 FROM dm_media WHERE media_id = ?", (mid,)).fetchone():
+                raise HTTPException(422, f"media {mid} belongs to a direct message")
         cur = conn.execute(
             "INSERT INTO events (group_id, kind, author_device_id, key_version, ciphertext, signature, media_ids, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1362,6 +1491,124 @@ def ack(body: AckIn, dev: Device = Depends(current_device)):
     return {"last_seq": last}
 
 
+@api.post("/dms", status_code=201)
+def post_dm(body: DmIn, dev: Device = Depends(current_device)):
+    """Send a direct message. The message key must be sealed to exactly the
+    active devices of both members, minus the sending device, so a sender
+    can't quietly leave a device out or add an outsider. Only active members
+    of the same group can be messaged."""
+    limit(event_limit, dev.id, "events from this device")
+    ct = b64decode(body.ciphertext, "ciphertext")
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        them = conn.execute(
+            "SELECT id FROM members WHERE id = ? AND group_id = ? AND status = 'active'",
+            (body.recipient_member_id, dev.group_id),
+        ).fetchone()
+        if them is None:
+            raise HTTPException(404, "no such member in this group (or they were removed)")
+        if body.recipient_member_id == dev.member_id:
+            raise HTTPException(422, "a direct message needs someone else")
+        if body.conversation_id != conversation_id(dev.group_id, dev.member_id, body.recipient_member_id):
+            raise HTTPException(422, "conversation_id isn't the one for these two members")
+        want = {
+            r["id"] for r in conn.execute(
+                "SELECT id FROM devices WHERE member_id IN (?, ?) AND status = 'active'",
+                (dev.member_id, body.recipient_member_id),
+            )
+        } - {dev.id}
+        got = [k.device_id for k in body.sealed_keys]
+        if len(set(got)) != len(got):
+            raise HTTPException(422, "more than one key for the same device")
+        if set(got) != want:
+            raise HTTPException(422, {"error": "the message key must be sealed to exactly the active devices of"
+                                               " both members, except the sending one",
+                                      "missing": sorted(want - set(got)), "not_allowed": sorted(set(got) - want)})
+        for mid in body.media_ids:
+            if not conn.execute("SELECT 1 FROM media WHERE id = ? AND group_id = ? AND uploader_device_id = ?",
+                                (mid, dev.group_id, dev.id)).fetchone():
+                raise HTTPException(422, f"unknown media id: {mid} (upload it from this device first)")
+            if conn.execute("SELECT 1 FROM dm_media WHERE media_id = ?", (mid,)).fetchone():
+                raise HTTPException(422, f"media {mid} already belongs to a message")
+        conn.execute("UPDATE groups SET dm_seq = dm_seq + 1 WHERE id = ?", (dev.group_id,))
+        seq = last_dm_seq(conn, dev.group_id)
+        msg_id = conn.execute(
+            "INSERT INTO dm_messages (group_id, seq, conversation_id, sender_device_id, sender_member_id,"
+            " recipient_member_id, ciphertext, signature, media_ids, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (dev.group_id, seq, body.conversation_id, dev.id, dev.member_id, body.recipient_member_id, ct,
+             b64decode(body.signature, "signature"), ",".join(body.media_ids), now()),
+        ).lastrowid
+        for k in body.sealed_keys:
+            conn.execute("INSERT INTO dm_keys (message_id, device_id, sealed_key) VALUES (?, ?, ?)",
+                         (msg_id, k.device_id, b64decode(k.sealed_key, "sealed_key")))
+        for mid in body.media_ids:
+            conn.execute("INSERT INTO dm_media (media_id, message_id) VALUES (?, ?)", (mid, msg_id))
+    # After the commit, so a device that syncs on this push finds the message.
+    push_new_dm(sorted(want), seq)
+    return {"seq": seq}
+
+
+@api.get("/dms")
+def get_dms(
+    after: int = Query(0, ge=0),
+    limit: int = Query(PAGE_SIZE, ge=1, le=PAGE_SIZE),
+    dev: Device = Depends(current_device),
+):
+    """Direct messages sealed to this device after `after`, each with every
+    sealed key: the sender's signature covers them all, the device opens its own."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT m.id, m.seq, m.conversation_id, m.sender_device_id, m.sender_member_id, m.recipient_member_id,"
+            " m.ciphertext, m.signature, m.media_ids, m.created_at"
+            " FROM dm_messages m JOIN dm_keys k ON k.message_id = m.id AND k.device_id = ?"
+            " WHERE m.group_id = ? AND m.seq > ? ORDER BY m.seq LIMIT ?",
+            (dev.id, dev.group_id, after, limit + 1),
+        ).fetchall()
+        more = len(rows) > limit
+        rows = rows[:limit]
+        keys: dict[int, list[dict]] = {}
+        if rows:
+            marks = ",".join("?" * len(rows))
+            for k in conn.execute(f"SELECT message_id, device_id, sealed_key FROM dm_keys"
+                                  f" WHERE message_id IN ({marks}) ORDER BY device_id", [r["id"] for r in rows]):
+                keys.setdefault(k["message_id"], []).append(
+                    {"device_id": k["device_id"], "sealed_key": b64encode(k["sealed_key"])})
+    messages = [
+        {
+            "seq": r["seq"],
+            "conversation_id": r["conversation_id"],
+            "sender_device_id": r["sender_device_id"],
+            "sender_member_id": r["sender_member_id"],
+            "recipient_member_id": r["recipient_member_id"],
+            "ciphertext": b64encode(r["ciphertext"]),
+            "signature": b64encode(r["signature"]),
+            "media_ids": [m for m in r["media_ids"].split(",") if m],
+            "created_at": r["created_at"],
+            "sealed_keys": keys.get(r["id"], []),
+        }
+        for r in rows
+    ]
+    return {"messages": messages, "last_seq": messages[-1]["seq"] if messages else after, "has_more": more}
+
+
+@api.post("/dms/ack")
+def ack_dms(body: AckIn, dev: Device = Depends(current_device)):
+    """How far this device has stored its direct messages (only moves forward)."""
+    with db() as conn:
+        ceiling = last_dm_seq(conn, dev.group_id)
+        if body.seq > ceiling:
+            raise HTTPException(422, f"seq {body.seq} is beyond the latest direct message ({ceiling})")
+        conn.execute(
+            "INSERT INTO dm_acks (group_id, device_id, last_seq, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(device_id) DO UPDATE SET"
+            " last_seq = MAX(dm_acks.last_seq, excluded.last_seq), updated_at = excluded.updated_at",
+            (dev.group_id, dev.id, body.seq, now()),
+        )
+        last = conn.execute("SELECT last_seq FROM dm_acks WHERE device_id = ?", (dev.id,)).fetchone()[0]
+    return {"last_seq": last}
+
+
 @api.post("/media", status_code=201)
 async def upload_media(request: Request, dev: Device = Depends(current_device)):
     declared = request.headers.get("content-length")
@@ -1404,6 +1651,15 @@ def download_media(media_id: str, dev: Device = Depends(current_device)):
         row = conn.execute(
             "SELECT path FROM media WHERE id = ? AND group_id = ?", (media_id, dev.group_id)
         ).fetchone()
+        # A direct message's photo: only the devices it was sealed to, and the sender's.
+        dm = conn.execute(
+            "SELECT dm.message_id, m.sender_device_id FROM dm_media dm JOIN dm_messages m ON m.id = dm.message_id"
+            " WHERE dm.media_id = ?", (media_id,)
+        ).fetchone()
+        if row is not None and dm is not None and dm["sender_device_id"] != dev.id and not conn.execute(
+            "SELECT 1 FROM dm_keys WHERE message_id = ? AND device_id = ?", (dm["message_id"], dev.id)
+        ).fetchone():
+            row = None  # looks like it doesn't exist, as another group's media does
     if row is None:
         raise HTTPException(404, "media not found")
     return FileResponse(MEDIA_DIR / row["path"], media_type="application/octet-stream")
@@ -1418,6 +1674,7 @@ async def ws(websocket: WebSocket):
     Server -> client, JSON text frames:
       {"type": "hello", "device_id"}            once, on connect
       {"type": "new_event", "seq", "kind"}      someone else appended an event
+      {"type": "new_dm", "seq"}                 a direct message for this device: GET /dms
       {"type": "join_request", "device_id", "display_name", "existing_member"}  Key Masters only
       {"type": "key_rotated", "key_version"}    fetch GET /keys
       {"type": "removed", "scope"}              this device was revoked ("device") or its

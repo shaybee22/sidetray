@@ -109,6 +109,41 @@ CREATE TABLE IF NOT EXISTS profiles (
     avatar_path    TEXT,                  -- file name in the media folder once downloaded and checked
     attempts       INTEGER NOT NULL DEFAULT 0
 );
+-- Phase 5b: direct messages, plaintext on disk like posts.
+CREATE TABLE IF NOT EXISTS conversations (
+    id               TEXT PRIMARY KEY,      -- crypto::dm::conversation_id
+    other_member_id  TEXT NOT NULL,
+    last_seq         INTEGER NOT NULL DEFAULT 0,
+    last_at          INTEGER NOT NULL DEFAULT 0,
+    last_text        TEXT NOT NULL DEFAULT '',
+    last_mine        INTEGER NOT NULL DEFAULT 0,
+    unread           INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS dm_messages (
+    id                TEXT PRIMARY KEY,     -- crypto::event_id of the ciphertext
+    seq               INTEGER NOT NULL,
+    conversation_id   TEXT NOT NULL,
+    sender_member_id  TEXT NOT NULL,
+    sender_device_id  TEXT NOT NULL,
+    body              TEXT NOT NULL,
+    created_at        INTEGER NOT NULL,
+    key_wrapped       BLOB NOT NULL         -- the message key, wrapped like group keys, for its photos
+);
+CREATE INDEX IF NOT EXISTS dm_messages_conversation ON dm_messages(conversation_id, seq);
+CREATE TABLE IF NOT EXISTS dm_photos (
+    id            TEXT PRIMARY KEY,         -- media id of the full image
+    message_id    TEXT NOT NULL,
+    idx           INTEGER NOT NULL,
+    width         INTEGER NOT NULL,
+    height        INTEGER NOT NULL,
+    full_digest   BLOB NOT NULL,
+    thumb_id      TEXT NOT NULL,
+    thumb_digest  BLOB NOT NULL,
+    local_path    TEXT,
+    thumb_path    TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS dm_photos_message ON dm_photos(message_id, idx);
 CREATE TABLE IF NOT EXISTS sync_state (
     id            INTEGER PRIMARY KEY CHECK (id = 1),
     last_seq      INTEGER NOT NULL,
@@ -128,6 +163,8 @@ pub fn open(path: &Path) -> Result<Connection> {
     // Phase 6: set when the relay pruned events this device never got.
     add_column(&conn, "sync_state", "missed_at", "INTEGER")?;
     add_column(&conn, "sync_state", "missed_days", "REAL")?;
+    // Phase 5b: how far direct messages have synced.
+    add_column(&conn, "sync_state", "dm_last_seq", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(conn)
 }
 
@@ -247,7 +284,9 @@ pub fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM identity; DELETE FROM group_keys; DELETE FROM secrets; DELETE FROM anchors;
          DELETE FROM members; DELETE FROM member_devices; DELETE FROM posts; DELETE FROM comments;
-         DELETE FROM reactions; DELETE FROM media; DELETE FROM profiles; UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0, missed_at = NULL, missed_days = NULL;",
+         DELETE FROM reactions; DELETE FROM media; DELETE FROM profiles;
+         DELETE FROM conversations; DELETE FROM dm_messages; DELETE FROM dm_photos;
+         UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0, missed_at = NULL, missed_days = NULL, dm_last_seq = 0;",
     )?;
     Ok(())
 }
@@ -303,6 +342,21 @@ pub fn add_unread(conn: &Connection, n: i64) -> Result<()> {
 pub fn clear_unread(conn: &Connection) -> Result<()> {
     conn.execute("UPDATE sync_state SET unread = 0 WHERE id = 1", [])?;
     Ok(())
+}
+
+/// Direct messages: the highest seq stored.
+pub fn dm_last_seq(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT dm_last_seq FROM sync_state WHERE id = 1", [], |r| r.get(0))?)
+}
+
+pub fn set_dm_last_seq(conn: &Connection, seq: i64) -> Result<()> {
+    conn.execute("UPDATE sync_state SET dm_last_seq = MAX(dm_last_seq, ?1) WHERE id = 1", params![seq])?;
+    Ok(())
+}
+
+/// Unread direct messages, over every conversation.
+pub fn dm_unread(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COALESCE(SUM(unread), 0) FROM conversations", [], |r| r.get(0))?)
 }
 
 /// The relay deleted events this device never downloaded (it was away longer

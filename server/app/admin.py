@@ -8,14 +8,14 @@ host does the same.
 new-group [--days N]  Print a fresh one-time setup token (valid 7 days, or N).
                       The first device that joins with it creates a new group
                       and becomes its Key Master. Only its hash is stored.
-list-groups           Groups on this server with member, device and event
+list-groups           Groups on this server with member, device, event and DM
                       counts, and the setup tokens not used yet. Operator
                       only: the API never lists groups.
 setup-status          One line for scripts: groups=N tokens=N env_token=yes|no
 prune                 Run the prune job now (it also runs every hour): delete
-                      events and media every active device has acked, and
-                      anything older than SIDETRAY_RETENTION_DAYS. Prints
-                      what it deleted as JSON.
+                      events, direct messages and media every device they're
+                      for has acked, and anything older than
+                      SIDETRAY_RETENTION_DAYS. Prints what it deleted as JSON.
 """
 
 import argparse
@@ -59,7 +59,8 @@ def list_groups() -> int:
             " (SELECT COUNT(*) FROM devices d WHERE d.group_id = g.id AND d.status = 'active') AS devices,"
             " (SELECT COUNT(*) FROM devices d WHERE d.group_id = g.id AND d.status = 'pending') AS pending,"
             " (SELECT COUNT(*) FROM events e WHERE e.group_id = g.id) AS events,"
-            " (SELECT MAX(created_at) FROM events e WHERE e.group_id = g.id) AS last_event"
+            " (SELECT MAX(created_at) FROM events e WHERE e.group_id = g.id) AS last_event,"
+            " (SELECT COUNT(*) FROM dm_messages x WHERE x.group_id = g.id) AS dms"
             " FROM groups g ORDER BY g.created_at"
         ).fetchall()
         tokens = open_tokens(conn)
@@ -67,10 +68,10 @@ def list_groups() -> int:
     if not rows:
         print("No groups yet.")
     else:
-        head = ("id", "name", "created", "members", "devices", "pending", "events", "last post", "key")
+        head = ("id", "name", "created", "members", "devices", "pending", "events", "last post", "dms", "key")
         table = [head] + [
             (r["id"], r["name"], when(r["created_at"]), str(r["members"]), str(r["devices"]),
-             str(r["pending"]), str(r["events"]), when(r["last_event"]), f"v{r['key_version']}")
+             str(r["pending"]), str(r["events"]), when(r["last_event"]), str(r["dms"]), f"v{r['key_version']}")
             for r in rows
         ]
         widths = [max(len(row[i]) for row in table) for i in range(len(head))]

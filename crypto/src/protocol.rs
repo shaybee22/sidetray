@@ -111,9 +111,71 @@ pub fn anchors_message(group_id: &str, recipient_device_id: &str, anchors: &[(St
     framed(b"sidetray/anchors/v1", &fields)
 }
 
+/// The fields of a conversation id (see [`crate::dm::conversation_id`]): the
+/// group and the two member ids, smaller first, so both sides get the same bytes.
+pub fn conversation_fields(group_id: &str, member_a: &str, member_b: &str) -> Vec<u8> {
+    let (lo, hi) = if member_a <= member_b { (member_a, member_b) } else { (member_b, member_a) };
+    framed(b"", &[group_id.as_bytes(), lo.as_bytes(), hi.as_bytes()])
+}
+
+/// What the sender of a direct message signs: the group, the conversation,
+/// the sending device, every recipient device with the message key sealed to
+/// it (sorted by device id, so the order the server relays them in doesn't
+/// matter), and the ciphertext. The server can't add, drop or swap a
+/// recipient, or move the message to another conversation.
+pub fn dm_message(
+    group_id: &str,
+    conversation_id: &str,
+    sender_device_id: &str,
+    sealed_keys: &[(String, Vec<u8>)],
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut sorted: Vec<&(String, Vec<u8>)> = sealed_keys.iter().collect();
+    sorted.sort();
+    let count = (sorted.len() as u32).to_le_bytes();
+    let mut fields: Vec<&[u8]> = vec![group_id.as_bytes(), conversation_id.as_bytes(), sender_device_id.as_bytes(), &count];
+    for (device, sealed) in &sorted {
+        fields.push(device.as_bytes());
+        fields.push(sealed);
+    }
+    fields.push(ciphertext);
+    framed(b"sidetray/dm/v1", &fields)
+}
+
+/// Associated data for a direct message's text (encrypted with its message key).
+pub fn dm_ad(group_id: &str, conversation_id: &str) -> Vec<u8> {
+    framed(b"sidetray/dm-ad/v1", &[group_id.as_bytes(), conversation_id.as_bytes()])
+}
+
+/// Associated data for a direct message's photos and thumbnails.
+pub fn dm_media_ad(group_id: &str, conversation_id: &str) -> Vec<u8> {
+    framed(b"sidetray/dm-media-ad/v1", &[group_id.as_bytes(), conversation_id.as_bytes()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dm_fields_matter_but_key_order_does_not() {
+        let k = |d: &str, b: u8| (d.to_string(), vec![b; 80]);
+        let base = dm_message("g", "c", "d", &[k("a", 1), k("b", 2)], b"ct");
+        assert_eq!(base, dm_message("g", "c", "d", &[k("b", 2), k("a", 1)], b"ct"));
+        for other in [
+            dm_message("h", "c", "d", &[k("a", 1), k("b", 2)], b"ct"),
+            dm_message("g", "e", "d", &[k("a", 1), k("b", 2)], b"ct"),
+            dm_message("g", "c", "x", &[k("a", 1), k("b", 2)], b"ct"),
+            dm_message("g", "c", "d", &[k("a", 1)], b"ct"),
+            dm_message("g", "c", "d", &[k("a", 1), k("b", 3)], b"ct"),
+            dm_message("g", "c", "d", &[k("a", 1), k("c", 2)], b"ct"),
+            dm_message("g", "c", "d", &[k("a", 1), k("b", 2)], b"cu"),
+        ] {
+            assert_ne!(base, other);
+        }
+        assert_eq!(conversation_fields("g", "m1", "m2"), conversation_fields("g", "m2", "m1"));
+        assert_ne!(conversation_fields("g", "m1", "m2"), conversation_fields("h", "m1", "m2"));
+        assert_ne!(dm_ad("g", "c"), dm_media_ad("g", "c"));
+    }
 
     #[test]
     fn fields_cannot_run_together() {

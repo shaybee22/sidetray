@@ -1,8 +1,8 @@
 //! After each sync: native notifications, the tray badge, and where a click on
 //! a notification should take you.
 //!
-//! Notified: posts by others, comments by others on my posts, and (Key
-//! Masters) new join requests. Not while the window is focused (the feed is
+//! Notified: posts by others, comments by others on my posts, direct
+//! messages, and (Key Masters) new join requests. Not while the window is focused (the feed is
 //! right there), and not on a new device's first sync (that's the backlog).
 
 use crate::feed::SyncReport;
@@ -22,6 +22,9 @@ pub enum Target {
     Post { post_id: String },
     Feed,
     Joins,
+    /// The conversation with this member.
+    Dm { member_id: String },
+    Messages,
 }
 
 pub fn after_sync(app: &App, r: &SyncReport) {
@@ -46,6 +49,13 @@ pub fn after_sync(app: &App, r: &SyncReport) {
         for n in notable {
             let title = if n.comment { format!("{} commented on your post", n.author) } else { format!("{} posted", n.author) };
             show(handle, &title, &n.text, Target::Post { post_id: n.post_id.clone() });
+        }
+    }
+    if r.dm_notices.len() > MAX_SEPARATE {
+        show(handle, "Side Tray", &format!("{} new messages", r.dm_notices.len()), Target::Messages);
+    } else {
+        for n in &r.dm_notices {
+            show(handle, &format!("{} sent you a message", n.author), &n.text, Target::Dm { member_id: n.member_id.clone() });
         }
     }
     match new_joins.len() {

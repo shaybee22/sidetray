@@ -121,7 +121,7 @@ async fn run(handle: &AppHandle, app: &App, id: &Identity) -> Result<Ended> {
                         .unwrap_or_default();
                     match kind.as_str() {
                         // A sync picks up new events, pending joins and rotated keys.
-                        "new_event" | "join_request" | "key_rotated" => app.wake.notify_one(),
+                        "new_event" | "new_dm" | "join_request" | "key_rotated" => app.wake.notify_one(),
                         "removed" => return Ok(Ended::Removed),
                         _ => {} // hello, pong
                     }

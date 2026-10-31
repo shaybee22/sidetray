@@ -280,3 +280,45 @@ dialog#crop p { margin: 0; }
 .crop-frame::after { content: ""; position: absolute; inset: 0; border-radius: 50%; box-shadow: 0 0 0 999px rgba(0, 0, 0, .55); outline: 2px solid rgba(255, 255, 255, .85); pointer-events: none; }
 .zoom { flex-direction: row; align-items: center; gap: 10px; }
 .zoom input { flex: 1; padding: 0; }
+
+/* Phase 5b: direct messages */
+.tag.pending { color: var(--danger); background: var(--danger-soft); }
+.dm-list-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dm-list-head h2 { margin: 0; }
+.dm-picker { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin: 12px 0; }
+.dm-picker .actions { margin-top: 8px; }
+.pick { display: flex; align-items: center; gap: 10px; width: 100%; border: none; border-radius: 8px; background: none; padding: 6px 8px; font-weight: 550; text-align: left; }
+.pick:hover { background: var(--surface-2); }
+.pick .avatar { width: 28px; height: 28px; font-size: .8rem; }
+#dm-list { margin-top: 8px; }
+.conv { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 12px 6px; border: none; border-top: 1px solid var(--line); border-radius: 0; background: none; font-weight: normal; }
+.conv:first-child { border-top: none; }
+.conv:hover { background: var(--surface-2); }
+.conv-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.conv-top { display: flex; gap: 8px; align-items: baseline; }
+.conv-name { font-weight: 650; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-last { color: var(--muted); font-size: .9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv.unread .conv-last { color: var(--text); font-weight: 600; }
+.conv .badge { flex: none; }
+.chat { display: flex; flex-direction: column; height: calc(100vh - 96px); min-height: 380px; padding: 0; overflow: hidden; }
+.chat-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.chat-head b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-log { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 4px; }
+.chat-log .empty { margin: auto 0; }
+.day-sep { text-align: center; color: var(--muted); font-size: .76rem; margin: 10px 0 4px; }
+.bubble-row { display: flex; }
+.bubble-row.mine { justify-content: flex-end; }
+.bubble { max-width: min(75%, 440px); background: var(--surface-2); border: 1px solid var(--line); border-radius: 16px 16px 16px 4px; padding: 7px 12px; }
+.bubble-row.mine .bubble { background: var(--accent); border-color: var(--accent); color: var(--accent-text); border-radius: 16px 16px 4px 16px; }
+.bubble .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.bubble .text:empty { display: none; }
+.bubble .when { font-size: .7rem; opacity: .75; margin-top: 2px; text-align: right; }
+.bubble .photos { margin: 3px -6px 0; width: 260px; max-width: calc(100% + 12px); border-radius: 12px; }
+.bubble .photos.n1 .photo, .bubble .photos.n1 .photo img { max-height: 320px; }
+.chat-gone { margin: 0 14px 12px; }
+.chat-composer { border-top: 1px solid var(--line); padding: 10px 12px; }
+.chat-input-row { display: flex; gap: 8px; align-items: flex-end; }
+.chat-input-row textarea { resize: none; flex: 1; }
+.chat-composer .error { margin-top: 8px; }
+.readonly #dm-composer, .readonly #dm-new, .readonly #dm-picker { display: none !important; }
+@media (max-width: 560px) { .chat { height: calc(100vh - 140px); } .bubble { max-width: 85%; } }

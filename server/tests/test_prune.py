@@ -66,9 +66,9 @@ class PruneTest(unittest.TestCase):
         self.ack("a", s3)
         # b has no ack at all: nothing goes, whatever revoked/removed devices did.
         self.ack("gone", 0)
-        self.assertEqual(self.m.prune(self.t), {"events": 0, "media": 0})
+        self.assertEqual(self.m.prune(self.t), {"events": 0, "media": 0, "dms": 0})
         self.ack("b", s2)
-        self.assertEqual(self.m.prune(self.t), {"events": 2, "media": 1})
+        self.assertEqual(self.m.prune(self.t), {"events": 2, "media": 1, "dms": 0})
         self.assertEqual(self.seqs(), [s3])
         self.assertEqual(self.pruned_through(), s2)
         self.assertFalse((self.m.MEDIA_DIR / "g_1" / "p1").exists())
@@ -83,7 +83,7 @@ class PruneTest(unittest.TestCase):
     def test_retention_window_wins_over_acks(self):
         old = self.event(age_days=91, media=["old"])
         new = self.event(age_days=89)
-        self.assertEqual(self.m.prune(self.t), {"events": 1, "media": 1})
+        self.assertEqual(self.m.prune(self.t), {"events": 1, "media": 1, "dms": 0})
         self.assertEqual(self.seqs(), [new])
         # Devices whose cursor is below this missed something.
         self.assertEqual(self.pruned_through(), old)

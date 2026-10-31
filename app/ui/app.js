@@ -321,6 +321,7 @@ function startMain() {
   $("#km-code").textContent = view.safety_code;
   renderSyncStatus();
   renderDevice();
+  renderDmBadge();
   loadFeed().then(markReadIfViewed);
 }
 
@@ -335,6 +336,7 @@ function selectTab(name) {
   if (name === "device") { renderDevice(); loadSettings(); loadProfile(); }
   if (name === "members") loadMembers();
   if (name === "feed") loadFeed().then(markReadIfViewed);
+  if (name === "messages") showMessages();
 }
 for (const t of $$(".tab")) t.addEventListener("click", () => selectTab(t.dataset.tab));
 
@@ -366,8 +368,8 @@ async function markReadIfViewed() {
   try { await invoke("mark_read"); } catch (e) { console.warn("mark_read", e); }
 }
 
-window.addEventListener("focus", markReadIfViewed);
-document.addEventListener("visibilitychange", markReadIfViewed);
+window.addEventListener("focus", () => { markReadIfViewed(); markChatRead(); });
+document.addEventListener("visibilitychange", () => { markReadIfViewed(); markChatRead(); });
 
 listen("push-status", async (ev) => {
   if (!view || view.stage !== "active") return;
@@ -386,6 +388,8 @@ listen("open-item", async (ev) => {
   const t = ev.payload;
   if (!view || view.stage !== "active") return;
   if (t.kind === "joins" && view.keymaster) return selectTab("km");
+  if (t.kind === "dm") { chatWith = t.member_id; return selectTab("messages"); }
+  if (t.kind === "messages") { chatWith = null; return selectTab("messages"); }
   selectTab("feed");
   await loadFeed();
   if (t.kind === "post") {
@@ -429,6 +433,8 @@ listen("synced", async (ev) => {
   badge.hidden = !r.pending_joins;
   if (!$("#panel-feed").hidden && (r.new_events || r.avatars)) loadFeed();
   if (!$("#panel-km").hidden) loadPending();
+  if (!$("#panel-messages").hidden && (r.new_dms || r.avatars || r.new_events)) refreshMessages();
+  renderDmBadge();
   markReadIfViewed();
 });
 
@@ -503,6 +509,14 @@ function renderPost(p) {
     const tag = document.createElement("span");
     tag.className = "tag";
     tag.textContent = "Key Master";
+    author.append(tag);
+  }
+  if (p.author_pending_name) {
+    // Key Masters only: they asked for a new name nobody has accepted yet.
+    const tag = document.createElement("span");
+    tag.className = "tag pending";
+    tag.textContent = "name change pending";
+    tag.title = `Wants to be called “${p.author_pending_name}”. Accept it under Members.`;
     author.append(tag);
   }
   $(".when", el).textContent = when(p.created_at) + (p.edited ? " · edited" : "");
@@ -874,12 +888,21 @@ async function loadMembers() {
 function renderMember(m) {
   const el = $("#tpl-member").content.firstElementChild.cloneNode(true);
   el.dataset.member = m.id;
-  avatar($(".avatar", el), m.chosen_name || m.name, m.avatar);
+  avatar($(".avatar", el), m.name, m.avatar);
   $(".m-name", el).textContent = m.name;
   if (m.chosen_name) {
+    // Only Key Masters get this: everyone else just sees the certified name.
     const chosen = $(".m-chosen", el);
     chosen.hidden = false;
-    chosen.textContent = `Goes by “${m.chosen_name}” now. Posts show that name; this list keeps the name a Key Master certified until one accepts the new one.`;
+    const tag = document.createElement("span");
+    tag.className = "tag pending";
+    tag.textContent = "name change pending";
+    chosen.replaceChildren(tag, ` Wants to be called “${m.chosen_name}”. Everyone keeps seeing “${m.name}” until a Key Master accepts it.`);
+  }
+  if (!m.me && m.cert_status === "verified" && view.stage === "active") {
+    const msg = $(".m-message", el);
+    msg.hidden = false;
+    msg.addEventListener("click", () => { chatWith = m.id; selectTab("messages"); });
   }
   $(".m-role", el).hidden = m.role !== "keymaster";
   $(".m-you", el).hidden = !m.me;
@@ -1076,10 +1099,19 @@ $("#rm-archive").addEventListener("click", async () => {
     ? `Saved posts from ${view.group_name}. You're no longer in this group, so this is read only.`
     : `Saved posts from ${view.group_name}. This device was disconnected, so this is read only.`;
   for (const p of $$(".panel")) p.hidden = p.id !== "panel-feed";
+  $("#readonly-switch").textContent = "Messages";
   await loadFeed();
 });
 
 $("#readonly-back").addEventListener("click", () => startRemoved());
+
+// Read only: switch between saved posts and saved messages.
+$("#readonly-switch").addEventListener("click", () => {
+  const toMessages = $("#panel-messages").hidden;
+  for (const p of $$(".panel")) p.hidden = p.id !== (toMessages ? "panel-messages" : "panel-feed");
+  $("#readonly-switch").textContent = toMessages ? "Posts" : "Messages";
+  if (toMessages) { chatWith = null; showMessages(); } else loadFeed();
+});
 
 $("#rm-restart").addEventListener("click", async () => {
   const yes = await askConfirm({
@@ -1215,7 +1247,7 @@ function renderProfile(p) {
   const note = $("#pf-note");
   note.hidden = !p.pending_name;
   if (p.pending_name) {
-    note.textContent = `Your posts show “${p.pending_name}”. The member list keeps showing “${p.certified_name}”, the name a Key Master approved, until a Key Master accepts the new one.`;
+    note.textContent = `You asked to be called “${p.pending_name}”. Everyone keeps seeing “${p.certified_name}” until a Key Master accepts the new name.`;
   }
 }
 
@@ -1388,6 +1420,292 @@ $("#crop-save").addEventListener("click", async () => {
       showError(err, e);
     }
   });
+});
+
+// --- direct messages (Phase 5b) ----------------------------------------------------------------
+
+let chatWith = null;   // member id of the open conversation, null for the list
+let dmStaged = [];     // [{id, preview}] in the chat composer
+let draftFor = null;   // whose conversation the composer's draft and photos belong to
+
+function renderDmBadge() {
+  const badge = $("#dm-badge");
+  const n = (view && view.dm_unread) || 0;
+  badge.textContent = n > 9 ? "9+" : String(n);
+  badge.hidden = !n;
+}
+
+/** The open conversation counts as read once it's on screen in a focused window. */
+function chatInView() {
+  return chatWith && !$("#panel-messages").hidden && !$("#dm-chat-view").hidden
+    && document.visibilityState === "visible" && document.hasFocus();
+}
+
+async function markChatRead() {
+  if (!chatInView()) return;
+  try {
+    await invoke("mark_dm_read", { memberId: chatWith });
+    view = await invoke("get_state");
+    renderDmBadge();
+  } catch (e) { console.warn("mark_dm_read", e); }
+}
+
+/** The Messages tab: the open conversation, or the list. */
+function showMessages() {
+  $("#dm-picker").hidden = true;
+  if (chatWith) return openChat(chatWith);
+  $("#dm-chat-view").hidden = true;
+  $("#dm-list-view").hidden = false;
+  loadConversations();
+}
+
+function refreshMessages() {
+  if (!$("#dm-chat-view").hidden && chatWith) loadChat(false);
+  else loadConversations();
+}
+
+async function loadConversations() {
+  const err = $("#dm-list-err");
+  let list;
+  try {
+    list = await invoke("list_conversations");
+    hideError(err);
+  } catch (e) {
+    return showError(err, e);
+  }
+  $("#dm-list").replaceChildren(...list.map(renderConversation));
+  $("#dm-empty").hidden = list.length > 0;
+}
+
+function renderConversation(c) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "conv" + (c.unread ? " unread" : "");
+  const face = document.createElement("span");
+  face.className = "avatar";
+  face.setAttribute("aria-hidden", "true");
+  avatar(face, c.name, c.avatar);
+  const main = document.createElement("span");
+  main.className = "conv-main";
+  const top = document.createElement("span");
+  top.className = "conv-top";
+  const name = document.createElement("span");
+  name.className = "conv-name";
+  name.textContent = c.name;
+  const t = document.createElement("span");
+  t.className = "muted small";
+  t.textContent = when(c.last_at);
+  top.append(name, t);
+  const last = document.createElement("span");
+  last.className = "conv-last";
+  last.textContent = (c.last_mine ? "You: " : "") + c.last_text;
+  main.append(top, last);
+  b.append(face, main);
+  if (c.unread) {
+    const n = document.createElement("span");
+    n.className = "badge";
+    n.textContent = c.unread > 9 ? "9+" : String(c.unread);
+    n.setAttribute("aria-label", `${c.unread} unread`);
+    b.append(n);
+  }
+  b.addEventListener("click", () => openChat(c.member_id));
+  return b;
+}
+
+async function openChat(memberId) {
+  if (draftFor !== memberId) {
+    draftFor = memberId;
+    for (const s of dmStaged) if (s.id) invoke("unstage_photo", { id: s.id });
+    dmStaged = [];
+    renderDmStaged();
+    $("#dm-text").value = "";
+    hideError($("#dm-err"));
+  }
+  chatWith = memberId;
+  $("#dm-list-view").hidden = true;
+  $("#dm-chat-view").hidden = false;
+  await loadChat(true);
+  if (!$("#dm-composer").hidden && !$("#screen-main").classList.contains("readonly")) $("#dm-text").focus();
+}
+
+$("#dm-back").addEventListener("click", () => {
+  chatWith = null;
+  showMessages();
+});
+
+async function loadChat(scrollToEnd) {
+  const member = chatWith;
+  let c;
+  try {
+    c = await invoke("open_chat", { memberId: member });
+  } catch (e) {
+    return showError($("#dm-err"), e);
+  }
+  if (chatWith !== member) return; // switched away meanwhile
+  avatar($("#dm-avatar"), c.name, c.avatar);
+  $("#dm-name").textContent = c.name;
+  const log = $("#dm-log");
+  const atEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  const items = [];
+  let day = null;
+  for (const m of c.messages) {
+    const d = new Date(m.created_at * 1000).toDateString();
+    if (d !== day) {
+      day = d;
+      const sep = document.createElement("div");
+      sep.className = "day-sep";
+      sep.textContent = new Date(m.created_at * 1000).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+      items.push(sep);
+    }
+    items.push(renderBubble(m));
+  }
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = c.can_message ? `No messages with ${c.name} yet. Only the two of you will be able to read them.` : "No messages.";
+    items.push(empty);
+  }
+  log.replaceChildren(...items);
+  if (scrollToEnd || atEnd) log.scrollTop = log.scrollHeight;
+  const readonly = $("#screen-main").classList.contains("readonly");
+  const gone = $("#dm-gone");
+  gone.hidden = c.can_message || readonly;
+  gone.textContent = `${c.name} isn't a verified member of the group any more, so new messages can't be sent. What you exchanged stays here.`;
+  $("#dm-composer").hidden = !c.can_message || readonly;
+  markChatRead();
+}
+
+function renderBubble(m) {
+  const row = document.createElement("div");
+  row.className = "bubble-row" + (m.mine ? " mine" : "");
+  const b = document.createElement("div");
+  b.className = "bubble";
+  if (m.photos.length) {
+    const photos = document.createElement("div");
+    const n = m.photos.length;
+    photos.className = "photos " + (n === 1 ? "n1" : n === 2 ? "n2" : n === 4 ? "n4" : "many");
+    for (const ph of m.photos) photos.append(renderPhoto(ph, n === 1));
+    b.append(photos);
+  }
+  const text = document.createElement("div");
+  text.className = "text";
+  text.textContent = m.text;
+  const t = document.createElement("div");
+  t.className = "when";
+  t.textContent = new Date(m.created_at * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  t.title = new Date(m.created_at * 1000).toLocaleString();
+  b.append(text, t);
+  row.append(b);
+  return row;
+}
+
+// New message: pick someone from the verified roster.
+$("#dm-new").addEventListener("click", async () => {
+  const err = $("#dm-list-err");
+  hideError(err);
+  let people;
+  try {
+    people = await invoke("dm_recipients");
+  } catch (e) {
+    return showError(err, e);
+  }
+  $("#dm-picker-list").replaceChildren(...people.map((p) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "pick";
+    const face = document.createElement("span");
+    face.className = "avatar";
+    face.setAttribute("aria-hidden", "true");
+    avatar(face, p.name, p.avatar);
+    const name = document.createElement("span");
+    name.textContent = p.name;
+    b.append(face, name);
+    b.addEventListener("click", () => { $("#dm-picker").hidden = true; openChat(p.member_id); });
+    return b;
+  }));
+  $("#dm-picker-empty").hidden = people.length > 0;
+  $("#dm-picker").hidden = false;
+});
+$("#dm-picker-cancel").addEventListener("click", () => { $("#dm-picker").hidden = true; });
+
+function renderDmStaged() {
+  $("#dm-photos").replaceChildren(...dmStaged.map((s) => {
+    const item = document.createElement("div");
+    item.className = "staged-item" + (s.preview ? "" : " busy");
+    if (s.preview) {
+      const img = document.createElement("img");
+      img.src = s.preview;
+      img.alt = "";
+      const x = document.createElement("button");
+      x.type = "button";
+      x.textContent = "×";
+      x.setAttribute("aria-label", "Remove photo");
+      x.addEventListener("click", () => {
+        invoke("unstage_photo", { id: s.id });
+        dmStaged = dmStaged.filter((o) => o !== s);
+        renderDmStaged();
+      });
+      item.append(img, x);
+    } else {
+      const sp = document.createElement("span");
+      sp.className = "spinner";
+      item.append(sp);
+    }
+    return item;
+  }));
+}
+
+$("#dm-file").addEventListener("change", async (ev) => {
+  const files = [...ev.target.files];
+  ev.target.value = "";
+  const err = $("#dm-err");
+  hideError(err);
+  for (const file of files) {
+    if (dmStaged.length >= 10) { showError(err, "At most 10 photos per message."); break; }
+    const slot = { id: null, preview: null };
+    dmStaged.push(slot);
+    renderDmStaged();
+    try {
+      // The same pipeline as posts: resized, re-encoded as WebP, EXIF (GPS included) dropped.
+      const r = await invoke("stage_photo", new Uint8Array(await file.arrayBuffer()));
+      slot.id = r.id;
+      slot.preview = r.preview;
+    } catch (e) {
+      dmStaged = dmStaged.filter((o) => o !== slot);
+      showError(err, `${file.name}: ${e}`);
+    }
+    renderDmStaged();
+  }
+});
+
+$("#dm-composer").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const err = $("#dm-err");
+  hideError(err);
+  if (dmStaged.some((s) => !s.preview)) return showError(err, "Wait for the photos to finish preparing.");
+  const text = $("#dm-text").value;
+  const photos = dmStaged.map((s) => s.id);
+  if (!text.trim() && !photos.length) return;
+  const member = chatWith;
+  await busy($("#dm-send"), async () => {
+    $("#dm-send").textContent = photos.length ? "Uploading…" : "Sending…";
+    try {
+      await invoke("send_dm", { memberId: member, text, photos });
+      if (chatWith === member) {
+        $("#dm-text").value = "";
+        dmStaged = [];
+        renderDmStaged();
+        await loadChat(true);
+      }
+    } catch (e) {
+      showError(err, e);
+    }
+  });
+  $("#dm-text").focus();
+});
+
+$("#dm-text").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("#dm-composer").requestSubmit();
 });
 
 // --- settings ------------------------------------------------------------------------------

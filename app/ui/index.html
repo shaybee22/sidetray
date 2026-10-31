@@ -128,6 +128,7 @@
     </div>
     <nav class="tabs" role="tablist">
       <button class="tab" role="tab" data-tab="feed" aria-selected="true">Feed</button>
+      <button class="tab" role="tab" data-tab="messages">Messages <span class="badge" id="dm-badge" hidden></span></button>
       <button class="tab" role="tab" data-tab="members">Members</button>
       <button class="tab" role="tab" data-tab="km" id="tab-km-btn" hidden>Key Master <span class="badge" id="km-badge" hidden></span></button>
       <button class="tab" role="tab" data-tab="device">This device</button>
@@ -145,6 +146,7 @@
 
   <div class="banner" id="readonly-banner" hidden>
     <span id="readonly-text">Saved posts from a group you're no longer in. Read only.</span>
+    <button class="ghost small" id="readonly-switch">Messages</button>
     <button class="ghost small" id="readonly-back">Back</button>
   </div>
 
@@ -166,6 +168,43 @@
     <div id="feed"></div>
     <p class="empty" id="feed-empty" hidden>No posts yet. Say hello.</p>
     <div class="actions center"><button class="ghost" id="load-more" hidden>Older posts</button></div>
+  </section>
+
+  <section class="panel" id="panel-messages" hidden>
+    <div class="card" id="dm-list-view">
+      <div class="dm-list-head">
+        <h2>Messages</h2>
+        <button class="primary small" id="dm-new">New message</button>
+      </div>
+      <p class="hint">Only you and the person you write to can read a conversation: not other members, not Key Masters, not the server.</p>
+      <div class="dm-picker" id="dm-picker" hidden>
+        <p class="hint">Who do you want to write to?</p>
+        <div id="dm-picker-list"></div>
+        <p class="empty" id="dm-picker-empty" hidden>Nobody else in the group can receive messages yet.</p>
+        <div class="actions start"><button class="ghost small" id="dm-picker-cancel">Cancel</button></div>
+      </div>
+      <div id="dm-list"></div>
+      <p class="empty" id="dm-empty" hidden>No conversations yet. Start one with <b>New message</b>, or with <b>Message</b> next to someone under Members.</p>
+      <p class="error" id="dm-list-err" hidden></p>
+    </div>
+    <div class="card chat" id="dm-chat-view" hidden>
+      <header class="chat-head">
+        <button class="ghost small" id="dm-back" aria-label="Back to all conversations">‹ All</button>
+        <span class="avatar" id="dm-avatar" aria-hidden="true"></span>
+        <b id="dm-name"></b>
+      </header>
+      <div class="chat-log" id="dm-log" aria-live="polite"></div>
+      <p class="note chat-gone" id="dm-gone" hidden></p>
+      <form id="dm-composer" class="chat-composer" novalidate>
+        <div class="staged" id="dm-photos"></div>
+        <div class="chat-input-row">
+          <label class="button ghost" title="Add photos">Photo<input id="dm-file" type="file" accept="image/*" multiple hidden></label>
+          <textarea id="dm-text" rows="2" maxlength="20000" placeholder="Write a message… (Ctrl+Enter sends)"></textarea>
+          <button class="primary" id="dm-send">Send</button>
+        </div>
+        <p class="error" id="dm-err" hidden></p>
+      </form>
+    </div>
   </section>
 
   <section class="panel" id="panel-members" hidden>
@@ -284,6 +323,7 @@
         <div class="small muted m-chosen" hidden></div>
       </div>
       <div class="member-actions">
+        <button class="ghost small m-message" hidden>Message</button>
         <button class="ghost small m-accept" hidden>Accept new name</button>
         <button class="ghost small m-promote" hidden>Make Key Master</button>
         <button class="ghost small danger m-remove" hidden>Remove</button>

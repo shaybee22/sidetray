@@ -325,7 +325,8 @@ pub struct MemberView {
     pub id: String,
     /// The certified name.
     pub name: String,
-    /// The name they chose in their profile, if it differs (not accepted by a Key Master yet).
+    /// Key Masters only: the name they chose in their profile, if it differs
+    /// from the certified one (waiting for a Key Master to accept it).
     pub chosen_name: Option<String>,
     pub avatar: Option<String>,
     /// "keymaster" or "member", from certificates (the server's claim if none verify).
@@ -358,7 +359,7 @@ pub async fn list_members(app: &App) -> Result<Vec<MemberView>> {
     for v in &mut views {
         let (avatar, chosen) = crate::profile::view(&conn, &v.id);
         v.avatar = avatar;
-        v.chosen_name = chosen.filter(|c| *c != v.name && v.cert_status != "unverified");
+        v.chosen_name = chosen.filter(|c| id.is_keymaster() && *c != v.name && v.cert_status != "unverified");
     }
     Ok(views)
 }
@@ -453,6 +454,7 @@ mod tests {
                 last_seen: None,
                 joined_at: None,
                 revoked_seq: None,
+                revoked_dm_seq: None,
             };
             match raw_members.iter_mut().find(|x| x.id == *m) {
                 Some(x) => x.devices.push(md),
@@ -478,7 +480,7 @@ mod tests {
                 );
             }
         }
-        CheckedRoster { raw: Roster { members: raw_members, former: vec![] }, verified, former: BTreeMap::new() }
+        CheckedRoster { raw: Roster { members: raw_members, former: vec![] }, verified, former: BTreeMap::new(), former_dm: BTreeMap::new() }
     }
 
     fn identity(member: &str, device: &str, k: &DeviceKeys) -> Identity {

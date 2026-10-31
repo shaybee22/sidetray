@@ -76,6 +76,7 @@ fn is_foreground(w: &tauri::WebviewWindow) -> bool {
 /// Redraw the badge and tooltip from the unread count and pending joins.
 pub fn refresh(handle: &AppHandle, app: &App) {
     let unread = db::unread(&app.db()).unwrap_or(0).max(0) as u32;
+    let messages = db::dm_unread(&app.db()).unwrap_or(0).max(0) as u32;
     let joins = app.pending_joins.load(Ordering::SeqCst);
     let Some(tray) = handle.tray_by_id(TRAY_ID) else { return };
     let mut tip = String::from("Side Tray");
@@ -84,13 +85,18 @@ pub fn refresh(handle: &AppHandle, app: &App) {
         1 => tip.push_str(" — 1 new post or comment"),
         n => tip.push_str(&format!(" — {n} new posts and comments")),
     }
+    match messages {
+        0 => {}
+        1 => tip.push_str("\n1 unread message"),
+        n => tip.push_str(&format!("\n{n} unread messages")),
+    }
     match joins {
         0 => {}
         1 => tip.push_str("\n1 join request waiting"),
         n => tip.push_str(&format!("\n{n} join requests waiting")),
     }
     let _ = tray.set_tooltip(Some(&tip));
-    let _ = tray.set_icon(Some(icon(unread + joins as u32)));
+    let _ = tray.set_icon(Some(icon(unread + messages + joins as u32)));
 }
 
 /// The tray icon's pixel size: Windows asks for a small icon (16 px at 100%

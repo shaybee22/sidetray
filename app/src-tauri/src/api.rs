@@ -493,6 +493,9 @@ pub struct MemberDevice {
     pub joined_at: Option<i64>,
     /// Former devices: the last event seq before they were cut off.
     pub revoked_seq: Option<i64>,
+    /// Former devices: the last direct message seq before they were cut off.
+    #[serde(default)]
+    pub revoked_dm_seq: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -525,6 +528,44 @@ pub struct EventPage {
     /// The group's current key version.
     #[serde(default)]
     pub key_version: u32,
+}
+
+/// A direct message, as `GET /dms` returns it (Phase 5b).
+#[derive(Deserialize)]
+pub struct Dm {
+    pub seq: i64,
+    pub conversation_id: String,
+    pub sender_device_id: String,
+    pub sender_member_id: String,
+    pub recipient_member_id: String,
+    pub ciphertext: String,
+    pub signature: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub sealed_keys: Vec<DmKey>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct DmKey {
+    pub device_id: String,
+    pub sealed_key: String,
+}
+
+#[derive(Deserialize)]
+pub struct DmPage {
+    pub messages: Vec<Dm>,
+    pub last_seq: i64,
+    pub has_more: bool,
+}
+
+#[derive(Serialize)]
+pub struct DmReq<'a> {
+    pub conversation_id: &'a str,
+    pub recipient_member_id: &'a str,
+    pub ciphertext: String,
+    pub signature: String,
+    pub media_ids: Vec<String>,
+    pub sealed_keys: Vec<DmKey>,
 }
 
 #[derive(Deserialize)]

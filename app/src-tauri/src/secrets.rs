@@ -52,6 +52,19 @@ impl Secrets {
         Ok(GroupKey::from_bytes(version, &key))
     }
 
+    /// Wrap a direct message's key (kept so its photos can be fetched later).
+    pub fn wrap_message_key(&self, message_id: &str, key: &crypto::dm::MessageKey) -> Result<Vec<u8>> {
+        Ok(crypto::encrypt(&self.local_key()?, &key.key_bytes()[..], &dm_wrap_ad(message_id)))
+    }
+
+    pub fn unwrap_message_key(&self, message_id: &str, wrapped: &[u8]) -> Result<crypto::dm::MessageKey> {
+        let raw = zeroize::Zeroizing::new(
+            crypto::decrypt(&self.local_key()?, wrapped, &dm_wrap_ad(message_id)).context("unwrapping a stored message key")?,
+        );
+        let key: [u8; 32] = raw[..].try_into().context("stored message key has the wrong length")?;
+        Ok(crypto::dm::MessageKey::from_bytes(&key))
+    }
+
     fn local_key(&self) -> Result<GroupKey> {
         Ok(GroupKey::from_bytes(0, &decode32(&self.local_key)?))
     }
@@ -60,6 +73,12 @@ impl Secrets {
 fn wrap_ad(version: u32) -> Vec<u8> {
     let mut ad = b"sidetray/local-group-key/v1:".to_vec();
     ad.extend_from_slice(&version.to_le_bytes());
+    ad
+}
+
+fn dm_wrap_ad(message_id: &str) -> Vec<u8> {
+    let mut ad = b"sidetray/local-dm-key/v1:".to_vec();
+    ad.extend_from_slice(message_id.as_bytes());
     ad
 }
 

@@ -92,6 +92,11 @@ pub struct SyncReport {
     pub rotated: Option<u32>,
     /// Avatars that became available (downloaded and checked) in this sync.
     pub avatars: usize,
+    /// Direct messages stored in this sync (from others, or from my other devices).
+    pub new_dms: usize,
+    /// New direct messages from others, for the unread count and notifications.
+    #[serde(skip)]
+    pub dm_notices: Vec<crate::dm::DmNotice>,
 }
 
 /// Who may author events: verified devices in the roster now, and former
@@ -133,6 +138,7 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
     let api = app.api(&id)?;
     let s = app.secrets(&id)?;
     let roster = account::refresh_roster(app, &id, &api).await?;
+    let dm_former = roster.former_dm;
     let authors = Authors { current: roster.verified, former: roster.former };
     // The roster refresh may have recorded a promotion.
     let id = app.require_active()?;
@@ -187,6 +193,16 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
             break;
         }
     }
+    // Direct messages (Phase 5b). A failure here doesn't fail the feed sync.
+    let dm_authors = crate::dm::Authors { current: authors.current.clone(), former: dm_former };
+    match crate::dm::sync(app, &id, &s, &api, &dm_authors).await {
+        Ok(d) => {
+            report.new_dms = d.new_messages;
+            report.rejected += d.rejected;
+            report.dm_notices = d.notices;
+        }
+        Err(e) => eprintln!("syncing direct messages: {e:#}"),
+    }
     download_media(app, &id, &s, &api).await;
     report.avatars = crate::profile::download(app, &id, &s, &api).await;
     if let Some(keys) = &km_keys {
@@ -215,7 +231,7 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
 }
 
 /// One line for a notification: whitespace collapsed, cut at 140 characters.
-fn snippet(text: &str, photos: usize) -> String {
+pub fn snippet(text: &str, photos: usize) -> String {
     let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if t.is_empty() {
         return match photos {
@@ -250,8 +266,9 @@ fn apply_event(
     let event_id = crypto::event_id(&ct);
     let member = &author.member_id;
     let by_other = *member != id.member_id;
-    // Posts and notifications use the name the author chose, if any.
-    let author_name = || crate::profile::chosen_name(conn, member).unwrap_or_else(|| author.display_name.clone());
+    // Posts and notifications use the certified name: a name chosen in a
+    // profile counts only once a Key Master accepts it (re-signs the certificate).
+    let author_name = || author.display_name.clone();
     match e.kind.as_str() {
         "post" => {
             let body: PostBody = serde_json::from_slice(&plain).context("bad post payload")?;
@@ -632,6 +649,8 @@ pub struct PostView {
     pub author: String,
     pub author_avatar: Option<String>,
     pub author_keymaster: bool,
+    /// Key Masters only: a name the author chose that no Key Master has accepted yet.
+    pub author_pending_name: Option<String>,
     pub mine: bool,
     pub text: String,
     pub created_at: i64,
@@ -679,10 +698,12 @@ pub fn media_url(file: &str) -> String {
 const UNKNOWN: &str = "Unknown member";
 
 /// Newest first, `limit` posts older than `before` (a seq), or the latest.
-pub fn feed(conn: &Connection, me: &str, before: Option<i64>, limit: i64) -> Result<Vec<PostView>> {
+/// Names are the certified ones; `keymaster` adds names waiting for acceptance.
+pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, limit: i64) -> Result<Vec<PostView>> {
     let mut st = conn.prepare(
-        "SELECT p.id, p.seq, p.author_id, COALESCE(pr.display_name, m.display_name, ?1), COALESCE(m.role, 'member'), p.body,
-                p.created_at, p.edited_at IS NOT NULL, pr.avatar_path
+        "SELECT p.id, p.seq, p.author_id, COALESCE(m.display_name, ?1), COALESCE(m.role, 'member'), p.body,
+                p.created_at, p.edited_at IS NOT NULL, pr.avatar_path,
+                CASE WHEN pr.display_name IS NOT m.display_name THEN pr.display_name END
          FROM posts p LEFT JOIN members m ON m.id = p.author_id LEFT JOIN profiles pr ON pr.member_id = p.author_id
          WHERE p.deleted = 0 AND p.seq < ?2 ORDER BY p.seq DESC LIMIT ?3",
     )?;
@@ -696,6 +717,7 @@ pub fn feed(conn: &Connection, me: &str, before: Option<i64>, limit: i64) -> Res
             author: r.get(3)?,
             author_avatar: r.get::<_, Option<String>>(8)?.as_deref().map(media_url),
             author_keymaster: role == Role::Keymaster.as_str(),
+            author_pending_name: if keymaster { r.get(9)? } else { None },
             text: r.get(5)?,
             created_at: r.get(6)?,
             edited: r.get(7)?,
@@ -708,13 +730,13 @@ pub fn feed(conn: &Connection, me: &str, before: Option<i64>, limit: i64) -> Res
 
     let mut photos = conn.prepare("SELECT thumb_path, local_path, width, height FROM media WHERE post_id = ?1 ORDER BY idx")?;
     let mut comments = conn.prepare(
-        "SELECT c.id, c.author_id, COALESCE(pr.display_name, m.display_name, ?2), c.body, c.created_at, pr.avatar_path
+        "SELECT c.id, c.author_id, COALESCE(m.display_name, ?2), c.body, c.created_at, pr.avatar_path
          FROM comments c LEFT JOIN members m ON m.id = c.author_id LEFT JOIN profiles pr ON pr.member_id = c.author_id
          WHERE c.post_id = ?1 ORDER BY c.seq",
     )?;
     let mut reactions = conn.prepare(
-        "SELECT r.emoji, r.author_id, COALESCE(pr.display_name, m.display_name, ?2) FROM reactions r
-         LEFT JOIN members m ON m.id = r.author_id LEFT JOIN profiles pr ON pr.member_id = r.author_id
+        "SELECT r.emoji, r.author_id, COALESCE(m.display_name, ?2) FROM reactions r
+         LEFT JOIN members m ON m.id = r.author_id
          WHERE r.post_id = ?1 ORDER BY r.seq",
     )?;
     for p in &mut posts {
@@ -860,7 +882,7 @@ mod tests {
         let (ed, _) = f.event("edit", serde_json::json!({ "post": pid, "text": "hello, edited" }));
         f.apply(&ed).unwrap();
 
-        let view = feed(&f.conn, "m_me", None, 50).unwrap();
+        let view = feed(&f.conn, "m_me", false, None, 50).unwrap();
         assert_eq!(view.len(), 1);
         assert_eq!(view[0].author, "Ana");
         assert_eq!(view[0].text, "hello, edited");
@@ -871,7 +893,7 @@ mod tests {
 
         let (del, _) = f.event("delete", serde_json::json!({ "post": pid }));
         f.apply(&del).unwrap();
-        assert!(feed(&f.conn, "m_me", None, 50).unwrap().is_empty());
+        assert!(feed(&f.conn, "m_me", false, None, 50).unwrap().is_empty());
     }
 
     #[test]
@@ -901,7 +923,7 @@ mod tests {
         f.apply(&ed).unwrap();
         let (del, _) = f.event("delete", serde_json::json!({ "post": "p_me" }));
         f.apply(&del).unwrap();
-        let view = feed(&f.conn, "m_me", None, 50).unwrap();
+        let view = feed(&f.conn, "m_me", false, None, 50).unwrap();
         assert_eq!(view[0].text, "mine");
         assert!(view[0].mine);
     }
@@ -949,18 +971,28 @@ mod tests {
     }
 
     #[test]
-    fn profile_names_show_on_posts_and_notices() {
+    fn chosen_names_wait_for_a_key_master() {
         let mut f = fixture();
-        let (pr, _) = f.event("profile", serde_json::json!({ "display_name": "Ana Banana", "avatar": null }));
+        // Ana renames herself "Mom": nobody sees it until a Key Master accepts it.
+        let (pr, _) = f.event("profile", serde_json::json!({ "display_name": "Mom", "avatar": null }));
         assert!(f.apply(&pr).unwrap().is_none());
         let (post, pid) = f.event("post", serde_json::json!({ "text": "hi" }));
-        assert_eq!(f.apply(&post).unwrap().unwrap().author, "Ana Banana");
+        assert_eq!(f.apply(&post).unwrap().unwrap().author, "Ana");
         let (c, _) = f.event("comment", serde_json::json!({ "post": pid, "text": "me again" }));
         f.apply(&c).unwrap();
-        let view = feed(&f.conn, "m_me", None, 50).unwrap();
-        assert_eq!(view[0].author, "Ana Banana");
-        assert_eq!(view[0].comments[0].author, "Ana Banana");
+        let view = feed(&f.conn, "m_me", false, None, 50).unwrap();
+        assert_eq!(view[0].author, "Ana");
+        assert_eq!(view[0].comments[0].author, "Ana");
+        assert_eq!(view[0].author_pending_name, None);
         assert_eq!(view[0].author_avatar, None);
+        // Key Masters see that a change is waiting.
+        let view = feed(&f.conn, "m_me", true, None, 50).unwrap();
+        assert_eq!(view[0].author, "Ana");
+        assert_eq!(view[0].author_pending_name.as_deref(), Some("Mom"));
+        // Once accepted, the certificate (and so the roster cache) carries it.
+        f.conn.execute("UPDATE members SET display_name = 'Mom' WHERE id = 'm_ana'", []).unwrap();
+        let view = feed(&f.conn, "m_me", true, None, 50).unwrap();
+        assert_eq!((view[0].author.as_str(), view[0].author_pending_name.as_deref()), ("Mom", None));
         // A malformed profile event is rejected like any other bad event.
         let (bad, _) = f.event("profile", serde_json::json!({ "display_name": "" }));
         assert!(f.apply(&bad).is_err());
