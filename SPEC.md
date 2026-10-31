@@ -18,7 +18,7 @@ Side Tray is a private, invite-only feed for one group of friends and family: ev
 
 - Multiple groups (schema carries `group_id` so this is a later feature, not a rewrite)
 - Facebook cross-posting browser extension (phase 2)
-- Native phone apps (PWA later), video, search beyond the local archive
+- Native phone apps (an Android app is planned; see "Android app" below), video, search beyond the local archive
 - Direct messages come right after the MVP feed (Phase 5b below)
 
 ## Architecture
@@ -266,6 +266,72 @@ Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, 
 
 **Done when** `install.sh` brings up a fresh VPS on a real domain, the app joins it with no pasted certificate, an invite link opens the wizard pre-filled, a cropped avatar and a new name show up on another member's device, and a second group created with `sidetray-admin new-group` can't see or be found from the first.
 
+## Android app
+
+Side Tray 0.1.1 runs on Windows and Linux. This section plans a phone app for Android. Nothing here is built yet.
+
+**Decisions**
+
+- **Tauri 2 on Android.** The same Rust backend and `sidetray-crypto` crate, and as much of `app/ui` as possible. The crypto crate is pure Rust (no libsodium to link), so it cross-compiles as is. The C parts of the app's dependencies (`ring` for rustls, bundled SQLite, libwebp) build with the NDK's clang. Desktop-only plugins (tray, autostart, single-instance, updater) sit behind `cfg(desktop)`; Android gets its own equivalents where needed.
+- **The phone is its own device.** It generates its own X25519 and Ed25519 keypairs on first run and joins through the normal flow: join request, the same safety code on both screens, a Key Master approves. A person can approve their own phone from a Key Master desktop. Keys never move between devices: no export, no QR transfer, no backup of private keys. The phone gets the group key sealed to it like any new device, and direct messages are sealed to it from then on (earlier ones aren't, as for any new device).
+- **Keys protected by the Android Keystore.** The Keystore can't run libsodium-style X25519/Ed25519 operations on every device, so the app keeps a non-exportable AES-256-GCM key in the Keystore and stores the device's private keys, token and group keys wrapped with it in app-private storage. Unwrapped keys live only in memory, as on desktop. Uninstalling the app or clearing its data means a new device and a new join.
+- **Notifications through UnifiedPush and a self-hosted ntfy.** The server runs ntfy next to the relay; `install.sh` can set it up (optional, off unless the operator says yes). A push carries no content, only a wake-up: the app then syncs over the normal API, decrypts, and shows the notification itself, so neither ntfy nor any distributor sees names, text or who posted. No Google FCM. Users without a UnifiedPush distributor app get a periodic background sync instead (WorkManager, about every 15 minutes, Android's minimum).
+- **Share target.** "Share → Side Tray" from any app (Facebook, Photos, the browser) opens the composer with the shared image(s) and/or text attached; the person chooses post or direct message and sends. Shared photos go through the same resize, EXIF strip and WebP encode as any photo.
+- **Distribution.** A signed APK attached to GitHub releases first, sideloaded. The app checks `latest.json` (or an Android entry next to it) and shows "New version available" with a *Download* button that fetches the APK and hands it to the system installer. Play Store is a later decision.
+
+**What changes on the server**
+
+- Push registration: `POST /push` with `{endpoint}` (the UnifiedPush endpoint URL the distributor gives the app) and `DELETE /push`, stored per device. Revoking a device deletes its endpoint.
+- Wherever the relay pushes on `/ws` today (`new_event`, `new_dm`, `join_request`, `key_rotated`, `removed`, `roster`), it also POSTs an empty wake-up to the endpoints of the affected devices that have no live `/ws` connection. Coalesced: at most one wake-up per device every few seconds.
+- The relay only POSTs to endpoints on the configured ntfy host or that a distributor issued; it doesn't fetch arbitrary URLs for anyone.
+
+**Phases**
+
+**A1. Android build, join, feed, posting, comments, DMs (sync while open)**
+
+- `tauri android init`; the app builds and runs on an emulator and a real phone.
+- Keystore-wrapped key storage (above) in place of Credential Manager.
+- First-run wizard and join flow, including invite links (`sidetray://` as an Android intent filter) and the test-server fingerprint step.
+- Feed, posts with photos, comments, reactions, Messages tab and chat, Key Master tab (approve joins from the phone too). Sync and `/ws` run while the app is in the foreground; nothing in the background yet.
+- The existing layout made usable on a phone screen; the real mobile polish is A2.
+- **Done when** a phone joins a group, a Key Master desktop approves it after comparing codes, and the phone posts, comments and exchanges direct messages with a desktop.
+
+What this Windows machine needs to build for Android:
+
+- **Android Studio** (easiest way to get everything below, plus the emulator), or the standalone command-line tools.
+- **Android SDK**: an SDK Platform (API 34 or newer), Platform-Tools (`adb`), Build-Tools, Command-line Tools, and the Android Emulator with a system image, all from the SDK Manager.
+- **Android NDK** (side-by-side, r27 or the version Tauri's docs name), for the Rust and C code.
+- **JDK 17**: Android Studio's bundled JBR works (`C:\Program Files\Android\Android Studio\jbr`).
+- **Environment variables**: `JAVA_HOME` (the JDK), `ANDROID_HOME` (usually `%LOCALAPPDATA%\Android\Sdk`), `NDK_HOME` (`%ANDROID_HOME%\ndk\<version>`).
+- **Rust targets**: `rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android`.
+- **Windows Developer Mode** on (Settings → System → For developers), because the Tauri Android build creates symlinks.
+- A phone with USB debugging on, or an emulator image (x86_64).
+
+**A2. Share target, camera and gallery, mobile layout**
+
+- "Share → Side Tray" intent filters for `image/*` (one or several) and `text/plain`; the shared content opens in the composer.
+- Photo picker with the camera and the system gallery (Android photo picker).
+- Mobile layout polish: bottom tabs, full-width composer, larger touch targets, back button behaviour, safe areas, the photo lightbox with pinch zoom.
+- **Done when** sharing a photo from another app lands in a Side Tray post on a desktop, and a photo taken with the camera posts the same way.
+
+**A3. Push through UnifiedPush and ntfy**
+
+- Server: ntfy in `compose.yaml` behind Caddy (its own path or subdomain), the optional step in `install.sh`, the `/push` endpoints and wake-ups above.
+- App: the UnifiedPush connector, registering the endpoint with the relay, syncing on a wake-up and showing local notifications (new post, comment on your post, direct message, join request for Key Masters). Tapping a notification opens the post or conversation.
+- Fallback: WorkManager periodic sync (~15 minutes) when no distributor is installed, with a line in settings explaining how to get instant notifications (install ntfy).
+- **Done when** a post from a desktop notifies a locked phone within seconds through ntfy, a phone without a distributor notifies within the sync interval, and a capture of the push traffic shows no content.
+
+**A4. Release pipeline**
+
+- GitHub Actions builds a signed release APK on `v*` tags (alongside the desktop builds) and attaches it to the release, with its version in the update manifest.
+- In-app update prompt: on start and daily, check the manifest; if newer, show "New version available" with *Download*, then hand the APK to the installer (the person allows "install unknown apps" for Side Tray once).
+- The APK signing key stays out of the repo: a keystore in GitHub Actions secrets (base64 keystore, store and key passwords), with an offline backup kept by the maintainer. Losing it means users must uninstall and reinstall (a new device and a new join), so the backup matters.
+- **Done when** a tag produces a release with the APK attached, and a phone running the previous version offers the update and installs it.
+
+## Backlog for 0.1.2
+
+- "Start Side Tray when I sign in" (*This device → Settings*) defaults to ON for new installs. Existing installs keep whatever they have.
+
 ## Distribution and later
 
 **Distribution**
@@ -278,7 +344,7 @@ Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, 
 
 - In-app group switcher (one install in several groups); the server side is Phase 6b
 - Facebook "Send to Side Tray too?" browser extension
-- PWA for phones, then native apps if needed
+- Android app: see "Android app" above; iPhone later
 - Archive sharing for new members, SQLCipher at rest, email verification via the M365 domain
 - iPhone photos: accept HEIC/HEIF in the photo picker (decode, then the same resize, EXIF strip and WebP encode)
 - Linux: keep the device's private keys and token in the system keyring (Secret Service / libsecret) instead of the local database
