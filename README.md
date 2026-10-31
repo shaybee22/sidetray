@@ -31,8 +31,10 @@ copies update themselves from signed releases (see [Releases](#releases)).
 Someone in your family runs Side Tray for the group (the *Key Master*). This
 is how you get it onto your Windows computer.
 
-1. **Download the installer.** Your Key Master sends you a link to a file
-   called something like `Side.Tray_0.1.0_x64-setup.exe`. Download it.
+1. **Download the installer** from
+   <https://github.com/shaybee22/sidetray/releases/latest/download/SideTray-Setup.exe>
+   (your Key Master may send you this link too). It always gets the newest
+   version, a file called `SideTray-Setup.exe`.
 2. **Open it.** Double-click the file (or click it in your browser's
    downloads list). You don't need an administrator password.
 3. **Windows will probably warn you.** A blue box appears that says
@@ -42,7 +44,7 @@ is how you get it onto your Windows computer.
    isn't signed with a paid certificate yet, so Windows doesn't recognise
    it (see [Code signing](#code-signing) for what that would change).
    - Click the small underlined **More info** link under the message.
-   - The box now also shows *App: Side.Tray_0.1.0_x64-setup.exe* and
+   - The box now also shows *App: SideTray-Setup.exe* and
      *Publisher: Unknown publisher*, and a second button appears:
      **Run anyway**. Click it.
 
@@ -58,8 +60,7 @@ is how you get it onto your Windows computer.
    │ from starting. Running this app  │     │ from starting. Running this app  │
    │ might put your PC at risk.       │     │ might put your PC at risk.       │
    │ More info   <── click this       │     │                                  │
-   │                                  │     │ App:       Side.Tray_0.1.0_x64-  │
-   │                                  │     │            setup.exe             │
+   │                                  │     │ App:       SideTray-Setup.exe    │
    │                                  │     │ Publisher: Unknown publisher     │
    │                                  │     │                                  │
    │                    [ Don't run ] │     │ [ Run anyway ]   [ Don't run ]   │
@@ -67,8 +68,8 @@ is how you get it onto your Windows computer.
                                                   ^── then this
    ```
 
-   Only do this for a file your Key Master sent you. If the file name looks
-   different, ask them first. (Some browsers also ask "keep this file?"
+   Only do this for `SideTray-Setup.exe` from the link above (or a file your
+   Key Master sent you). If the name looks different, ask them first. (Some browsers also ask "keep this file?"
    when you download it; choose *Keep*.)
 4. **Click through the installer.** Click *Next* until you see *Install*,
    then *Install*. On the last page, leave **Create desktop shortcut**
@@ -581,7 +582,10 @@ One version number for everything: `app/src-tauri/Cargo.toml` (the app;
    Windows (`nsis`: `Side Tray_X.Y.Z_x64-setup.exe`) and Ubuntu 22.04
    (`.deb` and `.AppImage`) with `tauri-apps/tauri-action`. Each build signs
    its update bundle and adds it, its `.sig` and its entry in `latest.json`
-   to the release. macOS isn't built yet.
+   to the release. The Windows job also attaches a copy named
+   `SideTray-Setup.exe`, so `releases/latest/download/SideTray-Setup.exe`
+   (the link in [For family members](#for-family-members)) is always the
+   newest published installer. macOS isn't built yet.
 4. Check the draft, then publish it. Installed apps only see a release once
    it's published (`releases/latest` skips drafts).
 

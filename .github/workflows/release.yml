@@ -78,3 +78,19 @@ jobs:
           releaseId: ${{ needs.draft.outputs.release_id }}
           args: --bundles ${{ matrix.bundles }}
           uploadUpdaterJson: true
+
+      # A copy under a fixed name, so
+      # https://github.com/shaybee22/sidetray/releases/latest/download/SideTray-Setup.exe
+      # always gets the newest published installer (the README links it).
+      - name: Attach SideTray-Setup.exe
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          setups=(app/src-tauri/target/release/bundle/nsis/*_"${TAG#v}"_x64-setup.exe)
+          [ ${#setups[@]} -eq 1 ] || { echo "expected one installer, found: ${setups[*]}"; exit 1; }
+          cp "${setups[0]}" SideTray-Setup.exe
+          gh release upload "$TAG" SideTray-Setup.exe --clobber
