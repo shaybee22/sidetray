@@ -8,4 +8,4 @@ RUN useradd --system --uid 1000 sidetray && mkdir -p /data && chown sidetray /da
 USER sidetray
 ENV SIDETRAY_DATA=/data
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws", "wsproto", "--proxy-headers", "--forwarded-allow-ips", "*"]

@@ -6,7 +6,8 @@
 # 2. Full API on a throwaway api container (fresh database, removed afterwards):
 #    group creation with the setup token, member certificates, join, pending
 #    list, Key Master-only checks, approve with sealed keys + certificate +
-#    anchors, deny, promotion, members, events, ack, media.
+#    anchors, deny, promotion, members, events, ack, media, and the /ws push
+#    channel (who gets join_request and new_event, idle sockets dropped).
 #    Keys, signatures and ciphertext are random bytes: the relay never checks
 #    them (clients do), only that certificates describe the right device.
 set -euo pipefail
@@ -50,11 +51,14 @@ EXISTS=$(expect 200 GET /group | j '["exists"]'); pass "GET /group (exists=$EXIS
 expect 401 GET /events >/dev/null && pass "no token -> 401" || fail "no token -> 401"
 expect 401 GET /events bogus-token >/dev/null && pass "unknown token -> 401" || fail "unknown token -> 401"
 expect 401 GET /join/status bogus-token >/dev/null && pass "unknown token on /join/status -> 401" || fail "unknown token on /join/status -> 401"
+probe() { python3 scripts/ws_probe.py "$@"; }
+[ "$(probe "wss://$SIDETRAY_HOST/api/v1/ws" --cacert "$CACERT" || true)" = "rejected 403" ]   && pass "/ws through Caddy without a token -> 403" || fail "/ws through Caddy without a token -> 403"
+[ "$(probe "wss://$SIDETRAY_HOST/api/v1/ws" --cacert "$CACERT" --token bogus-token || true)" = "rejected 403" ]   && pass "/ws through Caddy with an unknown token -> 403" || fail "/ws through Caddy with an unknown token -> 403"
 unset CACERT
 
 echo "== full API on a throwaway container"
 docker compose run -d --rm --no-deps --name "$SMOKE" -p 127.0.0.1::8000 \
-  -e SIDETRAY_DATA=/tmp/smoke -e SIDETRAY_SETUP_TOKEN=smoke-setup api >/dev/null
+  -e SIDETRAY_DATA=/tmp/smoke -e SIDETRAY_SETUP_TOKEN=smoke-setup -e SIDETRAY_WS_IDLE_SECONDS=6 api >/dev/null
 PORT=$(docker port "$SMOKE" 8000/tcp | head -1 | sed 's/.*://')
 B="http://127.0.0.1:$PORT/api/v1"
 for _ in $(seq 50); do curl -sf "$B/health" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -182,4 +186,36 @@ python3 -c "import sys,json; e=json.loads(sys.argv[1])['events'][-1]; assert (e[
 pass "Key Master pulled it, attributed to the member's device"
 [ "$(expect 200 GET "/events?after=$SEQ" "$KM_TOK" | j '["events"]')" = "[]" ] && pass "?after=$SEQ is empty" || fail "?after=$SEQ is empty"
 [ "$(expect 200 POST /ack "$KM_TOK" "{\"seq\":$SEQ}" | j '["last_seq"]')" = "$SEQ" ] && pass "acked seq=$SEQ" || fail "acked seq=$SEQ"
+
+echo "== push channel (/ws)"
+W="ws://127.0.0.1:$PORT/api/v1/ws"
+[ "$(probe "$W" || true)" = "rejected 403" ] && pass "/ws without a token -> 403" || fail "/ws without a token -> 403"
+[ "$(probe "$W" --token bogus-token || true)" = "rejected 403" ] && pass "/ws with an unknown token -> 403" || fail "/ws with an unknown token -> 403"
+ZED=$(expect 201 POST /join "" "$(join_body Zed zed@x.test)")
+ZED_TOK=$(echo "$ZED" | j '["token"]'); ZED_DEV=$(echo "$ZED" | j '["device_id"]')
+[ "$(probe "$W" --token "$ZED_TOK" || true)" = "rejected 403" ] && pass "/ws with a pending token -> 403" || fail "/ws with a pending token -> 403"
+[ "$(probe "$W" --token "$MAL_TOK" || true)" = "rejected 403" ] && pass "/ws with a denied token -> 403" || fail "/ws with a denied token -> 403"
+expect 200 POST "/joins/$ZED_DEV/approve" "$KM_TOK" "$(approve_body "$ZED_DEV" Zed)" >/dev/null && pass "Zed approved as a member" || fail "Zed approved as a member"
+
+# Kim (Key Master) and Zed (member) listen; then Yan asks to join, Zed posts, Kim posts.
+probe "$W" --token "$KM_TOK" --count 2 --timeout 15 --ready "$TMP/km.ready" > "$TMP/km.ws" & KM_WS=$!
+probe "$W" --token "$ZED_TOK" --count 1 --timeout 15 --ready "$TMP/zed.ready" > "$TMP/zed.ws" & ZED_WS=$!
+for _ in $(seq 50); do [ -e "$TMP/km.ready" ] && [ -e "$TMP/zed.ready" ] && break; sleep 0.1; done
+[ -e "$TMP/km.ready" ] && [ -e "$TMP/zed.ready" ] && pass "two devices connected, each got hello and a pong" || fail "two devices connected, each got hello and a pong"
+YAN_DEV=$(expect 201 POST /join "" "$(join_body Yan yan@x.test)" | j '["device_id"]')
+ZSEQ=$(expect 201 POST /events "$ZED_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | j '["seq"]')
+KSEQ=$(expect 201 POST /events "$KM_TOK" "{\"kind\":\"comment\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" | j '["seq"]')
+wait "$KM_WS" || fail "Kim's socket didn't get its two messages"
+wait "$ZED_WS" || fail "Zed's socket didn't get its message"
+python3 - "$TMP/km.ws" "$TMP/zed.ws" "$YAN_DEV" "$ZSEQ" "$KSEQ" <<'PY'
+import json, sys
+km = [json.loads(l) for l in open(sys.argv[1])]
+zed = [json.loads(l) for l in open(sys.argv[2])]
+yan, zseq, kseq = sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+assert km == [{"type": "join_request", "device_id": yan, "display_name": "Yan", "existing_member": False},
+              {"type": "new_event", "seq": zseq, "kind": "post"}], km
+assert zed == [{"type": "new_event", "seq": kseq, "kind": "comment"}], zed
+PY
+pass "Key Master got join_request + Zed's new_event; member Zed got only Kim's new_event, not its own or the join"
+[ "$(probe "$W" --token "$KM_TOK" --count 1 --timeout 12)" = '{"type": "_closed"}' ]   && pass "a socket that stops pinging is closed after the idle timeout" || fail "a socket that stops pinging is closed after the idle timeout"
 echo "All smoke checks passed."

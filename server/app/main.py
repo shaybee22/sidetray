@@ -5,8 +5,12 @@ Every device has its own bearer token, issued at join and stored hashed.
 The first device creates the group with the operator's setup token and
 becomes its Key Master; later devices wait as `pending` until a Key Master
 approves them and uploads the group key sealed (and signed) to them.
+
+Connected devices get small push messages over /ws (see Hub) telling them
+to sync; the content itself is only ever fetched with GET /events.
 """
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -19,8 +23,10 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
+from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field, field_validator
 
 DATA_DIR = Path(os.environ.get("SIDETRAY_DATA", "./data"))
@@ -32,6 +38,11 @@ MAX_MEDIA_BYTES = int(os.environ.get("SIDETRAY_MAX_MEDIA_BYTES", 10 * 1024 * 102
 PAGE_SIZE = 500
 MAX_PENDING = 20
 KEY_LEN = 32
+# /ws: sockets per device, and how long a socket may stay silent. Clients send
+# {"type": "ping"} every 25 seconds; anything quieter than this is dropped.
+MAX_SOCKETS_PER_DEVICE = 4
+WS_IDLE_SECONDS = float(os.environ.get("SIDETRAY_WS_IDLE_SECONDS", 75))
+WS_QUEUE = 256
 
 # Seeded by the Phase 1 skeleton for its hardcoded test token; removed on startup.
 LEGACY_TEST_GROUP_ID = "g_test"
@@ -180,6 +191,94 @@ def init_db() -> None:
         add_column(conn, "devices", "anchors", "TEXT")  # JSON [{device_id, sign_pubkey}]
         add_column(conn, "devices", "anchors_signature", "BLOB")
         drop_legacy_test_group(conn)
+
+
+class Hub:
+    """Open /ws sockets by device, for push messages.
+
+    In memory, so the relay must run as a single process (it does: one
+    uvicorn worker). Request handlers run in a thread pool, so `send` hands
+    messages to the event loop thread-safely; each socket drains its own
+    queue. Messages only say "something changed"; clients then sync.
+    """
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.sockets: dict[str, set[asyncio.Queue]] = {}
+
+    def count(self, device_id: str) -> int:
+        return len(self.sockets.get(device_id, ()))
+
+    def attach(self, device_id: str, q: asyncio.Queue) -> None:
+        self.sockets.setdefault(device_id, set()).add(q)
+
+    def detach(self, device_id: str, q: asyncio.Queue) -> None:
+        qs = self.sockets.get(device_id)
+        if qs is not None:
+            qs.discard(q)
+            if not qs:
+                del self.sockets[device_id]
+
+    def send(self, device_ids, msg: dict, close: bool = False) -> None:
+        """Queue `msg` for every open socket of these devices; callable from any thread.
+        With close=True each socket is closed after the message."""
+        if self.loop is None or self.loop.is_closed():
+            return
+        data = json.dumps(msg, separators=(",", ":"))
+        self.loop.call_soon_threadsafe(self._deliver, list(device_ids), data, close)
+
+    def _deliver(self, device_ids: list[str], data: str, close: bool) -> None:
+        for d in device_ids:
+            for q in list(self.sockets.get(d, ())):
+                try:
+                    q.put_nowait(data)
+                    if close:
+                        q.put_nowait(None)
+                except asyncio.QueueFull:
+                    # A socket that can't keep up is closed; the client reconnects and syncs.
+                    while not q.empty():
+                        q.get_nowait()
+                    q.put_nowait(None)
+
+
+hub = Hub()
+
+
+def active_device_ids(conn: sqlite3.Connection, group_id: str, keymasters_only: bool = False) -> list[str]:
+    sql = ("SELECT d.id FROM devices d JOIN members m ON m.id = d.member_id"
+           " WHERE d.group_id = ? AND d.status = 'active' AND m.status = 'active'")
+    if keymasters_only:
+        sql += " AND m.role = 'keymaster'"
+    return [r["id"] for r in conn.execute(sql, (group_id,))]
+
+
+def push_new_event(group_id: str, author_device_id: str, seq: int, kind: str) -> None:
+    """Every active device except the one that posted (it already knows)."""
+    with db() as conn:
+        to = [d for d in active_device_ids(conn, group_id) if d != author_device_id]
+    hub.send(to, {"type": "new_event", "seq": seq, "kind": kind})
+
+
+def push_join_request(group_id: str, device_id: str, display_name: str, existing_member: bool) -> None:
+    """Key Masters only: someone is waiting for approval."""
+    with db() as conn:
+        to = active_device_ids(conn, group_id, keymasters_only=True)
+    hub.send(to, {"type": "join_request", "device_id": device_id,
+                  "display_name": display_name, "existing_member": existing_member})
+
+
+def push_key_rotated(group_id: str, key_version: int) -> None:
+    """A new group key was sealed to every active device: fetch it with GET /keys.
+    Sent by key rotation (Phase 6)."""
+    with db() as conn:
+        to = active_device_ids(conn, group_id)
+    hub.send(to, {"type": "key_rotated", "key_version": key_version})
+
+
+def push_removed(device_ids: list[str]) -> None:
+    """These devices were revoked: tell them, then close their sockets.
+    Sent by member removal (Phase 6), and by /ws itself when it notices."""
+    hub.send(device_ids, {"type": "removed"}, close=True)
 
 
 def the_group(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -353,10 +452,11 @@ class AckIn(BaseModel):
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    hub.loop = asyncio.get_running_loop()
     yield
 
 
-app = FastAPI(title="Side Tray relay", version="0.3.0", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="Side Tray relay", version="0.5.0", docs_url=None, redoc_url=None, lifespan=lifespan)
 api = APIRouter(prefix="/api/v1")
 
 
@@ -420,6 +520,7 @@ def join(body: JoinIn):
             "SELECT id, role FROM members WHERE group_id = ? AND lower(email) = lower(?) AND status = 'active'",
             (g["id"], body.email),
         ).fetchone()
+        existing_member = member is not None
         if member:
             member_id, role = member["id"], member["role"]
         else:
@@ -435,7 +536,7 @@ def join(body: JoinIn):
             " token_hash, last_seen, requested_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
             (device_id, g["id"], member_id, enc_pk, sign_pk, hash_token(token), t, t),
         )
-    # TODO(Phase 4): push join_request to online Key Masters over /ws.
+    push_join_request(g["id"], device_id, body.display_name, existing_member)
     return {"group_id": g["id"], "group_name": g["name"], "member_id": member_id,
             "device_id": device_id, "token": token, "status": "pending", "role": role}
 
@@ -697,7 +798,10 @@ def post_event(ev: EventIn, dev: Device = Depends(current_device)):
                 now(),
             ),
         )
-        return {"seq": cur.lastrowid}
+        seq = cur.lastrowid
+    # After the commit, so a device that syncs on this push finds the event.
+    push_new_event(dev.group_id, dev.id, seq, ev.kind)
+    return {"seq": seq}
 
 
 @api.get("/events")
@@ -794,6 +898,90 @@ def download_media(media_id: str, dev: Device = Depends(current_device)):
     if row is None:
         raise HTTPException(404, "media not found")
     return FileResponse(MEDIA_DIR / row["path"], media_type="application/octet-stream")
+
+
+def device_status(device_id: str) -> str:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT d.status, m.status AS member_status FROM devices d JOIN members m ON m.id = d.member_id"
+            " WHERE d.id = ?", (device_id,)
+        ).fetchone()
+    if row is None:
+        return "revoked"
+    return row["status"] if row["member_status"] == "active" else "revoked"
+
+
+@api.websocket("/ws")
+async def ws(websocket: WebSocket):
+    """Push channel. Authenticated like every other call, with
+    `Authorization: Bearer <device token>` on the upgrade request; an unknown
+    or non-active token gets HTTP 403 instead of a socket.
+
+    Server -> client, JSON text frames:
+      {"type": "hello", "device_id"}            once, on connect
+      {"type": "new_event", "seq", "kind"}      someone else appended an event
+      {"type": "join_request", "device_id", "display_name", "existing_member"}  Key Masters only
+      {"type": "key_rotated", "key_version"}    fetch GET /keys
+      {"type": "removed"}                       this device was revoked; the socket closes
+      {"type": "pong"}                          reply to a ping
+    Client -> server: {"type": "ping"} at least every WS_IDLE_SECONDS.
+    """
+    try:
+        dev = await run_in_threadpool(device_for_token, websocket.headers.get("authorization"))
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
+    if dev.status != "active" or hub.count(dev.id) >= MAX_SOCKETS_PER_DEVICE:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUEUE)
+    hub.attach(dev.id, q)
+
+    async def reader():
+        while True:
+            try:
+                text = await asyncio.wait_for(websocket.receive_text(), WS_IDLE_SECONDS)
+            except (asyncio.TimeoutError, WebSocketDisconnect, RuntimeError, KeyError):
+                return
+            try:
+                kind = json.loads(text).get("type")
+            except (ValueError, AttributeError):
+                continue
+            if kind == "ping":
+                # Notice revocation even if nobody calls push_removed.
+                if await run_in_threadpool(device_status, dev.id) != "active":
+                    push_removed([dev.id])
+                    continue
+                try:
+                    q.put_nowait('{"type":"pong"}')
+                except asyncio.QueueFull:
+                    return
+
+    async def writer():
+        while True:
+            data = await q.get()
+            if data is None:
+                return
+            await websocket.send_text(data)
+
+    try:
+        await websocket.send_text(json.dumps({"type": "hello", "device_id": dev.id}))
+        tasks = {asyncio.create_task(reader()), asyncio.create_task(writer())}
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for t in done:
+            t.exception()  # retrieve, so a dropped connection isn't logged as unhandled
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        hub.detach(dev.id, q)
+        try:
+            await websocket.close()
+        except (RuntimeError, WebSocketDisconnect):
+            pass  # already closed
 
 
 app.include_router(api)

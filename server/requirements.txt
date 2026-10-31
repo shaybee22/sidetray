@@ -1,2 +1,4 @@
 fastapi==0.115.12
 uvicorn==0.34.2
+# WebSocket protocol for uvicorn (/api/v1/ws).
+wsproto==1.2.0
