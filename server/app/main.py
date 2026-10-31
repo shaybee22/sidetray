@@ -207,6 +207,7 @@ def init_db() -> None:
         add_column(conn, "groups", "rotation_pending", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "devices", "revoked_reason", "TEXT")  # denied / removed / revoked
         add_column(conn, "devices", "revoked_at", "INTEGER")
+        add_column(conn, "devices", "revoked_seq", "INTEGER")  # last event seq when it was cut off
         conn.execute(
             "UPDATE groups SET key_version = MAX(key_version,"
             " (SELECT COALESCE(MAX(key_version), 1) FROM sealed_keys WHERE group_id = groups.id),"
@@ -683,6 +684,12 @@ def revoked_status(device_id: str) -> str:
     return "revoked"
 
 
+def last_seq(conn: sqlite3.Connection) -> int:
+    """The highest event seq ever issued (pruning doesn't lower it)."""
+    hw = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events'").fetchone()
+    return hw[0] if hw else 0
+
+
 def group_row(conn: sqlite3.Connection, group_id: str) -> sqlite3.Row:
     return conn.execute(
         "SELECT key_version, pruned_through, rotation_pending FROM groups WHERE id = ?", (group_id,)
@@ -914,7 +921,24 @@ def members(dev: Device = Depends(current_device)):
             # Activity is only shown to the people who manage devices.
             d["last_seen"], d["joined_at"] = r["last_seen"], r["requested_at"]
         m["devices"].append(d)
-    return {"members": list(out.values())}
+    # Devices revoked (or whose member was removed) while some of their events
+    # may still be on the server: clients accept those events up to revoked_seq,
+    # so a device that syncs late doesn't drop posts made before the removal.
+    with db() as conn:
+        former_rows = conn.execute(
+            "SELECT m.id AS member_id, m.display_name, d.id AS device_id, d.enc_pubkey, d.sign_pubkey, d.revoked_seq"
+            " FROM devices d JOIN members m ON m.id = d.member_id JOIN groups g ON g.id = d.group_id"
+            " WHERE d.group_id = ? AND d.status = 'revoked' AND d.revoked_seq > g.pruned_through"
+            " ORDER BY d.revoked_at",
+            (dev.group_id,),
+        ).fetchall()
+    former: dict[str, dict] = {}
+    for r in former_rows:
+        m = former.setdefault(r["member_id"], {"id": r["member_id"], "display_name": r["display_name"], "devices": []})
+        m["devices"].append({"id": r["device_id"], "enc_pubkey": b64encode(r["enc_pubkey"]),
+                             "sign_pubkey": b64encode(r["sign_pubkey"]), "certs": certs.get(r["device_id"], []),
+                             "revoked_seq": r["revoked_seq"]})
+    return {"members": list(out.values()), "former": list(former.values())}
 
 
 @api.post("/certs")
@@ -976,6 +1000,10 @@ def remove_member(member_id: str, km: Device = Depends(keymaster_device)):
         ).fetchone()[0]
         conn.execute("UPDATE members SET status = 'removed' WHERE id = ?", (member_id,))
         conn.execute(
+            "UPDATE devices SET revoked_seq = ? WHERE member_id = ? AND status = 'active'",
+            (last_seq(conn), member_id),
+        )
+        conn.execute(
             "UPDATE devices SET status = 'revoked', revoked_reason = 'removed', revoked_at = ?"
             " WHERE member_id = ? AND status IN ('active', 'pending')",
             (t, member_id),
@@ -1004,8 +1032,8 @@ def revoke_device(device_id: str, km: Device = Depends(keymaster_device)):
             raise HTTPException(409, "already revoked")
         if device_id == km.id:
             raise HTTPException(409, "you can't revoke the device you're using")
-        conn.execute("UPDATE devices SET status = 'revoked', revoked_reason = 'revoked', revoked_at = ? WHERE id = ?",
-                     (now(), device_id))
+        conn.execute("UPDATE devices SET status = 'revoked', revoked_reason = 'revoked', revoked_at = ?,"
+                     " revoked_seq = ? WHERE id = ?", (now(), last_seq(conn), device_id))
         conn.execute("UPDATE groups SET rotation_pending = 1 WHERE id = ?", (km.group_id,))
     push_removed([device_id], "device")
     return {"device_id": device_id, "status": "revoked", "rotation_pending": True}
@@ -1088,9 +1116,7 @@ def get_events(
 @api.post("/ack")
 def ack(body: AckIn, dev: Device = Depends(current_device)):
     with db() as conn:
-        # sqlite_sequence holds the highest seq ever issued, even after pruning.
-        hw = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'events'").fetchone()
-        ceiling = hw[0] if hw else 0
+        ceiling = last_seq(conn)
         if body.seq > ceiling:
             raise HTTPException(422, f"seq {body.seq} is beyond the latest event ({ceiling})")
         # Acks only move forward.

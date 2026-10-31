@@ -244,6 +244,14 @@ expect 401 GET /keys "$ZED_TOK" >/dev/null && pass "removed member's token can't
 expect 409 POST "/members/$ZED_MEM/remove" "$KM_TOK" >/dev/null && pass "removing twice -> 409" || fail "removing twice -> 409"
 [ "$(expect 200 GET /members "$KM_TOK" | python3 -c "import sys,json; print(sorted(m['display_name'] for m in json.load(sys.stdin)['members']))")" = "['Al', 'Kim', 'Yan']" ] \
   && pass "roster no longer lists Zed" || fail "roster no longer lists Zed"
+python3 - "$(expect 200 GET /members "$KM_TOK")" "$ZED_DEV" "$KSEQ" <<'PY'
+import json, sys
+r, zed, kseq = json.loads(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+f = [d for m in r["former"] for d in m["devices"]]
+assert [(d["id"], d["revoked_seq"]) for d in f] == [(zed, kseq)], r["former"]
+assert f[0]["certs"] and len(f[0]["sign_pubkey"]) == 44, f
+PY
+pass "GET /members lists Zed's device under former, cut off at seq $KSEQ, so his earlier posts stay attributable"
 KEYS=$(expect 200 GET /keys "$KM_TOK")
 [ "$(echo "$KEYS" | j '["rotation_pending"]')" = True ] && [ "$(echo "$KEYS" | j '["key_version"]')" = 1 ] \
   && pass "GET /keys: key version 1, rotation pending" || fail "GET /keys: key version 1, rotation pending"
