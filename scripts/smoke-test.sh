@@ -72,12 +72,12 @@ if [ "${SIDETRAY_PUSH:-no}" = yes ] && [ -n "${SIDETRAY_NTFY_URL:-}" ]; then
   NTFY_CURL=(-sS -m 10)
   if [ "${SIDETRAY_MODE:-}" = test ]; then
     docker compose exec -T caddy cat /etc/caddy/ntfy-tls/cert.pem > "$TMP/ntfy.crt"
-    NTFY_CURL+=(--cacert "$TMP/ntfy.crt")
     hp=${SIDETRAY_NTFY_URL#https://}
     served=$(echo | openssl s_client -connect "$hp" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null)
     [ -n "$served" ] && [ "$served" = "$(openssl x509 -noout -fingerprint -sha256 -in "$TMP/ntfy.crt")" ] \
       && pass "the push port serves its own long-lived certificate (the one the ntfy app pins; also with no SNI)" \
       || fail "the push port's certificate: '$served'"
+    NTFY_CURL+=(-k)  # it names no host (the ntfy app pins it whole); the fingerprint was just checked
   fi
   [ "$(curl "${NTFY_CURL[@]}" "$SIDETRAY_NTFY_URL/v1/health" | j '["healthy"]')" = True ] \
     && pass "ntfy answers over TLS through Caddy" || fail "ntfy health"

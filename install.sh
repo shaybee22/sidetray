@@ -399,17 +399,20 @@ EOF
     caddy_site; ntfy_site; } | put "$DIR/Caddyfile"
 fi
 
-# Test mode with push: the ntfy port's certificate, made once (10 years) and
-# remade only if the server's address changed.
+# Test mode with push: the ntfy port's certificate, made once (10 years). It
+# names no real host on purpose: the ntfy app pins the certificate itself and
+# skips the name check, and a certificate for the server's IP would make Caddy
+# serve it on 443 too, in place of its own CA's.
 install -d -m 755 "$DIR/ntfy-tls"
 if [ "$PUSH" = yes ] && [ "$MODE" = test ]; then
   cert="$DIR/ntfy-tls/cert.pem"
-  if [ ! -s "$cert" ] || ! openssl x509 -noout -checkip "$IP" -in "$cert" 2>/dev/null | grep -q 'does match'; then
+  if [ ! -s "$cert" ] || [ ! -s "$DIR/ntfy-tls/key.pem" ] \
+     || openssl x509 -noout -ext subjectAltName -in "$cert" 2>/dev/null | grep -q 'IP Address'; then
     (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
-      -subj "/CN=Side Tray push $IP" -addext "subjectAltName=IP:$IP" \
+      -subj "/CN=Side Tray push server" -addext "subjectAltName=DNS:push.sidetray.invalid" \
       -keyout "$DIR/ntfy-tls/key.pem" -out "$cert" 2>/dev/null) || die "couldn't make the push server's certificate (is openssl installed?)"
     chmod 644 "$cert"
-    say "  made a certificate for the push server ($IP, valid 10 years)"
+    say "  made a certificate for the push server (valid 10 years)"
   fi
 fi
 
@@ -537,7 +540,10 @@ if [ "$PUSH" = yes ]; then
   pok=0
   for _ in $(seq 30); do
     if [ "$MODE" = test ]; then
-      curl -fsS -m 5 --cacert "$DIR/ntfy-tls/cert.pem" "https://$HOST:$NTFY_PORT/v1/health" >/dev/null 2>&1 && { pok=1; break; }
+      # Its certificate names no host (see above), so compare fingerprints instead.
+      served=$(echo | openssl s_client -connect "$HOST:$NTFY_PORT" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)
+      [ "$served" = "$(openssl x509 -noout -fingerprint -sha256 -in "$DIR/ntfy-tls/cert.pem")" ] \
+        && curl -fsSk -m 5 "https://$HOST:$NTFY_PORT/v1/health" >/dev/null 2>&1 && { pok=1; break; }
     else
       curl -fsS -m 5 "https://$HOST:$NTFY_PORT/v1/health" >/dev/null 2>&1 && { pok=1; break; }
     fi
