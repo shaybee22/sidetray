@@ -2519,7 +2519,12 @@ $("#set-autostart").addEventListener("change", async (ev) => {
 
 // --- updates -------------------------------------------------------------------------------
 
+let lastUpdate = null;
+
+const megabytes = (n) => (n ? ` (${Math.max(1, Math.round(n / 1048576))} MB)` : "");
+
 function renderUpdate(u) {
+  lastUpdate = u;
   for (const el of $$(".app-version")) el.textContent = `Side Tray ${u.current_version}`;
   const ready = u.state === "ready";
   $("#update-banner").hidden = !ready;
@@ -2528,19 +2533,116 @@ function renderUpdate(u) {
   }
   const status = {
     off: mobile
-      ? `Side Tray ${u.current_version}. On a phone, new versions come as a new app download for now.`
+      ? `Side Tray ${u.current_version}. This is a test build, so it doesn't look for new versions.`
       : `Side Tray ${u.current_version}. This copy wasn't set up with the installer, so it doesn't update itself.`,
-    idle: `Side Tray ${u.current_version}. ` + (u.checked_at ? `Up to date (checked ${when(u.checked_at)}).` : "It checks for updates every few hours."),
+    idle: `Side Tray ${u.current_version}. ` + (u.checked_at ? `Up to date (checked ${when(u.checked_at)}).`
+      : mobile ? "It looks for a new version once a day." : "It checks for updates every few hours."),
     checking: `Side Tray ${u.current_version}. Checking for updates…`,
-    downloading: `Downloading Side Tray ${u.version}…`,
+    downloading: `Downloading Side Tray ${u.version}…` + (u.percent != null ? ` ${u.percent}%` : ""),
     ready: `Side Tray ${u.version} is downloaded. Choose Restart to update at the top of the window.`,
+    available: `Side Tray ${u.current_version}. Version ${u.version} is available${megabytes(u.size)}.`,
+    downloaded: `Side Tray ${u.current_version}. Version ${u.version} is downloaded and ready to install.`,
     failed: `Side Tray ${u.current_version}. Couldn't check for updates: ${u.message}`,
   }[u.state] || "";
   $("#upd-status").textContent = status;
   const check = $("#upd-check");
-  check.hidden = u.state === "off" || ready;
+  check.hidden = u.state === "off" || ready || u.state === "available" || u.state === "downloaded";
   check.disabled = u.state === "checking" || u.state === "downloading";
+  const get = $("#upd-get");
+  get.hidden = !(u.state === "available" || u.state === "downloaded" || u.state === "downloading");
+  get.disabled = u.state === "downloading";
+  get.textContent = u.state === "downloaded" ? (u.installer_allowed ? "Install" : "Allow and install") : "Download and install";
+  renderUpdateOffer();
 }
+
+// --- updates on a phone (A4) -----------------------------------------------------------------
+
+const UPDATE_LATER_KEY = "sidetray.update.later";
+/** Set after sending the person to "Install unknown apps": install as soon as they come back allowed. */
+let awaitingInstallPermission = false;
+/** What the last Install tap led to, shown in the card. */
+let updateNote = "";
+
+function updateLater() {
+  try { return localStorage.getItem(UPDATE_LATER_KEY); } catch (_) { return null; }
+}
+
+/** The card on the feed: a new version, its download, and Android's permission step. */
+function renderUpdateOffer() {
+  const u = lastUpdate;
+  const box = $("#update-offer");
+  const offered = mobile && u && ["available", "downloading", "downloaded"].includes(u.state);
+  if (!offered || (updateLater() === u.version && u.state !== "downloading")) { box.hidden = true; return; }
+  const go = $("#update-offer-go");
+  const later = $("#update-offer-later");
+  let title = `New version: Side Tray ${u.version}`;
+  let text;
+  go.disabled = false;
+  later.hidden = false;
+  if (u.state === "available") {
+    text = `You have ${u.current_version}. Download it now${megabytes(u.size)}? Your posts, messages and keys stay as they are.`;
+    if (u.error) text = `The download didn't work: ${u.error}`;
+    go.textContent = u.error ? "Try again" : "Download and install";
+  } else if (u.state === "downloading") {
+    text = `Downloading…${u.percent != null ? ` ${u.percent}%` : ""}`;
+    go.textContent = "Downloading…";
+    go.disabled = true;
+    later.hidden = true;
+  } else if (!u.installer_allowed) {
+    title = "One more step: let Side Tray install its updates";
+    text = "Android asks once before an app may install updates. Tap Open setting, turn on “Allow from this source”, then press Back to come here again.";
+    go.textContent = "Open setting";
+  } else {
+    text = updateNote || "Downloaded. Tap Install; when Android asks “Do you want to update this app?”, tap Update. Side Tray closes for a moment; open it again when it's done.";
+    go.textContent = "Install";
+  }
+  $("#update-offer-title").textContent = title;
+  $("#update-offer-text").textContent = text;
+  box.hidden = false;
+}
+
+async function getUpdate() {
+  const u = lastUpdate;
+  if (!u) return;
+  if (u.state === "downloaded" && !u.installer_allowed) {
+    awaitingInstallPermission = true;
+    await invoke("open_install_settings").catch((e) => console.warn("open_install_settings", e));
+    return;
+  }
+  hideError($("#upd-err"));
+  updateNote = "";
+  try {
+    const r = await invoke("install_update");
+    if (r === "needs_permission") {
+      renderUpdate(await invoke("update_status"));
+    } else if (r === "started") {
+      updateNote = "Android is asking whether to update Side Tray: tap Update. If you closed that by mistake, tap Install again.";
+      renderUpdateOffer();
+    }
+  } catch (e) {
+    showError($("#upd-err"), String(e));
+    renderUpdate(await invoke("update_status"));
+  }
+}
+
+$("#update-offer-go").addEventListener("click", getUpdate);
+$("#upd-get").addEventListener("click", getUpdate);
+$("#update-offer-later").addEventListener("click", () => {
+  try { localStorage.setItem(UPDATE_LATER_KEY, lastUpdate.version); } catch (_) {}
+  $("#update-offer").hidden = true;
+});
+
+// Back from Android's settings (or its installer): look again, and carry on if now allowed.
+document.addEventListener("visibilitychange", async () => {
+  if (!mobile || document.visibilityState !== "visible") return;
+  let u;
+  try { u = await invoke("update_status"); } catch (_) { return; }
+  renderUpdate(u);
+  if (awaitingInstallPermission && u.state === "downloaded" && u.installer_allowed) {
+    awaitingInstallPermission = false;
+    getUpdate();
+  }
+});
 
 listen("update", (ev) => renderUpdate(ev.payload));
 

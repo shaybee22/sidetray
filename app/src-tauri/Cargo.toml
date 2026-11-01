@@ -1,6 +1,6 @@
 [package]
 name = "sidetray-app"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.90"
 description = "Side Tray client (desktop and Android)"
@@ -67,6 +67,8 @@ tauri-plugin-updater = "2.14.1"
 # Android: the device's secrets are wrapped by a Keystore key, reached over JNI.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21.1"
+# Comparing the installed version with the newest release (A4).
+semver = "1.0.28"
 ndk-context = "0.1.1"
 
 # Device secrets go to the OS keychain where there's a native one; elsewhere

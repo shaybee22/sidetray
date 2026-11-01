@@ -152,7 +152,7 @@ async fn check_inner(handle: &AppHandle) -> Result<()> {
 
 /// Install the downloaded update. On Windows the installer takes over (the app
 /// exits and comes back afterwards); elsewhere, restart into the new version.
-pub fn install(handle: &AppHandle) -> Result<()> {
+pub fn install_now(handle: &AppHandle) -> Result<()> {
     let ready = handle.state::<Updates>().ready.lock().unwrap_or_else(|e| e.into_inner()).take();
     let Some((update, bytes)) = ready else { anyhow::bail!("no update is ready") };
     if let Err(e) = update.install(&bytes) {
@@ -162,6 +162,11 @@ pub fn install(handle: &AppHandle) -> Result<()> {
         anyhow::bail!("couldn't install the update: {msg}");
     }
     handle.restart();
+}
+
+/// The `install_update` command (shared with the phone's, which answers how it went).
+pub async fn install(handle: &AppHandle) -> Result<String> {
+    install_now(handle).map(|()| String::new())
 }
 
 pub fn spawn(handle: AppHandle) {

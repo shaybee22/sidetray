@@ -6,6 +6,9 @@
     <!-- So Side Tray can ask, with Android's own dialog, to run unrestricted in the
          background (otherwise wake-ups can arrive late or not at all). -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Updates (A4): hand a downloaded APK to Android's installer. The person still
+         allows "install unknown apps" for Side Tray once, and confirms each update. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- The camera button (A2): the WebView looks for a camera app before opening one,
          and since Android 11 an app only sees the ones it declares here. -->

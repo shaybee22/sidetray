@@ -3,20 +3,37 @@
 All notable changes to Side Tray. Versions follow [Semantic Versioning](https://semver.org/);
 the app, the Rust crates and the relay share one version number.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-01
 
-### Android app (phase A1)
+Side Tray comes to Android phones. Highlights:
 
-- Side Tray builds for Android (debug APK; see the README's *Android app*
-  section). A phone joins as its own device with the usual safety-code check,
-  and has the feed, posts with photos, comments, reactions, direct messages
-  and the Key Master tab. It syncs while it's open.
+- **An Android app** (`SideTray.apk` on the release; see *Install on an
+  Android phone* in the README): the feed, photos, comments, reactions,
+  direct messages and the Key Master tab, as on a computer. A phone joins as
+  its own device, with the usual phone call to compare codes.
+- **Notifications on phones**, also while Side Tray is closed: within seconds
+  with the free ntfy app, nothing to set up; about every 15 minutes without it.
+  The wake-ups carry no names and no content.
+- **Pictures the easy way**: *Share → Side Tray* from any app on a phone, and
+  the camera button. On a computer, paste (Ctrl+V) and drag and drop work as
+  in 0.1.1.
+- **Side Tray starts when you sign in** on new computer installs.
+
+Upgrading: computers update themselves as before. Phones running a test
+build of the app have to uninstall it and join again with the release APK
+(it's signed with a different key).
+
+### Android app
+
+- Side Tray for Android phones (Android 7 and newer, 64-bit ARM: every
+  phone from the last several years). A phone joins as its own device with
+  the usual safety-code check, and has the feed, posts with photos,
+  comments, reactions, direct messages and the Key Master tab (approve joins
+  from the phone too).
 - The phone's private keys and token are encrypted with a key held in the
-  Android Keystore.
+  Android Keystore. The app is left out of Android backups (they would copy
+  decrypted posts).
 - `sidetray://` invite links open the app on a phone too.
-
-### Android app (phase A2)
-
 - **Share → Side Tray** from any app: pictures (one or several), text and
   links. Side Tray shows what came in and asks where it goes: the feed, or a
   message to someone. If the app isn't in a group yet, it says so.
@@ -29,10 +46,6 @@ the app, the Rust crates and the relay share one version number.
 - **Phone layout**: tabs at the bottom, icon buttons, pinch-zoom in the photo
   viewer, and it fits the razr's small outer screen. Drafts survive moving
   between the inner and outer screens.
-- The app is left out of Android backups (they would copy decrypted posts).
-
-### Android app (phase A3)
-
 - **Notifications while the app is closed**: new posts, comments on your
   posts, direct messages and (for Key Masters) join requests. Tapping one
   opens that post, conversation or the Key Master tab.
@@ -45,8 +58,25 @@ the app, the Rust crates and the relay share one version number.
 - Android 13 and newer: Side Tray offers to turn notifications on after you
   join, not at first launch. *Device → Settings* shows whether they're on and
   how they arrive.
+- **Updates**: Side Tray looks for a new version when it starts and once a
+  day. When there is one, a card on the feed offers *Download and install*;
+  the first time, Android asks you to allow Side Tray to install apps
+  ("Allow from this source"), and the card says how. Android then asks to
+  confirm the update. Only an APK signed with Side Tray's own key can
+  replace the app.
 
-### Relay (A3)
+### Desktop app
+
+- **Start Side Tray when I sign in** is now on for new installs (it opens
+  quietly in the tray). Computers updating from 0.1.x keep their setting.
+- A new group's very first post now notifies (it used to count as the
+  backlog of a new device).
+- A HEIC/HEIF photo is refused with a clear message instead of "isn't a
+  photo this app can read".
+- Internally the app is now a library plus a small executable, so the same
+  code builds for Android.
+
+### Relay
 
 - Android wake-ups go through ntfy.sh by default (`SIDETRAY_PUSH_HOSTS`).
 - Optional own push server: `install.sh` asks whether to run **ntfy** next to
@@ -57,15 +87,21 @@ the app, the Rust crates and the relay share one version number.
 - `GET/POST/DELETE /api/v1/push`: a phone registers its UnifiedPush endpoint.
   When a phone has no connection open, the relay sends it an **empty**
   wake-up; nothing about the group, the people or the content goes into it.
+- Update the relay too (`git pull && sudo ./install.sh`) so phones get
+  notifications; 0.1.x apps work with it unchanged.
 
-### Desktop app
+### Releases
 
-- A new group's very first post now notifies (it used to count as the
-  backlog of a new device).
-- No other visible changes. Internally the app is now a library plus a small
-  executable, so the same code builds for Android.
-- A HEIC/HEIF photo is refused with a clear message instead of "isn't a
-  photo this app can read".
+- Each release now also carries the signed Android APK
+  (`Side.Tray_<version>_arm64.apk`, and the same file as `SideTray.apk`) and
+  `android.json`, which phones read to find updates.
+
+### Known limits
+
+- The APK is for 64-bit ARM phones only (no 32-bit phones, no x86 Chromebooks
+  or emulators).
+- Android's Play Protect may ask about an app from outside the Play Store the
+  first time; the README says what to tap.
 
 ## [0.1.1] - 2026-10-31
 
@@ -146,5 +182,6 @@ The first release: everything in [SPEC.md](SPEC.md) through Phase 7.
 - Clicking an old notification in the Windows notification centre doesn't
   open the post it was about (one still on screen does).
 
+[0.2.0]: https://github.com/shaybee22/sidetray/releases/tag/v0.2.0
 [0.1.1]: https://github.com/shaybee22/sidetray/releases/tag/v0.1.1
 [0.1.0]: https://github.com/shaybee22/sidetray/releases/tag/v0.1.0

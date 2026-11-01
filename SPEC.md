@@ -268,7 +268,7 @@ Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, 
 
 ## Android app
 
-Side Tray 0.1.1 runs on Windows and Linux. This section plans a phone app for Android. A1, A2 and A3 are built (see "As built" under each); A4 is not.
+Side Tray runs on Windows and Linux, and from 0.2.0 on Android. This section is the plan for the phone app; all four phases are built (see "As built" under each).
 
 **Decisions**
 
@@ -353,10 +353,16 @@ What this Windows machine needs to build for Android:
 - In-app update prompt: on start and daily, check the manifest; if newer, show "New version available" with *Download*, then hand the APK to the installer (the person allows "install unknown apps" for Side Tray once).
 - The APK signing key stays out of the repo: a keystore in GitHub Actions secrets (base64 keystore, store and key passwords), with an offline backup kept by the maintainer. Losing it means users must uninstall and reinstall (a new device and a new join), so the backup matters.
 - **Done when** a tag produces a release with the APK attached, and a phone running the previous version offers the update and installs it.
+- **As built:**
+  - Manifest: the release job writes `android.json` (`{version, url, sha256, size}`, the URL pointing at the versioned APK on that tag) instead of an entry in Tauri's `latest.json`, which the desktop jobs write and which carries minisign signatures the phone doesn't need. The app reads `releases/latest/download/android.json` (drafts are skipped, so a phone only sees a published release); a 404 counts as up to date. `SIDETRAY_ANDROID_UPDATE_URL` at build time points a test build elsewhere and is the only way plain `http://` is accepted. Debug builds (debug key) don't check unless built with it.
+  - Signing: an RSA 4096 PKCS12 keystore (alias `sidetray`, 2054), kept with the release manager next to the updater key and in three Actions secrets (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_PASSWORD`). Gradle signs the release build when the git-ignored `gen/android/keystore.properties` exists (CI writes it from the secrets). The job refuses an APK whose certificate isn't the expected SHA-256 or whose `versionName` isn't the tag's version. `proguard-rules.pro` keeps `org.sidetray.app.**`, since Rust calls those classes by name over JNI and R8 minifies the release build, and the constructors of Room databases (WorkManager creates `WorkDatabase_Impl` by reflection; without the rule the first release build crashed at launch).
+  - APK: arm64 only (`--target aarch64`), attached as `Side.Tray_X.Y.Z_arm64.apk` and `SideTray.apk`. A universal APK would carry four copies of the Rust library for 32-bit and x86 devices hardly anyone in a family has.
+  - App (`update_mobile.rs`): checks 15 s after start, then whenever a day has passed since the last successful check (ten minutes after a failed one: a check at start can fail while the phone dozes), looking at the wall clock every 15 minutes and on resume, since a sleeping phone stops tokio's timers. A newer version shows a card on the feed (*Download and install*, *Not now* per version, kept in `localStorage`) and a line and button in *Device → Settings → Updates*. Rust streams the APK to `cache/updates/SideTray-<version>.apk` with progress, checks the SHA-256 and size limit, and Kotlin (`installApk`) opens it with `ACTION_INSTALL_PACKAGE` (`ACTION_VIEW` as a fallback: with the APK type it also offers Termux, office apps and so on in an "Open with" chooser) through the existing FileProvider (`REQUEST_INSTALL_PACKAGES` in the manifest). Without "install unknown apps" for Side Tray, the card explains the switch ("Allow from this source"), opens `ACTION_MANAGE_UNKNOWN_APP_SOURCES`, and installs by itself when the page becomes visible again with it allowed. A downloaded APK that's still newer is reused (also after Android restarts the process); older ones are deleted at start.
 
-## Backlog for 0.1.2
+## Backlog for 0.1.2 (done in 0.2.0)
 
 - "Start Side Tray when I sign in" (*This device → Settings*) defaults to ON for new installs. Existing installs keep whatever they have.
+  - As built: an installed copy (the NSIS install, an AppImage, or a Linux package under `/usr`) decides once per data folder, at its first start of 0.2.0 or later: no identity yet means a new install, so it turns autostart on; otherwise it leaves it. A marker file `autostart-default` in the data folder records that it decided. Copies run from a build or with `SIDETRAY_DATA_DIR` never register.
 
 ## Distribution and later
 

@@ -14,6 +14,16 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// Release signing (A4): gen/android/keystore.properties, which git ignores, names
+// the keystore and its passwords (storeFile, storePassword, keyAlias, keyPassword).
+// CI writes it from GitHub secrets; without it a release build is unsigned.
+val keystoreProperties = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) {
+        f.inputStream().use { load(it) }
+    }
+}
+
 android {
     compileSdk = 37
     namespace = "org.sidetray.app"
@@ -24,6 +34,16 @@ android {
         targetSdk = 37
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    signingConfigs {
+        if (keystoreProperties.containsKey("storeFile")) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
     }
     buildTypes {
         getByName("debug") {
@@ -39,6 +59,7 @@ android {
             }
         }
         getByName("release") {
+            signingConfigs.findByName("release")?.let { signingConfig = it }
             optimization {
                enable = true
             }

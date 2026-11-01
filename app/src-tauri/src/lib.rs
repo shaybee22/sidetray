@@ -854,6 +854,29 @@ fn set_start_with_os(_handle: AppHandle, _enabled: bool) -> Res<Settings> {
     Err("not on a phone".into())
 }
 
+/// New installs start at sign-in; installs from before 0.2.0 keep what they had.
+/// Decided once per data folder (a marker file), and only for an installed copy:
+/// a build run from a checkout, or a test copy with its own data folder, never
+/// registers itself.
+#[cfg(desktop)]
+fn autostart_default(handle: &AppHandle, app: &App, dir: &std::path::Path) {
+    let marker = dir.join("autostart-default");
+    let installed_copy = update::installed()
+        || (cfg!(target_os = "linux") && std::env::current_exe().is_ok_and(|p| p.starts_with("/usr/")));
+    if marker.exists() || !installed_copy || std::env::var_os("SIDETRAY_DATA_DIR").is_some() {
+        return;
+    }
+    // No identity yet: a new install (or one that never joined). Otherwise it's an update.
+    let fresh = matches!(app.identity(), Ok(None));
+    if fresh {
+        if let Err(e) = handle.autolaunch().enable() {
+            eprintln!("turning on start at sign-in: {e}");
+            return;
+        }
+    }
+    let _ = std::fs::write(&marker, if fresh { "on" } else { "kept" });
+}
+
 // --- updates -----------------------------------------------------------------------------
 
 #[tauri::command]
@@ -866,9 +889,20 @@ async fn check_for_updates(handle: AppHandle) -> update::View {
     update::check(&handle).await
 }
 
+/// Desktop: install the downloaded update (the app restarts). Phone: download the
+/// new APK if needed and open Android's installer; returns "started",
+/// "needs_permission" (allow "install unknown apps" first) or "no_window".
 #[tauri::command]
-fn install_update(handle: AppHandle) -> Res<()> {
-    update::install(&handle).map_err(err)
+async fn install_update(handle: AppHandle) -> Res<String> {
+    update::install(&handle).await.map_err(err)
+}
+
+/// Android's "Install unknown apps" switch for Side Tray. Nothing on a computer.
+#[tauri::command]
+fn open_install_settings() -> Res<()> {
+    #[cfg(target_os = "android")]
+    update::open_install_settings().map_err(err)?;
+    Ok(())
 }
 
 // --- photos for the webview ------------------------------------------------------------
@@ -985,6 +1019,8 @@ pub fn run() {
                     eprintln!("registering for notifications: {e:#}");
                 }
             }
+            #[cfg(desktop)]
+            autostart_default(&handle, &app, &dir);
             tray::create(&handle)?;
             tray::refresh(&handle, &app);
             #[cfg(desktop)]
@@ -1085,6 +1121,7 @@ pub fn run() {
             update_status,
             check_for_updates,
             install_update,
+            open_install_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while starting Side Tray")
@@ -1106,6 +1143,7 @@ pub fn run() {
                         app.wake.notify_one();
                         app.push_wake.notify_one();
                     }
+                    update::resumed(_handle);
                 }
                 _ => {}
             }

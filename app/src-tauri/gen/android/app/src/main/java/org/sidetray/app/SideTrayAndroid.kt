@@ -22,6 +22,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -47,7 +48,9 @@ import kotlin.math.roundToInt
  * - deleting the camera's full-size originals once they're staged;
  * - decoding photo formats only Android can read (HEIC/HEIF, AVIF);
  * - notifications (A3): showing them, the permission, what a tapped one was
- *   about, UnifiedPush registration and the periodic sync (SideTrayWorker).
+ *   about, UnifiedPush registration and the periodic sync (SideTrayWorker);
+ * - updates (A4): handing a downloaded APK to the installer, and the
+ *   "install unknown apps" permission it needs.
  *
  * And the other way, the `native*` functions are Rust (src/android.rs). A push
  * wake-up or the periodic job can start this process without MainActivity, so
@@ -439,6 +442,70 @@ object SideTrayAndroid {
   @JvmStatic
   fun periodicSync(mode: String): String? {
     appContext?.let { SideTrayWorker.periodic(it, mode == "on") }
+    return null
+  }
+
+  // --- updates (A4) ------------------------------------------------------------------------
+
+  /** Where Rust saves a downloaded APK (inside the FileProvider's cache-path). */
+  @JvmStatic
+  fun updateDir(): String? = appContext?.let { File(it.cacheDir, "updates").absolutePath }
+
+  /** "yes" when Side Tray may hand APKs to the installer ("Install unknown apps", Android 8+). */
+  @JvmStatic
+  fun canInstallApks(): String {
+    val ctx = appContext ?: return "no"
+    return if (Build.VERSION.SDK_INT < 26 || ctx.packageManager.canRequestPackageInstalls()) "yes" else "no"
+  }
+
+  /**
+   * Open Android's installer on a downloaded APK. Android checks that it's
+   * signed with the same key as this app and asks the person to confirm.
+   */
+  @JvmStatic
+  fun installApk(path: String): String {
+    val a = activity?.get() ?: return "no_window"
+    if (canInstallApks() != "yes") return "needs_permission"
+    val uri = FileProvider.getUriForFile(a, a.packageName + ".fileprovider", File(path))
+    // INSTALL_PACKAGE goes straight to the system's package installer; VIEW with
+    // the APK type would also offer any app that opens APK files (Termux, office
+    // apps...) in an "Open with" chooser. VIEW stays as the fallback.
+    @Suppress("DEPRECATION")
+    val intents = listOf(
+      Intent(Intent.ACTION_INSTALL_PACKAGE).setData(uri),
+      Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive"),
+    ).map { it.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+    a.runOnUiThread {
+      for (i in intents) {
+        try {
+          a.startActivity(i)
+          return@runOnUiThread
+        } catch (e: Exception) {
+          Log.w(TAG, "no installer for ${i.action}", e)
+        }
+      }
+    }
+    return "started"
+  }
+
+  /** Android's "Install unknown apps" switch for Side Tray ("Allow from this source"). */
+  @JvmStatic
+  fun openInstallSettings(): String? {
+    val a = activity?.get() ?: return null
+    val uri = Uri.parse("package:" + a.packageName)
+    val intents = mutableListOf<Intent>()
+    if (Build.VERSION.SDK_INT >= 26) intents.add(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, uri))
+    intents.add(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri))
+    a.runOnUiThread {
+      for (i in intents) {
+        try {
+          a.startActivity(i)
+          return@runOnUiThread
+        } catch (e: Exception) {
+          Log.w(TAG, "no screen for ${i.action}", e)
+        }
+      }
+    }
     return null
   }
 

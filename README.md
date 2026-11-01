@@ -2,8 +2,8 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: 0.1.1** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 desktop app
-(`app/`) has a first-run wizard (join, or found the group with the setup token),
+**Status: 0.2.0** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 app for
+Windows, Linux and Android (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
 comments and reactions. It keeps a local SQLite archive and syncs the moment the
 relay pushes a change over a WebSocket (polling every 30 seconds only while the
@@ -23,13 +23,15 @@ with a `sidetray://` link or QR code, and everyone can set a photo and ask
 for a new name, which shows once a Key Master accepts it. Members send each
 other end-to-end encrypted direct messages (text and photos) that only the
 two people's devices can read. Windows gets a per-user installer and Linux an
-AppImage and a .deb, built by GitHub Actions on a version tag; installed
-copies update themselves from signed releases (see [Releases](#releases)).
+AppImage and a .deb, Android phones a signed APK, all built by GitHub Actions
+on a version tag; installed copies update themselves from signed releases
+(see [Releases](#releases)).
 
 ## For family members
 
 Someone in your family runs Side Tray for the group (the *Key Master*). This
-is how you get it onto your Windows computer.
+is how you get it onto your Windows computer. For a phone, see
+[Install on an Android phone](#install-on-an-android-phone) below.
 
 1. **Download the installer** from
    <https://github.com/shaybee22/sidetray/releases/latest/download/SideTray-Setup.exe>
@@ -97,6 +99,63 @@ you: the app closes for a few seconds and comes back with the new version.
 Uninstall.* Your posts, messages and keys stay on the computer unless you
 tick *Delete the application data*, so reinstalling picks up where you left
 off.
+
+### Install on an Android phone
+
+Side Tray isn't in the Play Store; you download it from our release page
+instead. A phone is a device of its own: it joins the group the same way a
+computer does (with the phone call), even if Side Tray is already on your
+computer.
+
+1. **Download it.** On the phone, open this link in Chrome (your Key Master
+   may send it to you too):
+   <https://github.com/shaybee22/sidetray/releases/latest/download/SideTray.apk>.
+   It's a file called `SideTray.apk`. If Chrome asks whether to keep or
+   download it anyway, choose **Download anyway**.
+2. **Open it.** Tap **Open** in Chrome's message at the bottom of the
+   screen (or open the *Files* app, then *Downloads*, and tap
+   `SideTray.apk`).
+3. **Allow the install, once.** Android says something like *"For your
+   security, your phone currently isn't allowed to install unknown apps from
+   this source."* Tap **Settings**, turn on **Allow from this source**, then
+   press Back. Android now asks *"Do you want to install this app?"*: tap
+   **Install**.
+   - **Google Play Protect** then probably says *"App scan recommended:
+     Play Protect hasn't seen this app before"*, because Side Tray doesn't
+     come from the Play Store. Either tap **Scan app** (Google checks it,
+     then installs it), or tap **More details**, then **Install without
+     scanning**, and confirm. Only do this for `SideTray.apk` from the link
+     above.
+4. **Open Side Tray** (the *Open* button, or its icon on your home screen).
+5. **Join the group.** Easiest: tap the invite link your Key Master sent
+   you (it starts with `sidetray://`); Side Tray fills in the server and the
+   group. Otherwise type them exactly as they were given to you. Then type
+   your name and email address and tap *Ask to join*.
+6. **Phone your Key Master** and compare codes, exactly as on a computer
+   (step 6 above).
+7. **Turn on notifications.** After you're in, Side Tray asks *"Get notified
+   about new posts?"*: tap **Turn on**, then **Allow**.
+
+**Instant notifications with ntfy.** Without anything else, Side Tray checks
+for news about every 15 minutes. For notifications within seconds, install
+the free **ntfy** app from Google Play (search for *ntfy*, by Philipp
+Heckel; it's also on F-Droid). There's nothing to set up in it: install it,
+then open Side Tray again. If a card *Let notifications through* appears on
+the feed, tap its buttons and choose **Allow** or **Unrestricted** as it
+explains: Android otherwise holds the apps back to save battery, and
+notifications come late.
+
+**Updates.** Side Tray looks for a new version once a day. When there is
+one, a card on the feed says *New version: Side Tray …*: tap **Download and
+install**. The first time, Android has to allow Side Tray to install apps:
+the card says *One more step*; tap **Open setting**, turn on **Allow from
+this source**, and press Back. Android then asks *"Do you want to update
+this app?"*: tap **Update**. Play Protect may ask about it again, as in
+step 3. Your posts and messages stay.
+
+**Removing it.** Long-press the Side Tray icon, then *App info* →
+*Uninstall*. Unlike on a computer, this deletes the phone's keys with it:
+installing it again means joining again (another phone call).
 
 ## Layout
 
@@ -655,16 +714,18 @@ see [Releases](#releases).
   sit in SQLite, encrypted under that wrapping key. Linux has no keychain
   backend yet, so there those secrets live in the database.
 
-## Android app (A1-A3)
+## Android app (A1-A4)
 
-The same app builds for Android (SPEC.md "Android app", phases A1 to A3):
+The same app builds for Android (SPEC.md "Android app", phases A1 to A4):
 join with the safety-code check (or from a `sidetray://` invite link), the
 feed, posts with photos, comments, reactions, direct messages and the Key
 Master tab; *Share → Side Tray* from other apps, the camera, multi-select from
 the photo picker, HEIC photos, a phone layout with bottom tabs, and
 notifications while it's closed (instant through the ntfy app, or about
-every 15 minutes without it). There's no release APK yet (A4): build a debug
-one as below.
+every 15 minutes without it), and updates from the signed APK on each
+release. Family members install it as in
+[Install on an Android phone](#install-on-an-android-phone); to build one
+yourself, see below.
 
 **Build setup on Windows** (all per user, no admin except Developer Mode):
 
@@ -687,6 +748,38 @@ cargo tauri android build --debug --apk --target aarch64   # a phone; x86_64 for
 adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 ```
 
+**A signed release build** (what CI makes on a tag) needs the release
+keystore. `app/src-tauri/gen/android/keystore.properties`, which git ignores,
+points at it:
+
+```properties
+storeFile=C:/Users/<you>/.tauri/sidetray-android.jks
+storePassword=...
+keyAlias=sidetray
+keyPassword=...
+```
+
+Then `cargo tauri android build --apk --target aarch64` (no `--debug`)
+writes `gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`.
+Without that file the release APK comes out unsigned. A debug build and a
+release build are signed with different keys, so one can't replace the
+other: `adb uninstall org.sidetray.app` first (which deletes the phone's
+keys: it joins again). The release build is minified by R8;
+`proguard-rules.pro` keeps the app's own classes, which Rust calls over JNI
+by name, and the Room database constructors WorkManager needs (without them
+a release build crashes at launch).
+
+**Trying the update card** without publishing a release: build with
+`SIDETRAY_ANDROID_UPDATE_URL=http://<host>/android.json` in the environment
+(plain `http://` is accepted only for such a test build), and to make the
+installed copy look old, also `--config '{"version":"0.1.9"}'`. On the test
+server, put a newer signed APK and an `android.json` next to each other in a
+folder served by `python3 -m http.server 8088`; `url` may be relative:
+
+```json
+{"version": "0.2.0", "url": "SideTray.apk", "sha256": "<sha256sum of the APK>", "size": 12345678}
+```
+
 The Android Studio project in `app/src-tauri/gen/android` is generated by
 `cargo tauri android init` and committed (its own `.gitignore` keeps build
 output out). Its launcher icons come from `icons/app-icon.png`
@@ -702,9 +795,26 @@ hand-made small desktop icons).
   AES-256-GCM key in the Android Keystore (`src/keystore.rs`, over JNI).
   Clearing the app's data or uninstalling deletes that key: the phone then
   joins again as a new device.
-- **No tray, autostart or self-update** (`cfg(desktop)` in `src/lib.rs`;
-  `tray_mobile.rs` and `update_mobile.rs` stand in). Coming back to the
-  foreground syncs at once.
+- **No tray or autostart** (`cfg(desktop)` in `src/lib.rs`; `tray_mobile.rs`
+  stands in). Coming back to the foreground syncs at once.
+- **Updates** (`src/update_mobile.rs`). At every start and then once a day
+  (also checked on coming back to the foreground) the app reads
+  `android.json` from the newest published release
+  (`releases/latest/download/android.json`: version, APK address, SHA-256
+  and size). If it's newer, a card on the feed and *Device → Settings*
+  offer it. *Download and install* downloads the APK into the app's cache
+  (`cache/updates`), checks the SHA-256, and hands it to Android's installer
+  through the FileProvider (`SideTrayAndroid.installApk`: `ACTION_INSTALL_PACKAGE`,
+  so apps that also open APK files don't get offered in a chooser; with the
+  `REQUEST_INSTALL_PACKAGES` permission). The first time, the person has to
+  turn on *Install unknown apps → Allow from this source* for Side Tray: the
+  card explains it and opens that screen, and installs as soon as they come
+  back with it allowed. Android only replaces the app with an APK signed
+  with the same key, so the checksum is only there to catch a damaged
+  download. Old downloads are deleted at the next start. A debug build
+  doesn't look for updates (it's signed with the debug key, so a release
+  APK couldn't replace it), unless it's built with
+  `SIDETRAY_ANDROID_UPDATE_URL` (below).
 - **Photos** go to Rust as base64 in JSON (Android's IPC can't carry a raw
   body). *Photos* opens Android's photo picker (several at once); *Camera*
   (composer, comments, chat) opens the camera app, and the full-size shot it
@@ -785,12 +895,13 @@ To try sharing without another app:
 
 ## Releases
 
-One version number for everything: `app/src-tauri/Cargo.toml` (the app;
-`tauri.conf.json` takes it from there), `crypto/Cargo.toml`,
+One version number for everything: `app/src-tauri/Cargo.toml` (the app),
+`app/src-tauri/tauri.conf.json` (`version`: the installers and the Android
+APK's `versionName` and `versionCode` come from it), `crypto/Cargo.toml`,
 `cli/Cargo.toml` and `server/app/__init__.py` (the relay reports it on
 `/api/v1/health`). To release:
 
-1. Bump the four versions, add a section to [CHANGELOG.md](CHANGELOG.md)
+1. Bump the five versions (the release job refuses a tag they don't match), add a section to [CHANGELOG.md](CHANGELOG.md)
    (`## [x.y.z] - date`; it becomes the release notes), commit.
 2. `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 3. [`.github/workflows/release.yml`](.github/workflows/release.yml) creates a
@@ -801,7 +912,11 @@ One version number for everything: `app/src-tauri/Cargo.toml` (the app;
    to the release. The Windows job also attaches a copy named
    `SideTray-Setup.exe`, so `releases/latest/download/SideTray-Setup.exe`
    (the link in [For family members](#for-family-members)) is always the
-   newest published installer. macOS isn't built yet.
+   newest published installer. A third job builds the Android APK (arm64,
+   signed with the release keystore; it fails unless the APK's certificate
+   is the expected one and its version matches the tag) and attaches it as
+   `Side.Tray_X.Y.Z_arm64.apk` and as `SideTray.apk`, plus `android.json`
+   for the phones' update check. macOS isn't built yet.
 4. Check the draft, then publish it. Installed apps only see a release once
    it's published (`releases/latest` skips drafts).
 
@@ -874,6 +989,23 @@ also sets `"dangerousInsecureTransportProtocol": true`; never ship that in a
 release. The 0.1.0 updater was tested that way: a 0.1.0 installed from the
 installer found 0.1.1 on a static folder on the test server, downloaded and
 verified it, and after *Restart to update* came back as 0.1.1 by itself.
+
+**The Android signing key** is a keystore made with `keytool` (RSA 4096,
+alias `sidetray`, valid until 2054). Android only installs an update over an
+installed app if both are signed with the same key: **if the keystore is
+lost, no phone can be updated any more**; everyone would have to uninstall
+Side Tray and join again with an APK signed with a new key. So keep a backup
+somewhere other than this computer (a password manager takes both the file
+and its password). For 0.2.0 it lives with the release manager in
+`%USERPROFILE%\.tauri\`: `sidetray-android.jks`, its password (store and
+key password are the same) in `sidetray-android.jks.password`, and the
+keystore as one line of base64 in `sidetray-android.jks.base64`. CI has it in
+three GitHub Actions secrets: `ANDROID_KEYSTORE_BASE64` (that base64),
+`ANDROID_KEYSTORE_PASSWORD` and `ANDROID_KEY_PASSWORD`. The certificate's
+SHA-256 is
+`C2:C4:FC:D1:70:16:29:57:03:C4:D9:F8:E8:01:30:C0:B4:FF:5B:CB:74:95:E1:26:2B:66:75:AD:EC:BB:88:DC`
+(`CERT_SHA256` in the workflow; `apksigner verify --print-certs` shows it
+for any APK).
 
 ### Code signing
 

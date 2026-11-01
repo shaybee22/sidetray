@@ -48,7 +48,7 @@ pub fn create(handle: &AppHandle) -> Result<()> {
             "open" => show_main(app),
             "quit" => app.exit(0),
             "update" => {
-                if let Err(e) = crate::update::install(app) {
+                if let Err(e) = crate::update::install_now(app) {
                     eprintln!("{e:#}");
                     show_main(app);
                 }

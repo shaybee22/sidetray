@@ -183,6 +183,17 @@
         <button class="ghost small" id="battery-later">Not now</button>
       </div>
     </div>
+    <!-- A phone: a newer APK on the release (A4) -->
+    <div class="banner offer" id="update-offer" hidden>
+      <div class="offer-text">
+        <strong id="update-offer-title"></strong>
+        <span id="update-offer-text"></span>
+      </div>
+      <div class="actions start">
+        <button class="small" id="update-offer-go"></button>
+        <button class="ghost small" id="update-offer-later">Not now</button>
+      </div>
+    </div>
     <form id="composer" class="card composer" novalidate>
       <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
       <div class="staged" id="cp-photos"></div>
@@ -320,7 +331,7 @@
     <div class="card">
       <h2>Updates</h2>
       <p id="upd-status"></p>
-      <div class="actions start"><button class="ghost" id="upd-check" hidden>Check for updates</button></div>
+      <div class="actions start"><button class="ghost" id="upd-get" hidden>Download and install</button><button class="ghost" id="upd-check" hidden>Check for updates</button></div>
       <p class="error" id="upd-err" hidden></p>
     </div>
     <div class="card" id="cert-card">

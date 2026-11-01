@@ -303,6 +303,31 @@ pub fn periodic_sync(on: bool) -> Result<()> {
     Ok(())
 }
 
+// --- updates (A4) ---------------------------------------------------------------------
+
+/// Where downloaded APKs go: `updates` in the app's cache (shared with the
+/// installer through the FileProvider).
+pub fn update_dir() -> Result<PathBuf> {
+    Ok(PathBuf::from(call_string("updateDir", &[])?.context("Android isn't ready yet")?))
+}
+
+/// Has the person allowed Side Tray to install apps ("Install unknown apps")?
+pub fn can_install_apks() -> Result<bool> {
+    Ok(call_string("canInstallApks", &[])?.as_deref() == Some("yes"))
+}
+
+/// Hand a downloaded APK to Android's installer: "started", "needs_permission" or "no_window".
+pub fn install_apk(path: &std::path::Path) -> Result<String> {
+    let p = path.to_str().context("odd characters in the download's path")?;
+    Ok(call_string("installApk", &[p])?.unwrap_or_default())
+}
+
+/// Android's "Install unknown apps" screen for Side Tray.
+pub fn open_install_settings() -> Result<()> {
+    call_string("openInstallSettings", &[])?;
+    Ok(())
+}
+
 // --- called from Kotlin ------------------------------------------------------------------
 
 fn jstr(env: &mut JNIEnv, s: &JString) -> String {
