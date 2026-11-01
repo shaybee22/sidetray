@@ -103,8 +103,8 @@ off.
 ```
 CHANGELOG.md          what changed in each release
 .github/workflows/    release.yml: installers and the updater manifest on a v* tag
-install.sh            server installer: Docker, /opt/sidetray, HTTPS, first setup token
-compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS)
+install.sh            server installer: Docker, /opt/sidetray, HTTPS, first setup token, optional push server
+compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS); ntfy for Android push (profile "push")
 Caddyfile             TLS via Caddy's internal CA, for a dev checkout on a LAN IP
 server/app/main.py    the relay
 server/app/admin.py   operator commands (`sidetray-admin new-group | list-groups | prune`)
@@ -138,6 +138,10 @@ It asks:
    domain, it checks that the name resolves to this machine before going on.
 2. **Retention**: how many days the relay keeps posts and photos that not
    every device has fetched yet (default 90).
+3. **Push server** (default no): whether to run [ntfy](https://ntfy.sh) next
+   to the relay so the Android app gets notifications within seconds. See
+   *Push server for Android* below. Without it, phones check about every 15
+   minutes.
 
 Then it installs Docker Engine and the Compose plugin from Docker's apt
 repository (if missing), writes `/opt/sidetray` (`compose.yaml`, `Caddyfile`,
@@ -153,8 +157,8 @@ Caddyfile changed, re-running the installer restarts Caddy so it takes effect.
 
 For unattended runs, every question has a flag:
 `--domain tray.example.org --email you@example.org` or `--ip 10.1.1.188`,
-`--retention 90`, `--yes` (keep existing settings), and `--new-group` (also print a
-token for another group). Piped from a release, `curl -fsSL <url>/install.sh |
+`--retention 90`, `--push` or `--no-push`, `--yes` (keep existing settings), and
+`--new-group` (also print a token for another group). Piped from a release, `curl -fsSL <url>/install.sh |
 sudo SIDETRAY_SOURCE_URL=<release tarball> bash` works the same way.
 
 **Re-running it is safe.** It updates the code and restarts the stack. The data
@@ -179,7 +183,10 @@ sudo ./install.sh --yes
 From a release instead: `curl -fsSL <release url>/install.sh | sudo
 SIDETRAY_SOURCE_URL=<release tarball> bash -s -- --yes`.
 
-`--yes` keeps every setting as it is (domain or IP, retention). The installer
+`--yes` keeps every setting as it is (domain or IP, retention, push server). A
+server that has never been asked about the push server (installed before it
+existed) gets the question when you run the installer without `--yes`; with
+`--yes` it stays off until you add `--push`. The installer
 copies the new `compose.yaml`, `server/` and `install.sh` into `/opt/sidetray`
 (keeping a `.bak` of anything it replaces), rebuilds the api image and
 restarts the stack. The data volumes and `.env` are kept, and the relay
@@ -196,6 +203,37 @@ If you installed from a plain copy of the files rather than a git checkout,
 switch to a checkout once (`git clone <repository> ~/sidetray`) and run the
 installer from there; it only needs `compose.yaml`, `server/` and
 `install.sh` next to each other.
+
+### Push server for Android
+
+With the push server on, `install.sh` adds an `ntfy` container (Compose
+profile `push`, set in `.env` as `COMPOSE_PROFILES=push`) and a Caddy site
+for it on port **8443** of the same domain or IP (`SIDETRAY_NTFY_PORT`). Open
+that port in any cloud firewall. ntfy is private: it refuses every topic
+except the random UnifiedPush ones (`up…`) that phones read and the relay
+writes, and it keeps nothing longer than 12 hours.
+
+When something happens (a post, a comment, a direct message, a join request
+for Key Masters) and a phone has no connection open, the relay POSTs an
+**empty** request to that phone's ntfy topic, at most once every 5 seconds
+per phone. ntfy turns that into a wake-up for the Side Tray app (which sees
+ntfy's placeholder text `triggered`), and the app fetches and decrypts the
+news over the normal API. Neither ntfy nor the phone's ntfy app learns names,
+text, the group or who posted. The relay sends to its own ntfy over Docker's
+internal network, and accepts only endpoints on that ntfy (or on hosts you
+list in `SIDETRAY_PUSH_HOSTS`, such as `ntfy.sh`; empty by default), so it
+can't be made to call other addresses.
+
+On each phone, in the **ntfy** app: *Settings → Default server* →
+`https://<your domain>:8443`, then open Side Tray (it asks ntfy for a new
+address and tells the relay). On a test server (an IP address) ntfy then
+says the certificate isn't trusted: subscribe once to any topic starting
+with `up` (say `upcheck`), compare the fingerprint ntfy shows with the
+"its certificate" line `install.sh` printed, tap *Trust*, and unsubscribe
+again. That certificate is made once and lasts 10 years
+(`/opt/sidetray/ntfy-tls/`); ntfy pins it exactly, and it deliberately names
+no host so Caddy keeps using its own CA on 443. A domain uses Let's Encrypt
+on 8443 too, and needs nothing in ntfy beyond the server address.
 
 ### More groups, and other admin commands
 
@@ -303,6 +341,9 @@ base64. The server never decrypts.
 | POST | /dms | member | `{conversation_id, recipient_member_id, ciphertext, signature, media_ids[], sealed_keys: [{device_id, sealed_key}]}` | `{seq}` |
 | GET | /dms | member | `?after=<seq>&limit=<1..500>` | `{messages: [{seq, conversation_id, sender_device_id, sender_member_id, recipient_member_id, ciphertext, signature, media_ids[], created_at, sealed_keys[]}], last_seq, has_more}`, only messages sealed to the calling device |
 | POST | /dms/ack | member | `{seq}` (only moves forward) | `{last_seq}` |
+| GET | /push | member | | `{offered, ntfy, hosts[], endpoint}`: whether the server sends wake-ups, its own ntfy, other allowed push hosts, and this device's endpoint |
+| POST | /push | member | `{endpoint}`, a UnifiedPush endpoint on the server's ntfy (or an allowed host) | `{endpoint}`; `400` for any other address, `404` if the server sends no wake-ups |
+| DELETE | /push | member | | `{deleted}` |
 | WS | /ws | member | `Authorization: Bearer` on the upgrade request | push messages, below |
 
 - **Creating a group:** `POST /join` with a valid `setup_token` creates a group
@@ -345,6 +386,16 @@ comes from `GET /events`. A missing, unknown, pending or revoked token gets HTTP
 | `{"type":"key_rotated","key_version"}` | every active device | a Key Master rotated the group key: fetch `GET /keys` |
 | `{"type":"removed","scope"}` | the revoked device; then the socket closes | `scope` is `member` (the member was removed) or `device` (just this device was revoked). Also sent by the socket itself if it notices the device is no longer active |
 | `{"type":"pong"}` | the pinging socket | reply to `{"type":"ping"}` |
+
+**Wake-ups (Android A3).** Each time the relay sends one of these messages
+(except `new_event` for reactions and profile changes), a device that is
+meant to get it but has **no socket open** and has registered an endpoint
+(`POST /push`) gets an empty `POST` to that endpoint instead (no body, only
+`TTL` and `Urgency` headers): at most one per device every 5 seconds
+(`SIDETRAY_WAKE_EVERY_SECONDS`), with a later one sent when the interval is
+up so the last change is never missed. Push servers that answer `404` or
+`410` lose the endpoint. A revoked device gets one last wake-up (so it finds
+out), and its endpoint is deleted.
 
 Clients send `{"type":"ping"}` every 25 seconds; a socket silent for 75 seconds
 (`SIDETRAY_WS_IDLE_SECONDS`) is closed. Up to 4 sockets per device. The hub is in
@@ -581,15 +632,16 @@ see [Releases](#releases).
   sit in SQLite, encrypted under that wrapping key. Linux has no keychain
   backend yet, so there those secrets live in the database.
 
-## Android app (A1, A2)
+## Android app (A1-A3)
 
-The same app builds for Android (SPEC.md "Android app", phases A1 and A2):
+The same app builds for Android (SPEC.md "Android app", phases A1 to A3):
 join with the safety-code check (or from a `sidetray://` invite link), the
 feed, posts with photos, comments, reactions, direct messages and the Key
 Master tab; *Share → Side Tray* from other apps, the camera, multi-select from
-the photo picker, HEIC photos, and a phone layout with bottom tabs. It syncs,
-with the push socket, only while it's open; background notifications are A3.
-There's no release APK yet (A4): build a debug one as below.
+the photo picker, HEIC photos, a phone layout with bottom tabs, and
+notifications while it's closed (instant through the ntfy app, or about
+every 15 minutes without it). There's no release APK yet (A4): build a debug
+one as below.
 
 **Build setup on Windows** (all per user, no admin except Developer Mode):
 
@@ -662,12 +714,40 @@ hand-made small desktop icons).
   posts and photos, and a restored copy couldn't unlock its keys anyway.
 - `sidetray://join?...` links open the app through an intent filter
   (`plugins.deep-link.mobile` in `tauri.conf.json`).
+- **Notifications while closed** (`src/mobile_push.rs`). If a UnifiedPush
+  distributor is installed (the ntfy app), Side Tray registers with it
+  (`SideTrayAndroid.pushRegister`, the `org.unifiedpush.android:connector`
+  library) and gives the relay the endpoint ntfy hands back
+  (`SideTrayPushService` → `SideTrayWorker` → `POST /push`). A wake-up
+  starts an expedited WorkManager job, which may use the network even while
+  the phone dozes; it loads the Rust library if the app wasn't running,
+  syncs as usual and shows the notifications (`alerts.rs`, through Kotlin's
+  `showNotifications`). Without a distributor, or when the relay refuses the
+  endpoint (ntfy pointed at another server), a periodic job syncs about every
+  15 minutes instead, and the app says once how to get instant ones;
+  *Device → Settings* always shows which it is. The app closes its push
+  socket whenever it leaves the screen, so the relay starts sending wake-ups
+  at once.
+- **Notification permission** (Android 13+): asked only after joining, from
+  a card on the feed ("Get notified about new posts?"), never at first
+  launch. Tapping a notification opens the post, the conversation, or the
+  Key Master tab (`take_open`). Channels: new posts, comments on your posts,
+  direct messages, join requests, your membership.
+- **One app state per process.** A wake-up can start the app's process
+  without its window. Rust then gets the JavaVM from
+  `SideTrayAndroid.nativeInit` instead of tao's ndk-context (which tao can set
+  only once per process), and a window opened later reuses the same `App`
+  (`state::shared`), so there's one database connection and one sync lock.
 
 **Testing against a relay on this PC.** Plain `http://` is only allowed to
 localhost, and `adb reverse` makes the PC's localhost the phone's:
 `adb reverse tcp:8765 tcp:8765`, then use `http://127.0.0.1:8765` in the
 wizard. A debug build's WebView can be driven over DevTools:
 `adb forward tcp:9401 localabstract:webview_devtools_remote_$(adb shell pidof org.sidetray.app)`.
+To try notifications on the emulator, install the ntfy APK from its
+GitHub releases (the `fdroid` build) and point it at the test server as in
+*Push server for Android*. `adb shell am kill org.sidetray.app` closes the
+app the way Android does (unlike `force-stop`, which also blocks wake-ups).
 To try sharing without another app:
 `adb shell am start -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT https://example.org`.
 

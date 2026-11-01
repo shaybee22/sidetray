@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Notifications (A3); on Android 13+ the app asks for this after joining. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- The camera button (A2): the WebView looks for a camera app before opening one,
          and since Android 11 an app only sees the ones it declares here. -->
@@ -65,6 +67,16 @@
             </intent-filter>
             <!-- DEEP LINK PLUGIN. AUTO-GENERATED. DO NOT REMOVE. -->
         </activity>
+
+        <!-- UnifiedPush (A3): wake-ups and endpoints from the distributor app (ntfy),
+             handed over by the connector library inside this app only. -->
+        <service
+            android:name=".SideTrayPushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
+            </intent-filter>
+        </service>
 
         <provider
           android:name="androidx.core.content.FileProvider"

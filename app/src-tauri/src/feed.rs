@@ -83,7 +83,7 @@ pub struct SyncReport {
     pub rejected: usize,
     pub pending_joins: usize,
     pub last_seq: i64,
-    /// This sync started from nothing (a new device catching up on the backlog).
+    /// This device had never finished a sync (a new device catching up on the backlog).
     pub initial: bool,
     /// What arrived, for the unread count and notifications.
     #[serde(skip)]
@@ -150,7 +150,9 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
     let authors = Authors { current: roster.verified, former: roster.former };
     // The roster refresh may have recorded a promotion.
     let id = app.require_active()?;
-    let mut report = SyncReport { initial: db::last_seq(&app.db())? == 0, ..Default::default() };
+    // A device that has never finished a sync is catching up on the backlog
+    // (not "nothing seen yet": a new group's first post should still notify).
+    let mut report = SyncReport { initial: db::sync_info(&app.db())?.1.is_none(), ..Default::default() };
     report.names_changed = roster_names(&app.db())? != names_before;
     // Key Masters check every time, to notice a rotation left pending.
     let km_keys = if id.is_keymaster() { Some(manage::refresh_keys(app, &id, &api, &authors.current).await?) } else { None };

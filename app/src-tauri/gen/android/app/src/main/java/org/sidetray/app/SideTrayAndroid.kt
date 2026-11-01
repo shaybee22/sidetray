@@ -1,8 +1,13 @@
 package org.sidetray.app
 
+import android.Manifest
 import android.app.Activity
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.ColorSpace
 import android.graphics.ImageDecoder
@@ -10,8 +15,17 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Parcelable
+import android.provider.Settings
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
+import org.unifiedpush.android.connector.UnifiedPush
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -29,7 +43,13 @@ import kotlin.math.roundToInt
  *   into the app's cache so Rust can run it through the photo pipeline;
  * - moving the app to the background (the back button on the feed);
  * - deleting the camera's full-size originals once they're staged;
- * - decoding photo formats only Android can read (HEIC/HEIF, AVIF).
+ * - decoding photo formats only Android can read (HEIC/HEIF, AVIF);
+ * - notifications (A3): showing them, the permission, what a tapped one was
+ *   about, UnifiedPush registration and the periodic sync (SideTrayWorker).
+ *
+ * And the other way, the `native*` functions are Rust (src/android.rs). A push
+ * wake-up or the periodic job can start this process without MainActivity, so
+ * they load the library themselves (`ensureNative`).
  */
 object SideTrayAndroid {
   private const val MAX_FILES = 20
@@ -47,9 +67,50 @@ object SideTrayAndroid {
 
   private class TooLarge : IOException()
 
+  const val TAG = "SideTray"
+  const val ACTION_OPEN = "org.sidetray.app.OPEN"
+  const val EXTRA_TARGET = "target"
+  private const val PUSH_INSTANCE = "default"
+  private const val NTFY = "io.heckel.ntfy"
+
+  @JvmStatic external fun nativeInit(context: Context)
+  @JvmStatic external fun nativeForeground(visible: Boolean)
+  @JvmStatic external fun nativeSync(dataDir: String): String
+  @JvmStatic external fun nativePush(dataDir: String, kind: String, value: String): String
+
+  private var nativeReady = false
+  private var observing = false
+  /** A tapped notification's target (JSON), until the page takes it. */
+  private var openTarget: String? = null
+
+  /** Load the Rust library and hand it the JavaVM and the app's context (once per process). */
+  fun ensureNative(ctx: Context) {
+    synchronized(lock) {
+      if (nativeReady) return
+      appContext = ctx.applicationContext
+      System.loadLibrary("sidetray_app_lib")
+      nativeInit(ctx.applicationContext)
+      nativeReady = true
+    }
+  }
+
   fun attach(a: Activity, coldStart: Boolean) {
     activity = WeakReference(a)
     appContext = a.applicationContext
+    ensureNative(a)
+    if (!observing) {
+      observing = true
+      // Whether the app is on screen: notifications aren't shown then, and the
+      // push socket is closed while it isn't (so the relay sends wake-ups).
+      ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) {
+          nativeForeground(true)
+          // What they were about is on screen now.
+          appContext?.let { NotificationManagerCompat.from(it).cancelAll() }
+        }
+        override fun onStop(owner: LifecycleOwner) = nativeForeground(false)
+      })
+    }
     if (coldStart) {
       // Leftovers from a share or a camera shot the app never finished with.
       worker.execute {
@@ -62,6 +123,12 @@ object SideTrayAndroid {
   /** An ACTION_SEND / ACTION_SEND_MULTIPLE intent: copy what came with it, off the main thread. */
   fun receive(a: Activity, intent: Intent?) {
     val action = intent?.action ?: return
+    if (action == ACTION_OPEN) {
+      // A tapped notification: the page asks for it (takeOpen) on start and resume.
+      synchronized(lock) { openTarget = intent.getStringExtra(EXTRA_TARGET) }
+      a.intent = Intent(Intent.ACTION_MAIN)
+      return
+    }
     if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
     val uris = LinkedHashSet<Uri>()
     if (action == Intent.ACTION_SEND) {
@@ -168,6 +235,154 @@ object SideTrayAndroid {
     val i = root.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
     val d = a.resources.displayMetrics.density
     return "${i.top / d},${i.right / d},${i.bottom / d},${i.left / d}"
+  }
+
+  // --- notifications (A3) --------------------------------------------------------------
+
+  /** What a tapped notification was about (JSON), once. */
+  @JvmStatic
+  fun takeOpen(): String? = synchronized(lock) {
+    val t = openTarget
+    openTarget = null
+    t
+  }
+
+  private fun channels(ctx: Context) {
+    if (Build.VERSION.SDK_INT < 26) return
+    val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+    fun ch(id: String, name: String, importance: Int, desc: String) {
+      nm.createNotificationChannel(NotificationChannel(id, name, importance).apply { description = desc })
+    }
+    ch("posts", "New posts", NotificationManager.IMPORTANCE_DEFAULT, "Someone in your group posted")
+    ch("comments", "Comments on your posts", NotificationManager.IMPORTANCE_DEFAULT, "Someone commented on something you posted")
+    ch("messages", "Direct messages", NotificationManager.IMPORTANCE_HIGH, "Messages sent to you")
+    ch("joins", "Join requests", NotificationManager.IMPORTANCE_HIGH, "Key Masters: someone is waiting to be let in")
+    ch("account", "Your membership", NotificationManager.IMPORTANCE_DEFAULT, "If this device is removed from the group")
+    ch("sync", "Checking for new posts", NotificationManager.IMPORTANCE_MIN, "Shown briefly on older Android versions while Side Tray syncs")
+  }
+
+  /** Builds the low-key notification an expedited job shows on Android 11 and older. */
+  fun syncNotification(ctx: Context): android.app.Notification {
+    channels(ctx)
+    return NotificationCompat.Builder(ctx, "sync")
+      .setSmallIcon(R.drawable.ic_stat_sidetray)
+      .setContentTitle("Checking for new posts")
+      .setPriority(NotificationCompat.PRIORITY_MIN)
+      .setSilent(true)
+      .build()
+  }
+
+  /**
+   * Show notifications: a JSON array of {id, channel, title, body, target}.
+   * Tapping one opens MainActivity with the target, which the page then shows.
+   */
+  @JvmStatic
+  fun showNotifications(json: String): String? {
+    val ctx = appContext ?: return null
+    channels(ctx)
+    val nm = NotificationManagerCompat.from(ctx)
+    if (!nm.areNotificationsEnabled()) return "off"
+    val items = JSONArray(json)
+    for (i in 0 until items.length()) {
+      val o = items.getJSONObject(i)
+      val id = o.getInt("id")
+      val channel = o.getString("channel")
+      val body = o.getString("body")
+      val open = Intent(ctx, MainActivity::class.java)
+        .setAction(ACTION_OPEN)
+        .putExtra(EXTRA_TARGET, o.getString("target"))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+      val pi = PendingIntent.getActivity(ctx, id, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+      val n = NotificationCompat.Builder(ctx, channel)
+        .setSmallIcon(R.drawable.ic_stat_sidetray)
+        .setColor(0xFF2F6F62.toInt())
+        .setContentTitle(o.getString("title"))
+        .setContentText(body)
+        .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+        .setContentIntent(pi)
+        .setAutoCancel(true)
+        .setCategory(if (channel == "messages") NotificationCompat.CATEGORY_MESSAGE else NotificationCompat.CATEGORY_SOCIAL)
+        .setPriority(if (channel == "messages" || channel == "joins") NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
+        .build()
+      try {
+        nm.notify(id, n)
+      } catch (e: SecurityException) {
+        return "off"
+      }
+    }
+    return "shown"
+  }
+
+  /** "on", "needs_permission" (Android 13+, not granted yet), or "off" (switched off in settings). */
+  @JvmStatic
+  fun notificationState(): String {
+    val ctx = appContext ?: return "off"
+    if (Build.VERSION.SDK_INT >= 33 &&
+      ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+      return "needs_permission"
+    }
+    return if (NotificationManagerCompat.from(ctx).areNotificationsEnabled()) "on" else "off"
+  }
+
+  /** Android's "Allow Side Tray to send you notifications?" prompt (Android 13+). */
+  @JvmStatic
+  fun requestNotificationPermission(): String {
+    val a = activity?.get() ?: return "no_window"
+    if (Build.VERSION.SDK_INT < 33) return "not_needed"
+    a.runOnUiThread { a.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 41) }
+    return "asked"
+  }
+
+  /** Android's notification settings for Side Tray (after the permission was refused). */
+  @JvmStatic
+  fun openNotificationSettings(): String? {
+    val a = activity?.get() ?: return null
+    val i = if (Build.VERSION.SDK_INT >= 26) {
+      Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, a.packageName)
+    } else {
+      Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + a.packageName))
+    }
+    a.runOnUiThread { a.startActivity(i) }
+    return null
+  }
+
+  // --- UnifiedPush and the periodic sync (A3) ---------------------------------------------
+
+  /**
+   * Register with the UnifiedPush distributor: the one already chosen, or else
+   * ntfy, or else the first one installed. "fresh" unregisters first, so the
+   * distributor makes a new endpoint (on its current default server). Returns
+   * the distributor's package, or "" if the phone has none.
+   */
+  @JvmStatic
+  fun pushRegister(mode: String): String {
+    val ctx = appContext ?: return ""
+    var d = UnifiedPush.getAckDistributor(ctx) ?: UnifiedPush.getSavedDistributor(ctx)
+    if (d == null) {
+      val all = UnifiedPush.getDistributors(ctx).filter { it != ctx.packageName }
+      d = all.firstOrNull { it == NTFY } ?: all.firstOrNull()
+      if (d != null) UnifiedPush.saveDistributor(ctx, d)
+    }
+    if (d == null) return ""
+    if (mode == "fresh") {
+      UnifiedPush.unregister(ctx, PUSH_INSTANCE)
+      // Unregistering the last registration also forgets the distributor.
+      UnifiedPush.saveDistributor(ctx, d)
+    }
+    UnifiedPush.register(ctx, PUSH_INSTANCE, "Side Tray", null)
+    return d
+  }
+
+  @JvmStatic
+  fun pushUnregister(): String? {
+    appContext?.let { UnifiedPush.unregister(it, PUSH_INSTANCE) }
+    return null
+  }
+
+  @JvmStatic
+  fun periodicSync(mode: String): String? {
+    appContext?.let { SideTrayWorker.periodic(it, mode == "on") }
+    return null
   }
 
   /** The back button with nothing left to close: leave the app running in the background, like Home. */

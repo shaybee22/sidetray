@@ -151,6 +151,11 @@ CREATE TABLE IF NOT EXISTS sync_state (
     rejected      INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO sync_state (id, last_seq) VALUES (1, 0);
+-- Small settings and state (A3: push registration, whether notifications were offered).
+CREATE TABLE IF NOT EXISTS kv (
+    key           TEXT PRIMARY KEY,
+    value         TEXT NOT NULL
+);
 "#;
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -289,9 +294,24 @@ pub fn wipe(conn: &Connection) -> Result<()> {
         "DELETE FROM identity; DELETE FROM group_keys; DELETE FROM secrets; DELETE FROM anchors;
          DELETE FROM members; DELETE FROM member_devices; DELETE FROM posts; DELETE FROM comments;
          DELETE FROM reactions; DELETE FROM media; DELETE FROM profiles;
-         DELETE FROM conversations; DELETE FROM dm_messages; DELETE FROM dm_photos;
+         DELETE FROM conversations; DELETE FROM dm_messages; DELETE FROM dm_photos; DELETE FROM kv;
          UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0, missed_at = NULL, missed_days = NULL, dm_last_seq = 0;",
     )?;
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn kv_get(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get(0)).optional()?)
+}
+
+/// `None` deletes the key.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn kv_set(conn: &Connection, key: &str, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(v) => conn.execute("INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2", params![key, v])?,
+        None => conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?,
+    };
     Ok(())
 }
 

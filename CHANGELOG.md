@@ -31,9 +31,32 @@ the app, the Rust crates and the relay share one version number.
   between the inner and outer screens.
 - The app is left out of Android backups (they would copy decrypted posts).
 
+### Android app (phase A3)
+
+- **Notifications while the app is closed**: new posts, comments on your
+  posts, direct messages and (for Key Masters) join requests. Tapping one
+  opens that post, conversation or the Key Master tab.
+- With the **ntfy** app installed they arrive within seconds (UnifiedPush,
+  through the group's own server). Without it, Side Tray checks about every
+  15 minutes and says once how to get instant ones.
+- Android 13 and newer: Side Tray offers to turn notifications on after you
+  join, not at first launch. *Device → Settings* shows whether they're on and
+  how they arrive.
+
+### Relay (A3)
+
+- Optional push server: `install.sh` asks whether to run **ntfy** next to the
+  relay (port 8443, behind Caddy; off unless you say yes; `--push` /
+  `--no-push`). An existing server is asked on its next update.
+- `GET/POST/DELETE /api/v1/push`: a phone registers its UnifiedPush endpoint.
+  When a phone has no connection open, the relay sends it an **empty**
+  wake-up; nothing about the group, the people or the content goes into it.
+
 ### Desktop app
 
-- No visible changes. Internally the app is now a library plus a small
+- A new group's very first post now notifies (it used to count as the
+  backlog of a new device).
+- No other visible changes. Internally the app is now a library plus a small
   executable, so the same code builds for Android.
 - A HEIC/HEIF photo is refused with a clear message instead of "isn't a
   photo this app can read".

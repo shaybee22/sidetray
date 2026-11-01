@@ -71,9 +71,9 @@ pub fn unwrap(wrapped: &[u8]) -> Result<Vec<u8>> {
 /// Attach this thread to the JVM, run `f` in a local reference frame, and turn
 /// a pending Java exception into an error (cleared, so the thread stays usable).
 pub(crate) fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T>) -> Result<T> {
-    let ctx = ndk_context::android_context();
-    // SAFETY: tao stores the process's JavaVM pointer in ndk-context at startup.
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }?;
+    // SAFETY: the pointer is the process's JavaVM, from SideTrayAndroid.nativeInit
+    // (also in a process the window never started in) or from tao's ndk-context.
+    let vm = unsafe { jni::JavaVM::from_raw(crate::android::java_vm()?) }?;
     let mut env = vm.attach_current_thread()?;
     let out = env.with_local_frame(64, |env| -> Result<T> { f(env) });
     if env.exception_check().unwrap_or(false) {

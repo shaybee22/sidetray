@@ -581,7 +581,8 @@ function startMain() {
   renderSyncStatus();
   renderDevice();
   renderDmBadge();
-  loadFeed().then(markReadIfViewed);
+  loadFeed().then(markReadIfViewed).then(checkOpen);
+  refreshPush();
 }
 
 function selectTab(name) {
@@ -593,7 +594,7 @@ function selectTab(name) {
     loadPending();
     pendingTimer = setInterval(loadPending, 10000);
   }
-  if (name === "device") { renderDevice(); loadSettings(); loadProfile(); }
+  if (name === "device") { renderDevice(); loadSettings(); loadProfile(); refreshPush(); }
   if (name === "members") loadMembers();
   if (name === "feed") loadFeed().then(markReadIfViewed);
   if (name === "messages") showMessages();
@@ -644,8 +645,9 @@ listen("removed", async () => {
 });
 
 // A notification was clicked: show what it was about.
-listen("open-item", async (ev) => {
-  const t = ev.payload;
+listen("open-item", (ev) => openItem(ev.payload));
+
+async function openItem(t) {
   if (t.kind === "update") return; // the window is up; the banner says the rest
   if (!view || view.stage !== "active") return;
   if (t.kind === "joins" && view.keymaster) return selectTab("km");
@@ -664,6 +666,138 @@ listen("open-item", async (ev) => {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
   markReadIfViewed();
+}
+
+// --- notifications on a phone (A3) ------------------------------------------------------------
+
+let push = null; // the last push_status: notifications on/ask/off, delivery instant/periodic
+
+/** A phone opened by tapping a notification: show what it was about. */
+async function checkOpen() {
+  if (!mobile || !view || view.stage !== "active") return;
+  try {
+    const t = await invoke("take_open");
+    if (t) await openItem(t);
+  } catch (e) {
+    console.warn("take_open", e);
+  }
+}
+
+async function refreshPush() {
+  if (!mobile || !view || view.stage !== "active") return;
+  try {
+    push = await invoke("push_status");
+  } catch (e) {
+    console.warn("push_status", e);
+    return;
+  }
+  renderNotifOffer();
+  renderPushSettings();
+}
+
+const distributorName = (d) => (d === "io.heckel.ntfy" ? "the ntfy app" : d || "a push app");
+
+/** Why notifications aren't instant, in words, or "" if they are. */
+function pushHow() {
+  if (!push || push.mode !== "periodic") return "";
+  switch (push.reason) {
+    case "no_distributor":
+      return "For instant notifications, install the free ntfy app (from F-Droid or Google Play), then open Side Tray again.";
+    case "server_refused":
+      return `Your ntfy app uses ${push.endpoint_host || "another server"}, but this group's server only sends to its own. In ntfy, open Settings → Default server, enter ${push.ntfy || "the address your group's server gives"}, then open Side Tray again.`;
+    case "server_off":
+      return "This group's server doesn't send instant notifications.";
+    case "registering":
+      return `Setting up instant notifications with ${distributorName(push.distributor)}…`;
+    case "offline":
+      return "Couldn't reach the server to set up instant notifications. Side Tray tries again each time you open it.";
+    case "failed":
+      return `${distributorName(push.distributor)} turned down the registration${push.detail ? ` (${push.detail})` : ""}.`;
+    default:
+      return "";
+  }
+}
+
+/**
+ * The offer to turn notifications on (once, after joining: Android 13+ asks for
+ * permission), then, once, the note on how to get them instantly.
+ */
+function renderNotifOffer() {
+  const box = $("#notif-offer");
+  const noteDue = push && push.notifications === "on" && push.mode === "periodic" && !push.note_seen
+    && ["no_distributor", "server_refused", "server_off"].includes(push.reason);
+  if (push && push.notifications === "ask") {
+    $("#notif-offer-title").textContent = "Get notified about new posts?";
+    $("#notif-offer-text").textContent = "Side Tray can tell you about new posts, comments on your posts and messages, even while it's closed. Android will ask whether to allow it.";
+    $("#notif-offer-yes").textContent = "Turn on";
+    $("#notif-offer-no").textContent = "Not now";
+    $("#notif-offer-no").hidden = false;
+    box.dataset.offer = "notifications";
+    box.hidden = false;
+  } else if (noteDue) {
+    $("#notif-offer-title").textContent = push.reason === "server_refused" ? "One more step for instant notifications" : "Notifications can take up to 15 minutes";
+    $("#notif-offer-text").textContent = `Side Tray checks for new posts about every 15 minutes. ${pushHow()}`;
+    $("#notif-offer-yes").textContent = "OK";
+    $("#notif-offer-no").hidden = true;
+    box.dataset.offer = "push_note";
+    box.hidden = false;
+  } else {
+    box.hidden = true;
+  }
+}
+
+async function askForNotifications() {
+  try {
+    await invoke("request_notifications");
+  } catch (e) {
+    console.warn("request_notifications", e);
+  }
+  // Android's prompt is its own window: look again once it has had a chance to close.
+  for (const ms of [1000, 3000, 8000]) setTimeout(refreshPush, ms);
+}
+
+$("#notif-offer-yes").addEventListener("click", async () => {
+  const which = $("#notif-offer").dataset.offer;
+  $("#notif-offer").hidden = true;
+  if (which === "notifications") return askForNotifications();
+  await invoke("dismiss_notice", { which }).catch((e) => console.warn("dismiss_notice", e));
+  refreshPush();
+});
+
+$("#notif-offer-no").addEventListener("click", async () => {
+  $("#notif-offer").hidden = true;
+  await invoke("dismiss_notice", { which: "notifications" }).catch((e) => console.warn("dismiss_notice", e));
+  refreshPush();
+});
+
+/** This device → Settings, on a phone: whether notifications are on and how they arrive. */
+function renderPushSettings() {
+  if (!push) return;
+  const on = push.notifications === "on";
+  $("#ns-state").textContent = on ? "on" : push.notifications === "ask" ? "off (not turned on yet)" : "off (turned off in Android's settings)";
+  $("#ns-turn-on").hidden = on;
+  $("#ns-settings").hidden = on || push.notifications === "ask";
+  $("#ns-mode").textContent = push.mode === "instant"
+    ? `instant, through ${distributorName(push.distributor)}${push.endpoint_host ? ` (${push.endpoint_host})` : ""}`
+    : push.mode === "periodic" ? "about every 15 minutes" : "none";
+  const how = pushHow();
+  $("#ns-how").textContent = how;
+  $("#ns-how").hidden = !how;
+}
+
+$("#ns-turn-on").addEventListener("click", askForNotifications);
+$("#ns-settings").addEventListener("click", () => invoke("open_notification_settings").catch((e) => console.warn(e)));
+$("#ns-recheck").addEventListener("click", async () => {
+  await busy($("#ns-recheck"), async () => {
+    await invoke("push_setup").catch((e) => console.warn("push_setup", e));
+    await sleep(2500); // the distributor answers in the background
+    await refreshPush();
+  });
+});
+
+listen("resumed", () => { checkOpen(); refreshPush(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") { checkOpen(); refreshPush(); }
 });
 
 $("#sync-btn").addEventListener("click", async () => {

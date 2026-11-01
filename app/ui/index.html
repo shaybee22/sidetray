@@ -162,6 +162,16 @@
       <span id="missed-text"></span>
       <button class="ghost small" id="missed-dismiss">Dismiss</button>
     </div>
+    <div class="banner offer" id="notif-offer" hidden>
+      <div class="offer-text">
+        <strong id="notif-offer-title"></strong>
+        <span id="notif-offer-text"></span>
+      </div>
+      <div class="actions start">
+        <button class="small" id="notif-offer-yes"></button>
+        <button class="ghost small" id="notif-offer-no"></button>
+      </div>
+    </div>
     <form id="composer" class="card composer" novalidate>
       <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
       <div class="staged" id="cp-photos"></div>
@@ -280,7 +290,16 @@
       <h2>Settings</h2>
       <label class="check desktop-only"><input type="checkbox" id="set-autostart"> Start Side Tray when I sign in <span class="hint">It opens quietly in the tray.</span></label>
       <p class="hint desktop-only">Closing the window keeps Side Tray running in the tray so it can tell you about new posts. To stop it, right-click the tray icon and choose Quit.</p>
-      <p class="hint mobile-only">On a phone, Side Tray syncs while it's open. Notifications while it's closed come in a later version.</p>
+      <div class="mobile-only stack" id="notif-settings">
+        <p><strong>Notifications:</strong> <span id="ns-state"></span></p>
+        <p><strong>Delivery:</strong> <span id="ns-mode"></span></p>
+        <p class="hint" id="ns-how" hidden></p>
+        <div class="actions start">
+          <button class="ghost small" id="ns-turn-on" hidden>Turn on notifications</button>
+          <button class="ghost small" id="ns-settings" hidden>Open notification settings</button>
+          <button class="ghost small" id="ns-recheck">Check again</button>
+        </div>
+      </div>
       <p class="error" id="set-err" hidden></p>
     </div>
     <div class="card">

@@ -327,6 +327,11 @@ dialog#crop p { margin: 0; }
 
 /* Phase 7: a downloaded update, and the version under the wizard */
 .banner.update { background: var(--surface-2); border: 1px solid var(--line); }
+/* A3: the offer to turn notifications on, and the note about instant ones (phones). */
+.banner.offer { background: var(--accent-soft); border: 1px solid var(--line); width: 100%; margin: 0 0 16px; flex-direction: column; align-items: stretch; gap: 10px; }
+.banner.offer .offer-text { display: flex; flex-direction: column; gap: 4px; }
+.banner.offer .actions { margin: 0; }
+#notif-settings p { margin: 0; }
 .app-version { text-align: center; margin: 16px 0 0; }
 
 /* 0.1.1: pasting and dropping pictures, photos on comments */

@@ -9,7 +9,8 @@
 //! The same code runs on Android (SPEC.md "Android app", A1): the tray, the
 //! updater, autostart and single-instance are desktop-only (`cfg(desktop)`);
 //! on a phone `tray` is a small stand-in and the keys are wrapped by the
-//! Android Keystore (`keystore`, `secrets`).
+//! Android Keystore (`keystore`, `secrets`). A3: notifications while the app
+//! is closed, woken through UnifiedPush or a periodic job (`mobile_push`).
 
 mod account;
 mod alerts;
@@ -23,6 +24,8 @@ mod invite;
 #[cfg(target_os = "android")]
 mod keystore;
 mod manage;
+#[cfg(target_os = "android")]
+mod mobile_push;
 mod photo;
 mod profile;
 mod push;
@@ -291,6 +294,8 @@ async fn confirm_approval(app: State<'_, Arc<App>>, code: String) -> Res<()> {
     account::confirm_approval(&app, &code).await.map_err(err)?;
     app.wake.notify_one();
     app.push_wake.notify_one();
+    #[cfg(target_os = "android")]
+    mobile_push::setup(&app);
     Ok(())
 }
 
@@ -452,13 +457,7 @@ fn dismiss_missed(app: State<'_, Arc<App>>) -> Res<()> {
 pub async fn removed_check(handle: &AppHandle, app: &App) {
     match manage::check_standing(app).await {
         Ok(Some(status)) => {
-            let group = app.identity().ok().flatten().map(|i| i.group_name).unwrap_or_default();
-            let (title, body) = if status == "removed" {
-                (format!("You've been removed from {group}"), "Posts already on this computer are kept.")
-            } else {
-                (format!("This device was disconnected from {group}"), "A Key Master revoked it. Posts already on it are kept.")
-            };
-            alerts::show(handle, &title, body, alerts::Target::Feed);
+            alerts::removed(app, &status);
             app.push_wake.notify_one();
             tray::refresh(handle, app);
             let _ = handle.emit("removed", status);
@@ -736,6 +735,78 @@ fn mark_dm_read(handle: AppHandle, app: State<'_, Arc<App>>, member_id: String) 
     Ok(())
 }
 
+// --- notifications on a phone (A3) ------------------------------------------------------------
+
+/// Notifications and how they're delivered (instant through UnifiedPush, or
+/// the periodic sync). None on a computer.
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn push_status(app: State<'_, Arc<App>>) -> Res<Option<mobile_push::PushView>> {
+    mobile_push::view(&app).map(Some).map_err(err)
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn push_status() -> Res<Option<()>> {
+    Ok(None)
+}
+
+/// Register with the distributor again (the person installed ntfy, or changed its server).
+#[tauri::command]
+fn push_setup(app: State<'_, Arc<App>>) {
+    #[cfg(target_os = "android")]
+    mobile_push::setup(&app);
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+}
+
+/// The person chose to turn notifications on: Android's permission prompt.
+#[tauri::command]
+fn request_notifications(app: State<'_, Arc<App>>) -> Res<String> {
+    #[cfg(target_os = "android")]
+    {
+        mobile_push::mark(&app, mobile_push::NOTIF_ASKED);
+        android::request_notification_permission().map_err(err)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(String::new())
+    }
+}
+
+/// "Not now" on the offer, or the one-time note about instant notifications was read.
+#[tauri::command]
+fn dismiss_notice(app: State<'_, Arc<App>>, which: String) {
+    #[cfg(target_os = "android")]
+    match which.as_str() {
+        "notifications" => mobile_push::mark(&app, mobile_push::NOTIF_ASKED),
+        "push_note" => mobile_push::mark(&app, mobile_push::NOTE_SEEN),
+        _ => {}
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = (app, which);
+}
+
+#[tauri::command]
+fn open_notification_settings() -> Res<()> {
+    #[cfg(target_os = "android")]
+    android::open_notification_settings().map_err(err)?;
+    Ok(())
+}
+
+/// What a tapped notification was about, if the app was opened by one.
+#[tauri::command]
+fn take_open() -> Res<Option<alerts::Target>> {
+    #[cfg(target_os = "android")]
+    {
+        let Some(t) = android::take_open().map_err(err)? else { return Ok(None) };
+        Ok(serde_json::from_str(&t).ok())
+    }
+    #[cfg(not(target_os = "android"))]
+    Ok(None)
+}
+
 // --- settings ----------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -886,7 +957,8 @@ pub fn run() {
                 Some(d) => d.into(),
                 None => tauri_app.path().app_data_dir()?,
             };
-            let app = Arc::new(App::open(dir.clone())?);
+            // A push wake-up may have opened it already, in this process (Android).
+            let app = state::shared(dir.clone())?;
             let handle = tauri_app.handle().clone();
             let _ = app.handle.set(handle.clone());
             tauri_app.manage(app.clone());
@@ -931,6 +1003,11 @@ pub fn run() {
             }
             spawn_sync_loop(handle.clone(), app.clone());
             update::spawn(handle.clone());
+            #[cfg(target_os = "android")]
+            {
+                android::ANDROID_CONTEXT_READY.store(true, Ordering::SeqCst);
+                mobile_push::setup(&app);
+            }
             push::spawn(handle, app);
             Ok(())
         })
@@ -967,6 +1044,12 @@ pub fn run() {
             unstage_photo,
             staged_photos,
             take_share,
+            take_open,
+            push_status,
+            push_setup,
+            request_notifications,
+            dismiss_notice,
+            open_notification_settings,
             stage_shared_photo,
             end_share,
             leave_app,
@@ -998,8 +1081,8 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { code: None, api, .. } = event {
                 api.prevent_exit();
             }
-            // A phone syncs only while the app is open (A1). Coming back to the
-            // foreground: sync now, and reconnect the push socket if Android dropped it.
+            // Coming back to the foreground: sync now, and reconnect the push socket
+            // (a phone closes it in the background; wake-ups or the periodic sync take over).
             #[cfg(mobile)]
             match event {
                 tauri::RunEvent::Resumed => {
@@ -1010,9 +1093,6 @@ pub fn run() {
                         app.wake.notify_one();
                         app.push_wake.notify_one();
                     }
-                }
-                tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Focused(focused), .. } => {
-                    tray::set_foreground(focused);
                 }
                 _ => {}
             }

@@ -9,6 +9,8 @@
 use crate::api;
 use crate::db::Identity;
 use crate::state::App;
+#[cfg(mobile)]
+use crate::tray;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::Ordering;
@@ -39,6 +41,17 @@ pub fn spawn(handle: AppHandle, app: Arc<App>) {
     tauri::async_runtime::spawn(async move {
         let mut backoff = BACKOFF_MIN;
         loop {
+            // A phone keeps no socket in the background (A3): a frozen app's
+            // socket would look connected to the relay, which then sends no
+            // wake-ups. Wait until it's back in front.
+            #[cfg(mobile)]
+            if !tray::foreground() {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    _ = app.push_wake.notified() => {}
+                }
+                continue;
+            }
             let id = match app.identity() {
                 Ok(Some(id)) if id.status == "active" => id,
                 _ => {
@@ -128,6 +141,12 @@ async fn run(handle: &AppHandle, app: &App, id: &Identity) -> Result<Ended> {
                 }
                 Some(Ok(_)) => last_heard = Instant::now(),
             },
+            _ = app.push_pause.notified() => {
+                #[cfg(mobile)]
+                if !tray::foreground() {
+                    return Ok(Ended::Dropped);
+                }
+            }
             _ = ping.tick() => {
                 if last_heard.elapsed() > SILENCE_LIMIT {
                     return Ok(Ended::Dropped);

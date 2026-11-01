@@ -225,6 +225,10 @@ impl Api {
     }
 
     /// Upload an encrypted blob; returns its media id.
+    pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.json(self.auth(self.http.delete(format!("{}{path}", self.base)))).await
+    }
+
     pub async fn upload_media(&self, blob: Vec<u8>) -> Result<String> {
         let req = self
             .http

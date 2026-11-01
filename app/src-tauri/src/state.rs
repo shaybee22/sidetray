@@ -27,6 +27,8 @@ pub struct App {
     pub wake: tokio::sync::Notify,
     /// Wakes the push loop (the device just became active).
     pub push_wake: tokio::sync::Notify,
+    /// Tells the push loop the app left the foreground (a phone then closes the socket).
+    pub push_pause: tokio::sync::Notify,
     /// The /ws socket is up; the sync loop then only polls as a slow safety net.
     pub push_connected: AtomicBool,
     /// Key Master: join requests waiting, for the tray tooltip.
@@ -42,6 +44,28 @@ pub struct App {
     pub cert_problem: Mutex<Option<String>>,
     /// An invite link that opened the app, until the wizard picks it up.
     pub pending_invite: Mutex<Option<InviteMsg>>,
+}
+
+/// The one App of this process. On Android a push wake-up can start the
+/// process without the window; the window, if it opens later, then uses the
+/// same App (one database connection, one sync lock).
+static SHARED: Mutex<Option<Arc<App>>> = Mutex::new(None);
+
+/// This process's App, opened on `data_dir` if there isn't one yet.
+pub fn shared(data_dir: PathBuf) -> Result<Arc<App>> {
+    let mut g = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = g.as_ref() {
+        return Ok(a.clone());
+    }
+    let a = Arc::new(App::open(data_dir)?);
+    *g = Some(a.clone());
+    Ok(a)
+}
+
+/// This process's App, if one was opened.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn current() -> Option<Arc<App>> {
+    SHARED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[derive(Clone)]
@@ -76,6 +100,7 @@ impl App {
             rotate_lock: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
             push_wake: tokio::sync::Notify::new(),
+            push_pause: tokio::sync::Notify::new(),
             push_connected: AtomicBool::new(false),
             pending_joins: AtomicUsize::new(0),
             seen_pending: Mutex::new(HashSet::new()),
