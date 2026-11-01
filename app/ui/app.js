@@ -692,8 +692,71 @@ async function refreshPush() {
     return;
   }
   renderNotifOffer();
+  renderBatteryOffer();
   renderPushSettings();
 }
+
+/** Which of Side Tray and the push app Android holds back to save battery. */
+function batteryProblems() {
+  const b = push && push.battery;
+  if (!b || push.notifications !== "on" || push.mode === "none") return { app: false, dist: false };
+  return {
+    app: !b.app_unrestricted || b.app_restricted,
+    // The push app only matters while wake-ups come through it.
+    dist: push.mode === "instant" && b.distributor_unrestricted === false,
+  };
+}
+
+const distributorShort = (d) => (d === "io.heckel.ntfy" ? "ntfy" : "the push app");
+
+/** What to do about battery restrictions, in words ("" if nothing). */
+function batteryHow() {
+  const p = batteryProblems();
+  const names = [p.app && "Side Tray", p.dist && distributorShort(push.distributor)].filter(Boolean);
+  if (!names.length) return "";
+  const steps = [];
+  if (p.app) {
+    steps.push(push.battery.app_restricted
+      ? "Allow Side Tray opens its App info: tap App battery usage (or Battery) and choose Unrestricted (on newer phones it's under Allow background usage)."
+      : "Allow Side Tray asks Android to let it run in the background: tap Allow.");
+  }
+  if (p.dist) {
+    steps.push(`Open ${distributorShort(push.distributor)}'s settings, tap App battery usage (or Battery) and choose Unrestricted (on newer phones it's under Allow background usage), then come back.`);
+  }
+  return `Android is saving battery by holding back ${names.join(" and ")}, so notifications can arrive late or not at all. ${steps.join(" ")}`;
+}
+
+/** A card on the feed when Side Tray or the push app is battery-restricted, until fixed or put off. */
+function renderBatteryOffer() {
+  const p = batteryProblems();
+  const box = $("#battery-offer");
+  if ((!p.app && !p.dist) || push.battery_later) { box.hidden = true; return; }
+  $("#battery-text").textContent = batteryHow();
+  $("#battery-app").hidden = !p.app;
+  $("#battery-dist").hidden = !p.dist;
+  $("#battery-dist").textContent = `Open ${distributorShort(push.distributor)}'s settings`;
+  box.hidden = false;
+}
+
+async function openBattery(which) {
+  try {
+    await invoke("open_battery_settings", { which });
+  } catch (e) {
+    console.warn("open_battery_settings", e);
+  }
+  // Android's dialog or settings screen is its own window: look again afterwards.
+  for (const ms of [1500, 4000]) setTimeout(refreshPush, ms);
+}
+
+$("#battery-app").addEventListener("click", () => openBattery("app"));
+$("#battery-dist").addEventListener("click", () => openBattery("distributor"));
+$("#battery-later").addEventListener("click", async () => {
+  $("#battery-offer").hidden = true;
+  await invoke("dismiss_notice", { which: "battery" }).catch((e) => console.warn("dismiss_notice", e));
+  refreshPush();
+});
+$("#ns-battery-app").addEventListener("click", () => openBattery("app"));
+$("#ns-battery-dist").addEventListener("click", () => openBattery("distributor"));
 
 const distributorName = (d) => (d === "io.heckel.ntfy" ? "the ntfy app" : d || "a push app");
 
@@ -783,6 +846,19 @@ function renderPushSettings() {
   const how = pushHow();
   $("#ns-how").textContent = how;
   $("#ns-how").hidden = !how;
+  const b = push.battery;
+  const p = batteryProblems();
+  const state = (ok) => (ok ? "unrestricted" : "restricted to save battery");
+  $("#ns-battery").textContent = !b ? "unknown"
+    : `Side Tray ${state(b.app_unrestricted && !b.app_restricted)}`
+      + (b.distributor_unrestricted === null || b.distributor_unrestricted === undefined ? ""
+        : `, ${distributorShort(push.distributor)} ${state(b.distributor_unrestricted)}`);
+  const bhow = batteryHow();
+  $("#ns-battery-how").textContent = bhow;
+  $("#ns-battery-how").hidden = !bhow;
+  $("#ns-battery-app").hidden = !p.app;
+  $("#ns-battery-dist").hidden = !p.dist;
+  $("#ns-battery-dist").textContent = `Open ${distributorShort(push.distributor)}'s settings`;
 }
 
 $("#ns-turn-on").addEventListener("click", askForNotifications);

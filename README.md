@@ -103,8 +103,8 @@ off.
 ```
 CHANGELOG.md          what changed in each release
 .github/workflows/    release.yml: installers and the updater manifest on a v* tag
-install.sh            server installer: Docker, /opt/sidetray, HTTPS, first setup token, optional push server
-compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS); ntfy for Android push (profile "push")
+install.sh            server installer: Docker, /opt/sidetray, HTTPS, first setup token, optional own push server
+compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS); optional ntfy for Android push (profile "push")
 Caddyfile             TLS via Caddy's internal CA, for a dev checkout on a LAN IP
 server/app/main.py    the relay
 server/app/admin.py   operator commands (`sidetray-admin new-group | list-groups | prune`)
@@ -138,10 +138,10 @@ It asks:
    domain, it checks that the name resolves to this machine before going on.
 2. **Retention**: how many days the relay keeps posts and photos that not
    every device has fetched yet (default 90).
-3. **Push server** (default no): whether to run [ntfy](https://ntfy.sh) next
-   to the relay so the Android app gets notifications within seconds. See
-   *Push server for Android* below. Without it, phones check about every 15
-   minutes.
+3. **Your own push server** (default no). Android phones get notifications
+   within seconds through the public ntfy.sh with no setup (the wake-ups are
+   empty); answer yes to run your own ntfy instead. See *Notifications on
+   Android phones* below.
 
 Then it installs Docker Engine and the Compose plugin from Docker's apt
 repository (if missing), writes `/opt/sidetray` (`compose.yaml`, `Caddyfile`,
@@ -183,10 +183,11 @@ sudo ./install.sh --yes
 From a release instead: `curl -fsSL <release url>/install.sh | sudo
 SIDETRAY_SOURCE_URL=<release tarball> bash -s -- --yes`.
 
-`--yes` keeps every setting as it is (domain or IP, retention, push server). A
-server that has never been asked about the push server (installed before it
-existed) gets the question when you run the installer without `--yes`; with
-`--yes` it stays off until you add `--push`. The installer
+`--yes` keeps every setting as it is (domain or IP, retention, own push
+server). A server that has never been asked about its own push server
+(installed before the question existed) gets it when you run the installer
+without `--yes`; with `--yes` it stays off (phones use ntfy.sh) until you add
+`--push`. The installer
 copies the new `compose.yaml`, `server/` and `install.sh` into `/opt/sidetray`
 (keeping a `.bak` of anything it replaces), rebuilds the api image and
 restarts the stack. The data volumes and `.env` are kept, and the relay
@@ -204,36 +205,58 @@ switch to a checkout once (`git clone <repository> ~/sidetray`) and run the
 installer from there; it only needs `compose.yaml`, `server/` and
 `install.sh` next to each other.
 
-### Push server for Android
+### Notifications on Android phones
 
-With the push server on, `install.sh` adds an `ntfy` container (Compose
-profile `push`, set in `.env` as `COMPOSE_PROFILES=push`) and a Caddy site
-for it on port **8443** of the same domain or IP (`SIDETRAY_NTFY_PORT`). Open
-that port in any cloud firewall. ntfy is private: it refuses every topic
-except the random UnifiedPush ones (`up…`) that phones read and the relay
-writes, and it keeps nothing longer than 12 hours.
+**Nothing to set up.** Phones with the free **ntfy** app (from F-Droid or
+Google Play) get notifications within seconds through ntfy's public server,
+ntfy.sh, which is the ntfy app's default: install ntfy, open Side Tray, done.
+Without ntfy, Side Tray checks for news about every 15 minutes.
 
 When something happens (a post, a comment, a direct message, a join request
 for Key Masters) and a phone has no connection open, the relay POSTs an
 **empty** request to that phone's ntfy topic, at most once every 5 seconds
 per phone. ntfy turns that into a wake-up for the Side Tray app (which sees
-ntfy's placeholder text `triggered`), and the app fetches and decrypts the
-news over the normal API. Neither ntfy nor the phone's ntfy app learns names,
-text, the group or who posted. The relay sends to its own ntfy over Docker's
-internal network, and accepts only endpoints on that ntfy (or on hosts you
-list in `SIDETRAY_PUSH_HOSTS`, such as `ntfy.sh`; empty by default), so it
-can't be made to call other addresses.
+only ntfy's placeholder text `triggered`), and the app fetches and decrypts
+the news over the normal API. ntfy.sh learns that some random topic should
+wake up now, and your server's IP address; not names, text, the group or who
+posted. The relay only sends to `ntfy.sh` and to your own ntfy (below), so it
+can't be made to call other addresses; `SIDETRAY_PUSH_HOSTS` in `.env`
+changes the list (comma-separated host names; set it empty to allow only
+your own ntfy). ntfy.sh counts wake-ups against each phone's own allowance,
+not the server's.
 
-On each phone, in the **ntfy** app: *Settings → Default server* →
-`https://<your domain>:8443`, then open Side Tray (it asks ntfy for a new
-address and tells the relay). On a test server (an IP address) ntfy then
-says the certificate isn't trusted: subscribe once to any topic starting
-with `up` (say `upcheck`), compare the fingerprint ntfy shows with the
-"its certificate" line `install.sh` printed, tap *Trust*, and unsubscribe
-again. That certificate is made once and lasts 10 years
-(`/opt/sidetray/ntfy-tls/`); ntfy pins it exactly, and it deliberately names
-no host so Caddy keeps using its own CA on 443. A domain uses Let's Encrypt
-on 8443 too, and needs nothing in ntfy beyond the server address.
+**Your own push server (optional).** If you'd rather not use ntfy.sh at all,
+answer yes to the installer's push question (or pass `--push`). It adds an
+`ntfy` container (Compose profile `push`, set in `.env` as
+`COMPOSE_PROFILES=push`). ntfy is private: it refuses every topic except the
+random UnifiedPush ones (`up…`) that phones read and the relay writes, and it
+keeps nothing longer than 12 hours. The relay reaches it over Docker's
+internal network.
+
+- **On a domain**, ntfy shares the relay's address and Let's Encrypt
+  certificate on port 443: Caddy sends `/api/*` to the relay and everything
+  else to ntfy. No extra port, DNS record or certificate step. Each phone's
+  ntfy app then needs *Settings → Default server* → `https://<your domain>`
+  (then open Side Tray and tap *Device → Settings → Check again*). Phones
+  still on ntfy.sh keep working.
+- **On a test server** (an IP address) ntfy gets its own port, **8443**
+  (`SIDETRAY_NTFY_PORT`), with a self-signed certificate that `install.sh`
+  makes once and that lasts 10 years (`/opt/sidetray/ntfy-tls/`): the ntfy
+  app pins a server's exact certificate, and Caddy's own test certificates
+  change every 12 hours. It deliberately names no host, so Caddy keeps using
+  its own CA on 443. On each phone, set ntfy's default server to
+  `https://<ip>:8443`; ntfy then says the certificate isn't trusted:
+  subscribe once to any topic starting with `up` (say `upcheck`), compare the
+  fingerprint ntfy shows with the "its certificate" line `install.sh`
+  printed, tap *Trust*, and unsubscribe again.
+
+**Battery settings.** Android may hold back Side Tray or ntfy to save
+battery, and then notifications arrive late or not at all. Side Tray checks
+both and, if needed, shows a card on the feed ("Let notifications through")
+with buttons: one opens Android's own "let app always run in background?"
+dialog for Side Tray, the other opens ntfy's App info, where the person taps
+*App battery usage* (on newer phones then *Allow background usage*) and
+chooses *Unrestricted*. *Device → Settings* shows the same.
 
 ### More groups, and other admin commands
 
@@ -725,9 +748,17 @@ hand-made small desktop icons).
   `showNotifications`). Without a distributor, or when the relay refuses the
   endpoint (ntfy pointed at another server), a periodic job syncs about every
   15 minutes instead, and the app says once how to get instant ones;
-  *Device → Settings* always shows which it is. The app closes its push
+  *Device → Settings* always shows which it is, and *Check again* asks ntfy
+  for a fresh endpoint (after its server changed). The app closes its push
   socket whenever it leaves the screen, so the relay starts sending wake-ups
   at once.
+- **Battery restrictions.** `SideTrayAndroid.batteryState` checks whether
+  Side Tray and the push app are exempt from battery optimization
+  (`PowerManager.isIgnoringBatteryOptimizations`) and whether Side Tray is
+  set to Restricted (`ActivityManager.isBackgroundRestricted`). If not, a
+  card on the feed and *Device → Settings* explain and offer buttons:
+  Android's `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` dialog for Side Tray (or
+  its App info when it's Restricted), and ntfy's App info screen.
 - **Notification permission** (Android 13+): asked only after joining, from
   a card on the feed ("Get notified about new posts?"), never at first
   launch. Tapping a notification opens the post, the conversation, or the
@@ -746,7 +777,8 @@ wizard. A debug build's WebView can be driven over DevTools:
 `adb forward tcp:9401 localabstract:webview_devtools_remote_$(adb shell pidof org.sidetray.app)`.
 To try notifications on the emulator, install the ntfy APK from its
 GitHub releases (the `fdroid` build) and point it at the test server as in
-*Push server for Android*. `adb shell am kill org.sidetray.app` closes the
+*Notifications on Android phones* (ntfy.sh needs no setup).
+`adb shell am kill org.sidetray.app` closes the
 app the way Android does (unlike `force-stop`, which also blocks wake-ups).
 To try sharing without another app:
 `adb shell am start -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT https://example.org`.

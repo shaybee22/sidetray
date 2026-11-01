@@ -250,6 +250,31 @@ pub fn open_notification_settings() -> Result<()> {
     Ok(())
 }
 
+/// Whether Android lets an app run in the background freely ("Unrestricted"
+/// battery use) or holds it back to save battery.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Battery {
+    /// Side Tray is exempt from battery optimization (Unrestricted).
+    pub app_unrestricted: bool,
+    /// Side Tray is set to "Restricted" (background use blocked altogether).
+    pub app_restricted: bool,
+    /// The same for the push app (ntfy); None without one.
+    pub distributor_unrestricted: Option<bool>,
+}
+
+pub fn battery(distributor: Option<&str>) -> Result<Battery> {
+    let s = call_string("batteryState", &[distributor.unwrap_or("")])?.context("no answer about battery settings")?;
+    Ok(serde_json::from_str(&s)?)
+}
+
+/// Ask Android to let `package` run unrestricted: for Side Tray itself the
+/// system's one-tap dialog; for another app (ntfy) its App info screen, where
+/// the person picks Battery → Unrestricted.
+pub fn open_battery_settings(package: &str) -> Result<()> {
+    call_string("openBatterySettings", &[package])?;
+    Ok(())
+}
+
 /// The app is visible (set by Kotlin's process lifecycle observer, and by Tauri).
 pub static FOREGROUND: AtomicBool = AtomicBool::new(false);
 

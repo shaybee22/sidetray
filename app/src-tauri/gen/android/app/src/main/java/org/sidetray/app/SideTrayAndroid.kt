@@ -2,6 +2,7 @@ package org.sidetray.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -15,6 +16,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Parcelable
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -343,6 +345,61 @@ object SideTrayAndroid {
       Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + a.packageName))
     }
     a.runOnUiThread { a.startActivity(i) }
+    return null
+  }
+
+  // --- battery restrictions ------------------------------------------------------------
+
+  /**
+   * Whether Android holds back Side Tray or the push app (`distributor`, may be
+   * "") to save battery. Held-back apps get wake-ups late or not at all: the
+   * phone may freeze them, and dozing cuts their network. JSON:
+   * {app_unrestricted, app_restricted, distributor_unrestricted (or null)}.
+   */
+  @JvmStatic
+  fun batteryState(distributor: String): String {
+    val ctx = appContext ?: return "{}"
+    val pm = ctx.getSystemService(PowerManager::class.java)
+    val restricted = Build.VERSION.SDK_INT >= 28 &&
+      (ctx.getSystemService(ActivityManager::class.java)?.isBackgroundRestricted ?: false)
+    val dist: Any = if (distributor.isEmpty()) JSONObject.NULL else pm.isIgnoringBatteryOptimizations(distributor)
+    return JSONObject()
+      .put("app_unrestricted", pm.isIgnoringBatteryOptimizations(ctx.packageName))
+      .put("app_restricted", restricted)
+      .put("distributor_unrestricted", dist)
+      .toString()
+  }
+
+  /**
+   * Take the person to the right place to make `pkg` Unrestricted. For Side
+   * Tray itself that's Android's one-tap "Let app always run in background?"
+   * dialog (unless it's set to Restricted, which only its App info screen can
+   * undo). For another app (ntfy), its App info screen: Battery → Unrestricted.
+   */
+  @JvmStatic
+  fun openBatterySettings(pkg: String): String? {
+    val a = activity?.get() ?: return null
+    val uri = Uri.parse("package:$pkg")
+    val restricted = Build.VERSION.SDK_INT >= 28 &&
+      (a.getSystemService(ActivityManager::class.java)?.isBackgroundRestricted ?: false)
+    val pm = a.getSystemService(PowerManager::class.java)
+    val intents = mutableListOf<Intent>()
+    if (pkg == a.packageName && !restricted && !pm.isIgnoringBatteryOptimizations(pkg)) {
+      @Suppress("BatteryLife")
+      intents.add(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, uri))
+    }
+    intents.add(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri))
+    intents.add(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+    a.runOnUiThread {
+      for (i in intents) {
+        try {
+          a.startActivity(i)
+          return@runOnUiThread
+        } catch (e: Exception) {
+          Log.w(TAG, "no screen for ${i.action}", e)
+        }
+      }
+    }
     return null
   }
 

@@ -172,6 +172,17 @@
         <button class="ghost small" id="notif-offer-no"></button>
       </div>
     </div>
+    <div class="banner offer" id="battery-offer" hidden>
+      <div class="offer-text">
+        <strong>Let notifications through</strong>
+        <span id="battery-text"></span>
+      </div>
+      <div class="actions start">
+        <button class="small" id="battery-app">Allow Side Tray</button>
+        <button class="small" id="battery-dist"></button>
+        <button class="ghost small" id="battery-later">Not now</button>
+      </div>
+    </div>
     <form id="composer" class="card composer" novalidate>
       <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
       <div class="staged" id="cp-photos"></div>
@@ -294,9 +305,13 @@
         <p><strong>Notifications:</strong> <span id="ns-state"></span></p>
         <p><strong>Delivery:</strong> <span id="ns-mode"></span></p>
         <p class="hint" id="ns-how" hidden></p>
+        <p><strong>Battery:</strong> <span id="ns-battery"></span></p>
+        <p class="hint" id="ns-battery-how" hidden></p>
         <div class="actions start">
           <button class="ghost small" id="ns-turn-on" hidden>Turn on notifications</button>
           <button class="ghost small" id="ns-settings" hidden>Open notification settings</button>
+          <button class="ghost small" id="ns-battery-app" hidden>Allow Side Tray</button>
+          <button class="ghost small" id="ns-battery-dist" hidden></button>
           <button class="ghost small" id="ns-recheck">Check again</button>
         </div>
       </div>

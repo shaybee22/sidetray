@@ -751,13 +751,24 @@ fn push_status() -> Res<Option<()>> {
     Ok(None)
 }
 
-/// Register with the distributor again (the person installed ntfy, or changed its server).
+/// Register with the distributor again, asking it for a fresh endpoint (the
+/// person installed ntfy, or changed its server).
 #[tauri::command]
 fn push_setup(app: State<'_, Arc<App>>) {
     #[cfg(target_os = "android")]
-    mobile_push::setup(&app);
+    mobile_push::setup_with(&app, true);
     #[cfg(not(target_os = "android"))]
     let _ = app;
+}
+
+/// Battery settings for Side Tray ("app") or the push app ("distributor").
+#[tauri::command]
+fn open_battery_settings(app: State<'_, Arc<App>>, which: String) -> Res<()> {
+    #[cfg(target_os = "android")]
+    mobile_push::open_battery_settings(&app, &which).map_err(err)?;
+    #[cfg(not(target_os = "android"))]
+    let _ = (app, which);
+    Ok(())
 }
 
 /// The person chose to turn notifications on: Android's permission prompt.
@@ -782,6 +793,7 @@ fn dismiss_notice(app: State<'_, Arc<App>>, which: String) {
     match which.as_str() {
         "notifications" => mobile_push::mark(&app, mobile_push::NOTIF_ASKED),
         "push_note" => mobile_push::mark(&app, mobile_push::NOTE_SEEN),
+        "battery" => mobile_push::mark(&app, mobile_push::BATTERY_LATER),
         _ => {}
     }
     #[cfg(not(target_os = "android"))]
@@ -1050,6 +1062,7 @@ pub fn run() {
             request_notifications,
             dismiss_notice,
             open_notification_settings,
+            open_battery_settings,
             stage_shared_photo,
             end_share,
             leave_app,

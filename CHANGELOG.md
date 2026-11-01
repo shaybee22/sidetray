@@ -36,18 +36,24 @@ the app, the Rust crates and the relay share one version number.
 - **Notifications while the app is closed**: new posts, comments on your
   posts, direct messages and (for Key Masters) join requests. Tapping one
   opens that post, conversation or the Key Master tab.
-- With the **ntfy** app installed they arrive within seconds (UnifiedPush,
-  through the group's own server). Without it, Side Tray checks about every
-  15 minutes and says once how to get instant ones.
+- With the free **ntfy** app installed they arrive within seconds, with
+  nothing to set up (UnifiedPush through ntfy.sh, ntfy's default; the
+  wake-ups carry no content). Without it, Side Tray checks about every 15
+  minutes and says once how to get instant ones.
+- If Android holds back Side Tray or ntfy to save battery, a card explains it
+  and has buttons that open the right settings to make both Unrestricted.
 - Android 13 and newer: Side Tray offers to turn notifications on after you
   join, not at first launch. *Device → Settings* shows whether they're on and
   how they arrive.
 
 ### Relay (A3)
 
-- Optional push server: `install.sh` asks whether to run **ntfy** next to the
-  relay (port 8443, behind Caddy; off unless you say yes; `--push` /
-  `--no-push`). An existing server is asked on its next update.
+- Android wake-ups go through ntfy.sh by default (`SIDETRAY_PUSH_HOSTS`).
+- Optional own push server: `install.sh` asks whether to run **ntfy** next to
+  the relay (off unless you say yes; `--push` / `--no-push`). On a domain it
+  shares port 443 and the Let's Encrypt certificate; a test server uses port
+  8443 with a self-signed certificate. An existing server is asked on its
+  next update.
 - `GET/POST/DELETE /api/v1/push`: a phone registers its UnifiedPush endpoint.
   When a phone has no connection open, the relay sends it an **empty**
   wake-up; nothing about the group, the people or the content goes into it.

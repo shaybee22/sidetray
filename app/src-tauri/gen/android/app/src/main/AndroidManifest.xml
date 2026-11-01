@@ -3,6 +3,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Notifications (A3); on Android 13+ the app asks for this after joining. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- So Side Tray can ask, with Android's own dialog, to run unrestricted in the
+         background (otherwise wake-ups can arrive late or not at all). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- The camera button (A2): the WebView looks for a camera app before opening one,
          and since Android 11 an app only sees the ones it declares here. -->

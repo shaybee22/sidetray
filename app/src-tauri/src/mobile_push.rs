@@ -25,6 +25,7 @@
 //! - `push_ntfy`: the relay's own push server, for the instructions
 //! - `notif_asked`: the in-app offer to turn notifications on was answered
 //! - `push_note_seen`: the one-time note about getting instant notifications was read
+//! - `battery_later`: "Not now" on the card about battery restrictions
 
 use crate::state::{self, App};
 use crate::{android, api, db, feed, manage};
@@ -42,6 +43,8 @@ const FRESH_AT: &str = "push_fresh_at";
 const NTFY: &str = "push_ntfy";
 pub const NOTIF_ASKED: &str = "notif_asked";
 pub const NOTE_SEEN: &str = "push_note_seen";
+/// "Not now" on the battery card (Device → Settings still shows it).
+pub const BATTERY_LATER: &str = "battery_later";
 
 /// An "unregistered" that follows our own request for a fresh endpoint this soon is expected.
 const FRESH_GRACE_SECS: i64 = 60;
@@ -77,13 +80,19 @@ fn update_periodic(app: &App) {
 /// active: (re-)register with the distributor and check the relay still has
 /// our endpoint. Quick; the network part runs in the background.
 pub fn setup(app: &Arc<App>) {
+    setup_with(app, false)
+}
+
+/// `fresh`: ask the distributor for a new endpoint even if it gave one before
+/// (*Check again*: the person may have changed ntfy's server).
+pub fn setup_with(app: &Arc<App>, fresh: bool) {
     if !active(app) {
         update_periodic(app);
         return;
     }
     // The relay refused the endpoint (say ntfy's default server is another
     // one): ask the distributor for a new one, in case its settings changed.
-    let fresh = get(app, REASON).as_deref() == Some("server_refused");
+    let fresh = fresh || get(app, REASON).as_deref() == Some("server_refused");
     if fresh {
         set(app, FRESH_AT, Some(&crate::now().to_string()));
     }
@@ -284,6 +293,10 @@ pub struct PushView {
     pub ntfy: Option<String>,
     /// The one-time note about instant notifications was read.
     pub note_seen: bool,
+    /// Battery restrictions on Side Tray and the push app.
+    pub battery: Option<android::Battery>,
+    /// "Not now" on the battery card.
+    pub battery_later: bool,
 }
 
 pub fn view(app: &App) -> Result<PushView> {
@@ -314,7 +327,20 @@ pub fn view(app: &App) -> Result<PushView> {
         }),
         ntfy: get(app, NTFY),
         note_seen: get(app, NOTE_SEEN).is_some(),
+        battery: android::battery(get(app, DISTRIBUTOR).as_deref())
+            .map_err(|e| eprintln!("push: battery settings: {e:#}"))
+            .ok(),
+        battery_later: get(app, BATTERY_LATER).is_some(),
     })
+}
+
+/// Open the battery setting for Side Tray ("app") or the push app ("distributor").
+pub fn open_battery_settings(app: &App, which: &str) -> Result<()> {
+    let package = match which {
+        "distributor" => get(app, DISTRIBUTOR).context("there's no push app")?,
+        _ => "org.sidetray.app".to_string(),
+    };
+    android::open_battery_settings(&package)
 }
 
 pub fn mark(app: &App, key: &str) {
