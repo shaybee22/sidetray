@@ -13,8 +13,9 @@
 #    the prune job (acked by every active device, and past retention), and
 #    Phase 6b: a second group from `sidetray-admin new-group`, the two groups
 #    unable to see each other, and the rate limits.
-#    Android A3 (when .env has SIDETRAY_PUSH=yes): push endpoints, and empty
-#    wake-ups delivered through the live ntfy to devices without a socket.
+#    Android A3: push endpoints (ntfy.sh allowed by default), and, when .env
+#    has SIDETRAY_PUSH=yes, empty wake-ups delivered through the server's own
+#    ntfy to devices without a socket.
 #    Keys, signatures and ciphertext are random bytes: the relay never checks
 #    them (clients do), only that certificates describe the right device.
 set -euo pipefail
@@ -405,18 +406,27 @@ expect 404 GET "/media/$KMID" "$BO_TOK" >/dev/null && pass "Bo can't download Sm
 expect 422 POST /events "$BO_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\",\"media_ids\":[\"$KMID\"]}" >/dev/null \
   && pass "Bo can't attach Smoke Family's media to a post" || fail "cross-group media_ids"
 
+echo "== push endpoints (Android A3)"
+P=$(expect 200 GET /push "$YAN_TOK")
+[ "$(echo "$P" | j '["offered"]')" = True ] && [ "$(echo "$P" | j '["endpoint"]')" = None ] \
+  && pass "GET /push: wake-ups offered (hosts $(echo "$P" | j '["hosts"]'), own ntfy $(echo "$P" | j '["ntfy"]')); nothing registered yet" || fail "GET /push: $P"
+if [ "${SIDETRAY_PUSH_HOSTS-ntfy.sh}" = ntfy.sh ]; then
+  expect 200 POST /push "$YAN_TOK" '{"endpoint":"https://ntfy.sh/upSmokeZeroConfig?up=1"}' >/dev/null \
+    && pass "an endpoint on ntfy.sh (the ntfy app's default) is accepted with no setup" || fail "ntfy.sh endpoint"
+fi
+expect 400 POST /push "$YAN_TOK" '{"endpoint":"https://push.example.invalid/upSomething?up=1"}' >/dev/null \
+  && pass "an endpoint on any other push server -> 400" || fail "foreign endpoint -> 400"
+expect 400 POST /push "$YAN_TOK" '{"endpoint":"https://ntfy.sh.example.invalid/upX?up=1"}' >/dev/null \
+  && pass "... including a look-alike host -> 400" || fail "look-alike host -> 400"
+expect 401 POST /push "$ZED_TOK" '{"endpoint":"https://ntfy.sh/upSmokeZed?up=1"}' >/dev/null && pass "a removed device can't register" || fail "removed device registers"
+expect 200 DELETE /push "$YAN_TOK" >/dev/null
+
 if [ "$PUSH_ON" = 1 ]; then
-  echo "== push wake-ups (Android A3)"
+  echo "== wake-ups through the server's own ntfy"
   TOPIC="upSmoke$(head -c 9 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
   EP="$SIDETRAY_NTFY_URL/$TOPIC?up=1"
-  P=$(expect 200 GET /push "$YAN_TOK")
-  [ "$(echo "$P" | j '["offered"]')" = True ] && [ "$(echo "$P" | j '["ntfy"]')" = "$SIDETRAY_NTFY_URL" ] && [ "$(echo "$P" | j '["endpoint"]')" = None ] \
-    && pass "GET /push: wake-ups offered through $SIDETRAY_NTFY_URL; nothing registered yet" || fail "GET /push: $P"
-  expect 400 POST /push "$YAN_TOK" '{"endpoint":"https://ntfy.sh/upSomething?up=1"}' >/dev/null \
-    && pass "an endpoint on another push server -> 400" || fail "foreign endpoint -> 400"
   expect 400 POST /push "$YAN_TOK" "{\"endpoint\":\"$SIDETRAY_NTFY_URL/v1/account\"}" >/dev/null \
     && pass "a non-topic path on our ntfy -> 400" || fail "non-topic path -> 400"
-  expect 401 POST /push "$ZED_TOK" "{\"endpoint\":\"$EP\"}" >/dev/null && pass "a removed device can't register" || fail "pending device registers"
   expect 200 POST /push "$YAN_TOK" "{\"endpoint\":\"$EP\"}" >/dev/null && pass "Yan registers a UnifiedPush endpoint on our ntfy" || fail "register endpoint"
   since=$(date +%s)
   expect 201 POST /events "$KM_TOK" "{\"kind\":\"post\",\"key_version\":3,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" >/dev/null

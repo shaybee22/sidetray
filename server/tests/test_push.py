@@ -158,6 +158,18 @@ class PushTest(unittest.TestCase):
         self.assertEqual(self.c.delete("/api/v1/push", headers=self.bo["auth"]).json(), {"deleted": False})
         self.assertEqual(self.c.post("/api/v1/push", json={"endpoint": f"{NTFY}/upX"}).status_code, 401)
 
+    def test_ntfy_sh_is_allowed_by_default(self):
+        # No SIDETRAY_PUSH_HOSTS at all: phones can use the ntfy app's default server
+        # with no setup. Set but empty: only the server's own ntfy.
+        os.environ.pop("SIDETRAY_PUSH_HOSTS")
+        m = importlib.reload(self.m)
+        self.assertEqual(m.PUSH_HOSTS, {"ntfy.sh"})
+        self.assertEqual(m.push_target("https://ntfy.sh/upAbc123?up=1"), "https://ntfy.sh/upAbc123?up=1")
+        os.environ["SIDETRAY_PUSH_HOSTS"] = ""
+        m = importlib.reload(self.m)
+        self.assertEqual(m.PUSH_HOSTS, set())
+        self.assertIsNone(m.push_target("https://ntfy.sh/upAbc123?up=1"))
+
     def test_not_offered_without_ntfy(self):
         os.environ.pop("SIDETRAY_NTFY_URL")
         os.environ.pop("SIDETRAY_PUSH_HOSTS")

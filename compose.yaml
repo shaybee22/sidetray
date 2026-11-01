@@ -22,8 +22,9 @@ services:
       # and how the relay reaches it inside Docker. Empty = no wake-ups.
       SIDETRAY_NTFY_URL: ${SIDETRAY_NTFY_URL:-}
       SIDETRAY_NTFY_INTERNAL: ${SIDETRAY_NTFY_INTERNAL:-}
-      # Other push servers phones may use (host names, comma-separated), e.g. ntfy.sh.
-      SIDETRAY_PUSH_HOSTS: ${SIDETRAY_PUSH_HOSTS:-}
+      # Public push servers phones may use (host names, comma-separated). Unset means
+      # ntfy.sh, the ntfy app's default; set it empty to allow only the server's own ntfy.
+      SIDETRAY_PUSH_HOSTS: ${SIDETRAY_PUSH_HOSTS-ntfy.sh}
     volumes:
       - api_data:/data
     mem_limit: 256m
@@ -46,7 +47,7 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      # ntfy, when install.sh turned push on (nothing listens there otherwise).
+      # A test server's own ntfy, if install.sh turned it on (nothing listens there otherwise).
       - "${SIDETRAY_NTFY_PORT:-8443}:${SIDETRAY_NTFY_PORT:-8443}"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
@@ -56,11 +57,12 @@ services:
       - caddy_config:/config
     mem_limit: 128m
 
-  # Optional push server for the Android app (UnifiedPush distributor
-  # backend). Started only with the "push" profile: install.sh sets
-  # COMPOSE_PROFILES=push in .env when the operator turns push on. Caddy
-  # serves it on its own port, SIDETRAY_NTFY_PORT. It only ever carries empty
-  # wake-ups: phones then sync over the relay's API.
+  # Optional self-hosted push server for the Android app (phones use ntfy.sh
+  # otherwise). Started only with the "push" profile: install.sh sets
+  # COMPOSE_PROFILES=push in .env when the operator turns it on. Caddy serves it
+  # on 443 next to the relay in production, or on SIDETRAY_NTFY_PORT (8443) on a
+  # test server. It only ever carries empty wake-ups: phones then sync over the
+  # relay's API.
   ntfy:
     image: binwiederhier/ntfy:v2.28.0
     profiles: ["push"]

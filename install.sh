@@ -12,9 +12,10 @@
 # waits for it to answer over HTTPS and prints a setup token for the first
 # group.
 #
-# It can also run a push server (ntfy) next to the relay, so the Android app
-# gets instant notifications: asked during install (off unless you say yes),
-# and asked again on a re-run of a server that hasn't decided yet.
+# Android phones get instant notifications through the public ntfy.sh by
+# default (the wake-ups carry nothing). It can also run your own push server
+# (ntfy) next to the relay instead: asked during install (off unless you say
+# yes), and asked again on a re-run of a server that hasn't decided yet.
 #
 # Safe to re-run: it updates the code and restarts the stack, keeps the data
 # volumes and .env (only the settings you change are rewritten), keeps a .bak
@@ -25,7 +26,7 @@
 #   --domain NAME --email ADDRESS   production mode
 #   --ip ADDRESS                    test mode
 #   --retention DAYS                how long the relay keeps undelivered posts (default 90)
-#   --push / --no-push              run the push server for Android notifications, or not
+#   --push / --no-push              run your own push server for Android (ntfy), or not
 #   --new-group                     also issue a fresh setup token for another group
 #   --yes                           don't ask; keep existing settings, take defaults
 set -euo pipefail
@@ -152,7 +153,7 @@ if [ -n "$OLD_HOST" ] && [ -z "$MODE" ]; then
   say "  address:   https://$OLD_HOST ($OLD_MODE mode)"
   [ "$OLD_MODE" = production ] && say "  email:     ${OLD_EMAIL:-none}"
   say "  retention: ${OLD_RETENTION:-90} days"
-  say "  push:      ${OLD_PUSH:-not set up} (Android notifications through ntfy)"
+  say "  own push server: ${OLD_PUSH:-not set up} (otherwise Android phones use ntfy.sh)"
   if yes_no "Keep these settings?" y; then KEEP=1; fi
 fi
 
@@ -204,11 +205,12 @@ if [ -z "$PUSH" ]; then
     PUSH=$OLD_PUSH
   elif [ "$TTY" = 1 ]; then
     say ""
-    say "Side Tray's Android app can get instant notifications through a small push"
-    say "server (ntfy) running next to the relay, on port $NTFY_PORT. It only carries empty"
-    say "wake-ups; phones then fetch the encrypted posts themselves. Without it, phones"
-    say "check for new posts about every 15 minutes."
-    if yes_no "Run the push server?" n; then PUSH=yes; else PUSH=no; fi
+    say "Android phones get instant notifications through the public ntfy.sh service,"
+    say "with nothing to set up: the relay only sends it empty wake-ups, and phones then"
+    say "fetch the encrypted posts themselves. You can run your own push server (ntfy)"
+    say "here instead; then everyone with Android has to set it as the ntfy app's default"
+    say "server. Most groups don't need this."
+    if yes_no "Run your own push server?" n; then PUSH=yes; else PUSH=no; fi
   else
     PUSH=no
   fi
@@ -338,27 +340,35 @@ caddy_site() {
 		reverse_proxy api:8000
 	}
 
+EOF
+  if [ "$MODE" = production ] && [ "$PUSH" = yes ]; then
+    # Your own push server, on this same address and certificate: ntfy's
+    # topics and API are everything that isn't the relay's.
+    cat <<'EOF'
+	handle {
+		reverse_proxy ntfy:80
+	}
+}
+EOF
+  else
+    cat <<'EOF'
 	handle {
 		respond "Side Tray relay" 200
 	}
 }
 EOF
-}
-# The push server's site, on its own port of the same address. In test mode it
-# has its own long-lived self-signed certificate: the ntfy app pins the exact
-# certificate it was shown, and Caddy's own test certificates change every
-# few hours.
-ntfy_site() {
-  [ "$PUSH" = yes ] || return 0
-  printf '\n# Push server for the Android app (ntfy), when install.sh was told to run it.\n'
-  if [ "$MODE" = test ]; then
-    # By port only: Caddy won't take two certificate setups for one address
-    # (its own CA on 443, this file here).
-    printf ':{$SIDETRAY_NTFY_PORT} {\n'
-    printf '\ttls /etc/caddy/ntfy-tls/cert.pem /etc/caddy/ntfy-tls/key.pem\n'
-  else
-    printf '{$SIDETRAY_HOST}:{$SIDETRAY_NTFY_PORT} {\n'
   fi
+}
+# A test server's own push server: its own port, with its own long-lived
+# self-signed certificate (the ntfy app pins the exact certificate it was
+# shown, and Caddy's own test certificates change every few hours). Addressed
+# by port only: Caddy won't take two certificate setups for one address. In
+# production it shares 443 instead (caddy_site).
+ntfy_site() {
+  [ "$PUSH" = yes ] && [ "$MODE" = test ] || return 0
+  printf '\n# Push server for the Android app (ntfy), when install.sh was told to run it.\n'
+  printf ':{$SIDETRAY_NTFY_PORT} {\n'
+  printf '\ttls /etc/caddy/ntfy-tls/cert.pem /etc/caddy/ntfy-tls/key.pem\n'
   printf '\treverse_proxy ntfy:80\n}\n'
 }
 caddyfile_before=""
@@ -418,12 +428,13 @@ fi
 
 # Push settings in .env: the compose profile that starts ntfy, and where the
 # relay sends wake-ups.
+if [ "$MODE" = production ]; then NTFY_URL="https://$HOST"; else NTFY_URL="https://$HOST:$NTFY_PORT"; fi
 push_env() {
   env_set SIDETRAY_PUSH "$PUSH"
   if [ "$PUSH" = yes ]; then
     env_set COMPOSE_PROFILES push
     env_set SIDETRAY_NTFY_PORT "$NTFY_PORT"
-    env_set SIDETRAY_NTFY_URL "https://$HOST:$NTFY_PORT"
+    env_set SIDETRAY_NTFY_URL "$NTFY_URL"
     env_set SIDETRAY_NTFY_INTERNAL "http://ntfy"
   else
     env_set COMPOSE_PROFILES ""
@@ -487,7 +498,7 @@ chmod 755 "$ADMIN_BIN"
 
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
   ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null && say "  ufw: allowed ports 80 and 443"
-  if [ "$PUSH" = yes ]; then
+  if [ "$PUSH" = yes ] && [ "$MODE" = test ]; then
     ufw allow "$NTFY_PORT/tcp" >/dev/null && say "  ufw: allowed port $NTFY_PORT (push server)"
   fi
 fi
@@ -536,7 +547,7 @@ fi
 say "The relay is answering over HTTPS."
 
 if [ "$PUSH" = yes ]; then
-  step "Waiting for the push server at https://$HOST:$NTFY_PORT"
+  step "Waiting for the push server at $NTFY_URL"
   pok=0
   for _ in $(seq 30); do
     if [ "$MODE" = test ]; then
@@ -545,7 +556,7 @@ if [ "$PUSH" = yes ]; then
       [ "$served" = "$(openssl x509 -noout -fingerprint -sha256 -in "$DIR/ntfy-tls/cert.pem")" ] \
         && curl -fsSk -m 5 "https://$HOST:$NTFY_PORT/v1/health" >/dev/null 2>&1 && { pok=1; break; }
     else
-      curl -fsS -m 5 "https://$HOST:$NTFY_PORT/v1/health" >/dev/null 2>&1 && { pok=1; break; }
+      curl -fsS -m 5 "$NTFY_URL/v1/health" >/dev/null 2>&1 && { pok=1; break; }
     fi
     sleep 2
   done
@@ -553,7 +564,11 @@ if [ "$PUSH" = yes ]; then
     say "The push server is answering."
   else
     compose logs --tail 20 ntfy || true
-    warn "the push server didn't answer on https://$HOST:$NTFY_PORT within a minute (logs above). Phones fall back to checking every 15 minutes. If a firewall in front of this server blocks port $NTFY_PORT, open it."
+    if [ "$MODE" = test ]; then
+      warn "the push server didn't answer on $NTFY_URL within a minute (logs above). Phones fall back to checking every 15 minutes. If a firewall in front of this server blocks port $NTFY_PORT, open it."
+    else
+      warn "the push server didn't answer on $NTFY_URL within a minute (logs above). Phones fall back to checking every 15 minutes."
+    fi
   fi
 fi
 
@@ -582,13 +597,13 @@ else
 fi
 say "Retention:       $RETENTION days"
 if [ "$PUSH" = yes ]; then
-  say "Push server:     https://$HOST:$NTFY_PORT (ntfy; Android phones set it as ntfy's default server)"
+  say "Push server:     $NTFY_URL (your own ntfy; Android phones set it as the ntfy app's default server)"
   if [ "$MODE" = test ] && command -v openssl >/dev/null; then
     say "                 its certificate: $(openssl x509 -noout -fingerprint -sha256 -in "$DIR/ntfy-tls/cert.pem" | sed 's/^.*Fingerprint=/SHA-256 /')"
     say "                 The ntfy app shows this when it first connects; it must match."
   fi
 else
-  say "Push server:     off (Android phones check every 15 minutes; re-run with --push to turn it on)"
+  say "Push server:     ntfy.sh (Android phones need no setup; re-run with --push to run your own)"
 fi
 say "Settings:        $DIR/.env, $DIR/Caddyfile; data in Docker volumes sidetray_api_data and sidetray_caddy_data"
 say "Admin:           sudo sidetray-admin new-group | list-groups | prune"

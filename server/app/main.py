@@ -91,14 +91,17 @@ MEDIA_BYTES_PER_HOUR = env_int("SIDETRAY_MEDIA_MB_PER_HOUR", 50) * 1024 * 1024
 JOINS_PER_HOUR = env_int("SIDETRAY_JOINS_PER_HOUR", 10)
 LOOKUPS_PER_HOUR = env_int("SIDETRAY_LOOKUPS_PER_HOUR", 60)
 
-# UnifiedPush wake-ups (Android A3). SIDETRAY_NTFY_URL is the public address of
-# the ntfy server install.sh runs next to the relay (e.g. https://tray.example.org:8443);
-# SIDETRAY_NTFY_INTERNAL is how the relay reaches the same server inside Docker
-# (http://ntfy), so a wake-up never leaves the machine. SIDETRAY_PUSH_HOSTS lists
-# other push servers' host names the operator allows (e.g. ntfy.sh); empty by default.
+# UnifiedPush wake-ups (Android A3). SIDETRAY_PUSH_HOSTS lists the public push
+# servers phones may use, by host name; by default ntfy.sh, the ntfy app's own
+# default, so phones need no setup (a wake-up is an empty request: ntfy.sh
+# learns only that some endpoint should wake up now). Set it empty to allow
+# only this server's own ntfy. SIDETRAY_NTFY_URL is the public address of that
+# optional ntfy (install.sh: https://<domain> in production, where Caddy routes
+# everything but the relay's paths to it; https://<ip>:8443 on a test server);
+# SIDETRAY_NTFY_INTERNAL is how the relay reaches it inside Docker (http://ntfy).
 NTFY_URL = os.environ.get("SIDETRAY_NTFY_URL", "").strip().rstrip("/")
 NTFY_INTERNAL = os.environ.get("SIDETRAY_NTFY_INTERNAL", "").strip().rstrip("/")
-PUSH_HOSTS = {h.strip().lower() for h in os.environ.get("SIDETRAY_PUSH_HOSTS", "").split(",") if h.strip()}
+PUSH_HOSTS = {h.strip().lower() for h in os.environ.get("SIDETRAY_PUSH_HOSTS", "ntfy.sh").split(",") if h.strip()}
 # At most one wake-up per device this often; one that comes sooner waits, so
 # the last change is never lost.
 WAKE_EVERY_SECONDS = float(os.environ.get("SIDETRAY_WAKE_EVERY_SECONDS") or 5)
@@ -625,6 +628,10 @@ def send_wake(device_id: str, endpoint: str) -> bool:
             with db() as conn:
                 conn.execute("DELETE FROM push_endpoints WHERE device_id = ? AND endpoint = ?", (device_id, endpoint))
             print(f"push: endpoint of device {device_id} is gone ({e.code}); deleted", flush=True)
+        elif e.code == 507:
+            # ntfy.sh: nobody is subscribed to that topic right now (the phone's
+            # ntfy app is offline or was reset). Keep the endpoint; it may come back.
+            print(f"push: no subscriber for device {device_id}'s endpoint right now (507)", flush=True)
         else:
             print(f"push: wake-up for device {device_id} failed: HTTP {e.code}", flush=True)
     except (OSError, ValueError) as e:
