@@ -351,9 +351,13 @@ EOF
 ntfy_site() {
   [ "$PUSH" = yes ] || return 0
   printf '\n# Push server for the Android app (ntfy), when install.sh was told to run it.\n'
-  printf '{$SIDETRAY_HOST}:{$SIDETRAY_NTFY_PORT} {\n'
   if [ "$MODE" = test ]; then
+    # By port only: Caddy won't take two certificate setups for one address
+    # (its own CA on 443, this file here).
+    printf ':{$SIDETRAY_NTFY_PORT} {\n'
     printf '\ttls /etc/caddy/ntfy-tls/cert.pem /etc/caddy/ntfy-tls/key.pem\n'
+  else
+    printf '{$SIDETRAY_HOST}:{$SIDETRAY_NTFY_PORT} {\n'
   fi
   printf '\treverse_proxy ntfy:80\n}\n'
 }
