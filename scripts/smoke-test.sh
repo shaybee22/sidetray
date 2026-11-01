@@ -13,6 +13,8 @@
 #    the prune job (acked by every active device, and past retention), and
 #    Phase 6b: a second group from `sidetray-admin new-group`, the two groups
 #    unable to see each other, and the rate limits.
+#    Android A3 (when .env has SIDETRAY_PUSH=yes): push endpoints, and empty
+#    wake-ups delivered through the live ntfy to devices without a socket.
 #    Keys, signatures and ciphertext are random bytes: the relay never checks
 #    them (clients do), only that certificates describe the right device.
 set -euo pipefail
@@ -63,10 +65,34 @@ probe() { python3 scripts/ws_probe.py "$@"; }
 [ "$(probe "wss://$SIDETRAY_HOST/api/v1/ws" --cacert "$CACERT" --token=bogus-token || true)" = "rejected 403" ]   && pass "/ws through Caddy with an unknown token -> 403" || fail "/ws through Caddy with an unknown token -> 403"
 unset CACERT
 
+PUSH_ON=0
+if [ "${SIDETRAY_PUSH:-no}" = yes ] && [ -n "${SIDETRAY_NTFY_URL:-}" ]; then
+  PUSH_ON=1
+  echo "== live push server ($SIDETRAY_NTFY_URL)"
+  NTFY_CURL=(-sS -m 10)
+  if [ "${SIDETRAY_MODE:-}" = test ]; then
+    docker compose exec -T caddy cat /etc/caddy/ntfy-tls/cert.pem > "$TMP/ntfy.crt"
+    NTFY_CURL+=(--cacert "$TMP/ntfy.crt")
+    hp=${SIDETRAY_NTFY_URL#https://}
+    served=$(echo | openssl s_client -connect "$hp" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null)
+    [ -n "$served" ] && [ "$served" = "$(openssl x509 -noout -fingerprint -sha256 -in "$TMP/ntfy.crt")" ] \
+      && pass "the push port serves its own long-lived certificate (the one the ntfy app pins; also with no SNI)" \
+      || fail "the push port's certificate: '$served'"
+  fi
+  [ "$(curl "${NTFY_CURL[@]}" "$SIDETRAY_NTFY_URL/v1/health" | j '["healthy"]')" = True ] \
+    && pass "ntfy answers over TLS through Caddy" || fail "ntfy health"
+  code=$(curl "${NTFY_CURL[@]}" -o /dev/null -w '%{http_code}' -d hello "$SIDETRAY_NTFY_URL/smoke-$$")
+  [ "$code" = 403 ] && pass "ntfy refuses ordinary topics (private server) -> 403" || fail "publishing to an ordinary topic -> $code"
+  code=$(curl "${NTFY_CURL[@]}" -o /dev/null -w '%{http_code}' "$SIDETRAY_NTFY_URL/smoke-$$/json?poll=1")
+  [ "$code" = 403 ] && pass "... and reading them -> 403" || fail "reading an ordinary topic -> $code"
+  code=$(curl "${NTFY_CURL[@]}" -o /dev/null -w '%{http_code}' -X POST "$SIDETRAY_NTFY_URL/upSmokeLive$$?up=1")
+  [ "$code" = 200 ] && pass "UnifiedPush topics (up*) are open to the phones and the relay" || fail "publishing to an up* topic -> $code"
+fi
+
 echo "== full API on a throwaway container"
 docker compose run -d --rm --no-deps --name "$SMOKE" -p 127.0.0.1::8000 \
   -e SIDETRAY_DATA=/tmp/smoke -e SIDETRAY_SETUP_TOKEN=smoke-setup -e SIDETRAY_WS_IDLE_SECONDS=6 -e SIDETRAY_PRUNE_EVERY_SECONDS=2 \
-  -e SIDETRAY_JOINS_PER_HOUR=40 api >/dev/null
+  -e SIDETRAY_JOINS_PER_HOUR=40 -e SIDETRAY_WAKE_EVERY_SECONDS=1 api >/dev/null
 PORT=$(docker port "$SMOKE" 8000/tcp | head -1 | sed 's/.*://')
 B="http://127.0.0.1:$PORT/api/v1"
 for _ in $(seq 50); do curl -sf "$B/health" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -378,6 +404,49 @@ KMID=$(curl -sS --fail-with-body -H "Authorization: Bearer $KM_TOK" --data-binar
 expect 404 GET "/media/$KMID" "$BO_TOK" >/dev/null && pass "Bo can't download Smoke Family's media" || fail "cross-group media"
 expect 422 POST /events "$BO_TOK" "{\"kind\":\"post\",\"key_version\":1,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\",\"media_ids\":[\"$KMID\"]}" >/dev/null \
   && pass "Bo can't attach Smoke Family's media to a post" || fail "cross-group media_ids"
+
+if [ "$PUSH_ON" = 1 ]; then
+  echo "== push wake-ups (Android A3)"
+  TOPIC="upSmoke$(head -c 9 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+  EP="$SIDETRAY_NTFY_URL/$TOPIC?up=1"
+  P=$(expect 200 GET /push "$YAN_TOK")
+  [ "$(echo "$P" | j '["offered"]')" = True ] && [ "$(echo "$P" | j '["ntfy"]')" = "$SIDETRAY_NTFY_URL" ] && [ "$(echo "$P" | j '["endpoint"]')" = None ] \
+    && pass "GET /push: wake-ups offered through $SIDETRAY_NTFY_URL; nothing registered yet" || fail "GET /push: $P"
+  expect 400 POST /push "$YAN_TOK" '{"endpoint":"https://ntfy.sh/upSomething?up=1"}' >/dev/null \
+    && pass "an endpoint on another push server -> 400" || fail "foreign endpoint -> 400"
+  expect 400 POST /push "$YAN_TOK" "{\"endpoint\":\"$SIDETRAY_NTFY_URL/v1/account\"}" >/dev/null \
+    && pass "a non-topic path on our ntfy -> 400" || fail "non-topic path -> 400"
+  expect 401 POST /push "$ZED_TOK" "{\"endpoint\":\"$EP\"}" >/dev/null && pass "a removed device can't register" || fail "pending device registers"
+  expect 200 POST /push "$YAN_TOK" "{\"endpoint\":\"$EP\"}" >/dev/null && pass "Yan registers a UnifiedPush endpoint on our ntfy" || fail "register endpoint"
+  since=$(date +%s)
+  expect 201 POST /events "$KM_TOK" "{\"kind\":\"post\",\"key_version\":3,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" >/dev/null
+  got=""
+  for _ in $(seq 25); do
+    got=$(curl "${NTFY_CURL[@]}" "$SIDETRAY_NTFY_URL/$TOPIC/json?poll=1&since=$since" | grep '"event":"message"' || true)
+    [ -n "$got" ] && break; sleep 0.2
+  done
+  [ "$(printf '%s\n' "$got" | grep -c .)" = 1 ] && pass "a post wakes Yan's phone: exactly one message reached ntfy within seconds" || fail "wake-up through ntfy: '$got'"
+  echo "      what ntfy received: $got"
+  printf '%s' "$got" | python3 -c "
+import json, sys
+m = json.loads(sys.stdin.read())
+extra = set(m) - {'id', 'time', 'expires', 'event', 'topic', 'message', 'encoding', 'priority'}
+assert m['message'] in ('', 'triggered'), m['message']   # ntfy's own placeholder for an empty body
+assert not extra, extra
+assert m.get('priority', 3) == 3
+" && pass "the wake-up is empty: no text, title, tags or names (ntfy shows its placeholder for an empty body)" || fail "wake-up content: $got"
+  # Yan online: /ws tells it, and no wake-up goes out.
+  probe "$W" --token="$YAN_TOK" --count 1 --timeout 5 --ready "$TMP/yan.ready" > "$TMP/yan.ws" & YAN_WS=$!
+  for _ in $(seq 50); do [ -e "$TMP/yan.ready" ] && break; sleep 0.1; done
+  sleep 1.2  # past the 1 s wake-up interval of this container
+  since=$(date +%s)
+  expect 201 POST /events "$KM_TOK" "{\"kind\":\"post\",\"key_version\":3,\"ciphertext\":\"$CT\",\"signature\":\"$SIG\"}" >/dev/null
+  wait "$YAN_WS" || true
+  sleep 1.5
+  grep -q '"new_event"' "$TMP/yan.ws" && [ -z "$(curl "${NTFY_CURL[@]}" "$SIDETRAY_NTFY_URL/$TOPIC/json?poll=1&since=$since" | grep '"event":"message"' || true)" ] \
+    && pass "with a socket open, Yan gets new_event over /ws and no wake-up" || fail "online device woken: $(cat "$TMP/yan.ws")"
+  [ "$(expect 200 DELETE /push "$YAN_TOK" | j '["deleted"]')" = True ] && pass "DELETE /push forgets the endpoint" || fail "DELETE /push"
+fi
 
 echo "== rate limits"
 # Bo has used 2 of 30 this minute: one post and one refused (attempts count).

@@ -92,7 +92,7 @@ mod tests {
         let l = link("https://tray.example.org", "Smith Family").unwrap();
         assert_eq!(l, "sidetray://join?server=https%3A%2F%2Ftray.example.org&group=Smith%20Family");
         assert_eq!(parse(&l).unwrap(), Invite { server: "https://tray.example.org".into(), group: "Smith Family".into() });
-        let odd = link("https://10.1.1.191", "Café & Co? 100%").unwrap();
+        let odd = link("https://10.1.1.188", "Café & Co? 100%").unwrap();
         assert_eq!(parse(&odd).unwrap().group, "Café & Co? 100%");
     }
 

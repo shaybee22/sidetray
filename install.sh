@@ -12,6 +12,10 @@
 # waits for it to answer over HTTPS and prints a setup token for the first
 # group.
 #
+# It can also run a push server (ntfy) next to the relay, so the Android app
+# gets instant notifications: asked during install (off unless you say yes),
+# and asked again on a re-run of a server that hasn't decided yet.
+#
 # Safe to re-run: it updates the code and restarts the stack, keeps the data
 # volumes and .env (only the settings you change are rewritten), keeps a .bak
 # of any file it replaces, and issues a new setup token only when the server
@@ -21,6 +25,7 @@
 #   --domain NAME --email ADDRESS   production mode
 #   --ip ADDRESS                    test mode
 #   --retention DAYS                how long the relay keeps undelivered posts (default 90)
+#   --push / --no-push              run the push server for Android notifications, or not
 #   --new-group                     also issue a fresh setup token for another group
 #   --yes                           don't ask; keep existing settings, take defaults
 set -euo pipefail
@@ -35,7 +40,7 @@ die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
-DOMAIN="" EMAIL="" IP="" RETENTION="" NEW_GROUP=0 YES=0 MODE=""
+DOMAIN="" EMAIL="" IP="" RETENTION="" NEW_GROUP=0 YES=0 MODE="" PUSH=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN=${2:?--domain needs a name}; MODE=production; shift 2 ;;
@@ -43,6 +48,8 @@ while [ $# -gt 0 ]; do
     --ip) IP=${2:?--ip needs an address}; MODE=test; shift 2 ;;
     --retention) RETENTION=${2:?--retention needs a number of days}; shift 2 ;;
     --new-group) NEW_GROUP=1; shift ;;
+    --push) PUSH=yes; shift ;;
+    --no-push) PUSH=no; shift ;;
     --yes|-y) YES=1; shift ;;
     -h|--help) usage 0 ;;
     *) printf 'Unknown option: %s\n\n' "$1" >&2; usage 2 ;;
@@ -131,6 +138,8 @@ OLD_HOST=$(env_get SIDETRAY_HOST)
 OLD_MODE=$(env_get SIDETRAY_MODE)
 OLD_EMAIL=$(env_get SIDETRAY_ACME_EMAIL)
 OLD_RETENTION=$(env_get SIDETRAY_RETENTION_DAYS)
+OLD_PUSH=$(env_get SIDETRAY_PUSH)
+NTFY_PORT=$(env_get SIDETRAY_NTFY_PORT); NTFY_PORT=${NTFY_PORT:-8443}
 if [ -n "$OLD_HOST" ] && [ -z "$OLD_MODE" ]; then
   if valid_ipv4 "$OLD_HOST"; then OLD_MODE=test; else OLD_MODE=production; fi
 fi
@@ -143,6 +152,7 @@ if [ -n "$OLD_HOST" ] && [ -z "$MODE" ]; then
   say "  address:   https://$OLD_HOST ($OLD_MODE mode)"
   [ "$OLD_MODE" = production ] && say "  email:     ${OLD_EMAIL:-none}"
   say "  retention: ${OLD_RETENTION:-90} days"
+  say "  push:      ${OLD_PUSH:-not set up} (Android notifications through ntfy)"
   if yes_no "Keep these settings?" y; then KEEP=1; fi
 fi
 
@@ -187,6 +197,24 @@ else
     ask RETENTION "Days to keep posts that not every device has fetched yet" "${OLD_RETENTION:-90}"
   done
 fi
+# Push server: a flag decides; otherwise keep what .env says; otherwise ask
+# (default no). With --yes and nothing decided yet, it stays off.
+if [ -z "$PUSH" ]; then
+  if [ -n "$OLD_PUSH" ]; then
+    PUSH=$OLD_PUSH
+  elif [ "$TTY" = 1 ]; then
+    say ""
+    say "Side Tray's Android app can get instant notifications through a small push"
+    say "server (ntfy) running next to the relay, on port $NTFY_PORT. It only carries empty"
+    say "wake-ups; phones then fetch the encrypted posts themselves. Without it, phones"
+    say "check for new posts about every 15 minutes."
+    if yes_no "Run the push server?" n; then PUSH=yes; else PUSH=no; fi
+  else
+    PUSH=no
+  fi
+fi
+case "$PUSH" in yes|no) ;; *) PUSH=no ;; esac
+
 valid_days "$RETENTION" || die "--retention must be a whole number of days from 1 to 3650"
 if [ "$MODE" = production ]; then
   valid_domain "$DOMAIN" || die "\"$DOMAIN\" isn't a domain name"
@@ -316,6 +344,19 @@ caddy_site() {
 }
 EOF
 }
+# The push server's site, on its own port of the same address. In test mode it
+# has its own long-lived self-signed certificate: the ntfy app pins the exact
+# certificate it was shown, and Caddy's own test certificates change every
+# few hours.
+ntfy_site() {
+  [ "$PUSH" = yes ] || return 0
+  printf '\n# Push server for the Android app (ntfy), when install.sh was told to run it.\n'
+  printf '{$SIDETRAY_HOST}:{$SIDETRAY_NTFY_PORT} {\n'
+  if [ "$MODE" = test ]; then
+    printf '\ttls /etc/caddy/ntfy-tls/cert.pem /etc/caddy/ntfy-tls/key.pem\n'
+  fi
+  printf '\treverse_proxy ntfy:80\n}\n'
+}
 caddyfile_before=""
 [ -f "$DIR/Caddyfile" ] && caddyfile_before=$(sha256sum <"$DIR/Caddyfile")
 if [ "$MODE" = production ]; then
@@ -328,7 +369,7 @@ if [ "$MODE" = production ]; then
 
 {$SIDETRAY_HOST} {
 EOF
-    caddy_site; } | put "$DIR/Caddyfile"
+    caddy_site; ntfy_site; } | put "$DIR/Caddyfile"
 else
   { cat <<'EOF'
 # Written by install.sh (test mode). Re-running it rewrites this file and keeps a .bak.
@@ -351,11 +392,54 @@ else
 	}
 
 EOF
-    caddy_site; } | put "$DIR/Caddyfile"
+    caddy_site; ntfy_site; } | put "$DIR/Caddyfile"
 fi
+
+# Test mode with push: the ntfy port's certificate, made once (10 years) and
+# remade only if the server's address changed.
+install -d -m 755 "$DIR/ntfy-tls"
+if [ "$PUSH" = yes ] && [ "$MODE" = test ]; then
+  cert="$DIR/ntfy-tls/cert.pem"
+  if [ ! -s "$cert" ] || ! openssl x509 -noout -checkip "$IP" -in "$cert" 2>/dev/null | grep -q 'does match'; then
+    (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+      -subj "/CN=Side Tray push $IP" -addext "subjectAltName=IP:$IP" \
+      -keyout "$DIR/ntfy-tls/key.pem" -out "$cert" 2>/dev/null) || die "couldn't make the push server's certificate (is openssl installed?)"
+    chmod 644 "$cert"
+    say "  made a certificate for the push server ($IP, valid 10 years)"
+  fi
+fi
+
+# Push settings in .env: the compose profile that starts ntfy, and where the
+# relay sends wake-ups.
+push_env() {
+  env_set SIDETRAY_PUSH "$PUSH"
+  if [ "$PUSH" = yes ]; then
+    env_set COMPOSE_PROFILES push
+    env_set SIDETRAY_NTFY_PORT "$NTFY_PORT"
+    env_set SIDETRAY_NTFY_URL "https://$HOST:$NTFY_PORT"
+    env_set SIDETRAY_NTFY_INTERNAL "http://ntfy"
+  else
+    env_set COMPOSE_PROFILES ""
+    env_set SIDETRAY_NTFY_URL ""
+    env_set SIDETRAY_NTFY_INTERNAL ""
+  fi
+}
 
 # .env: a new one, or only the settings that changed. The setup token and
 # anything else in an existing .env are left alone.
+env_set() {
+  local k=$1 v=$2
+  [ "$(env_get "$k")" = "$v" ] && grep -q "^$k=" "$DIR/.env" && return
+  [ -n "${NEW_ENV:-}" ] || [ -e "$DIR/.env.bak" ] || cp -p "$DIR/.env" "$DIR/.env.bak"
+  if grep -q "^$k=" "$DIR/.env"; then
+    local tmp; tmp=$(mktemp)
+    awk -v k="$k" -v v="$v" 'index($0, k "=") == 1 { print k "=" v; next } { print }' "$DIR/.env" >"$tmp"
+    cat "$tmp" >"$DIR/.env"; rm -f "$tmp"
+  else
+    printf '%s=%s\n' "$k" "$v" >>"$DIR/.env"
+  fi
+  [ -n "${NEW_ENV:-}" ] || say "  .env: $k=$v"
+}
 if [ ! -f "$DIR/.env" ]; then
   (umask 077; cat >"$DIR/.env" <<EOF
 # Side Tray relay settings, written by install.sh. Re-running it keeps this file.
@@ -374,25 +458,14 @@ SIDETRAY_RETENTION_DAYS=$RETENTION
 SIDETRAY_SETUP_TOKEN=
 EOF
   )
+  NEW_ENV=1 push_env
   say "  wrote .env"
 else
-  env_set() {
-    local k=$1 v=$2
-    [ "$(env_get "$k")" = "$v" ] && grep -q "^$k=" "$DIR/.env" && return
-    [ -e "$DIR/.env.bak" ] || cp -p "$DIR/.env" "$DIR/.env.bak"
-    if grep -q "^$k=" "$DIR/.env"; then
-      local tmp; tmp=$(mktemp)
-      awk -v k="$k" -v v="$v" 'index($0, k "=") == 1 { print k "=" v; next } { print }' "$DIR/.env" >"$tmp"
-      cat "$tmp" >"$DIR/.env"; rm -f "$tmp"
-    else
-      printf '%s=%s\n' "$k" "$v" >>"$DIR/.env"
-    fi
-    say "  .env: $k=$v"
-  }
   env_set SIDETRAY_MODE "$MODE"
   env_set SIDETRAY_HOST "$HOST"
   env_set SIDETRAY_ACME_EMAIL "$EMAIL"
   env_set SIDETRAY_RETENTION_DAYS "$RETENTION"
+  push_env
   chmod 600 "$DIR/.env"
   say "  kept .env (setup token and other settings untouched)"
 fi
@@ -407,12 +480,19 @@ chmod 755 "$ADMIN_BIN"
 
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
   ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null && say "  ufw: allowed ports 80 and 443"
+  if [ "$PUSH" = yes ]; then
+    ufw allow "$NTFY_PORT/tcp" >/dev/null && say "  ufw: allowed port $NTFY_PORT (push server)"
+  fi
 fi
 
 # --- start --------------------------------------------------------------------
 
 step "Building and starting the relay (the first build takes a minute or two)"
 compose up -d --build --remove-orphans
+if [ "$PUSH" = no ] && [ -n "$(docker ps -aq --filter label=com.docker.compose.project=sidetray --filter label=com.docker.compose.service=ntfy)" ]; then
+  say "  push is off: removing the push server's container (its volumes are kept)"
+  docker rm -f $(docker ps -aq --filter label=com.docker.compose.project=sidetray --filter label=com.docker.compose.service=ntfy) >/dev/null
+fi
 # The Caddyfile is bind-mounted as a single file, and put() replaces it, so a
 # running Caddy still sees the old one: restart it when the file changed.
 if [ -n "$caddyfile_before" ] && [ "$caddyfile_before" != "$(sha256sum <"$DIR/Caddyfile")" ]; then
@@ -448,6 +528,25 @@ if [ "$ok" = 0 ]; then
 fi
 say "The relay is answering over HTTPS."
 
+if [ "$PUSH" = yes ]; then
+  step "Waiting for the push server at https://$HOST:$NTFY_PORT"
+  pok=0
+  for _ in $(seq 30); do
+    if [ "$MODE" = test ]; then
+      curl -fsS -m 5 --cacert "$DIR/ntfy-tls/cert.pem" "https://$HOST:$NTFY_PORT/v1/health" >/dev/null 2>&1 && { pok=1; break; }
+    else
+      curl -fsS -m 5 "https://$HOST:$NTFY_PORT/v1/health" >/dev/null 2>&1 && { pok=1; break; }
+    fi
+    sleep 2
+  done
+  if [ "$pok" = 1 ]; then
+    say "The push server is answering."
+  else
+    compose logs --tail 20 ntfy || true
+    warn "the push server didn't answer on https://$HOST:$NTFY_PORT within a minute (logs above). Phones fall back to checking every 15 minutes. If a firewall in front of this server blocks port $NTFY_PORT, open it."
+  fi
+fi
+
 # --- setup token --------------------------------------------------------------
 
 status=$("$ADMIN_BIN" setup-status)
@@ -472,6 +571,15 @@ else
   say "                 The app shows this fingerprint when someone first connects; it must match."
 fi
 say "Retention:       $RETENTION days"
+if [ "$PUSH" = yes ]; then
+  say "Push server:     https://$HOST:$NTFY_PORT (ntfy; Android phones set it as ntfy's default server)"
+  if [ "$MODE" = test ] && command -v openssl >/dev/null; then
+    say "                 its certificate: $(openssl x509 -noout -fingerprint -sha256 -in "$DIR/ntfy-tls/cert.pem" | sed 's/^.*Fingerprint=/SHA-256 /')"
+    say "                 The ntfy app shows this when it first connects; it must match."
+  fi
+else
+  say "Push server:     off (Android phones check every 15 minutes; re-run with --push to turn it on)"
+fi
 say "Settings:        $DIR/.env, $DIR/Caddyfile; data in Docker volumes sidetray_api_data and sidetray_caddy_data"
 say "Admin:           sudo sidetray-admin new-group | list-groups | prune"
 say ""

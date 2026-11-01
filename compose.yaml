@@ -18,6 +18,12 @@ services:
       SIDETRAY_MEDIA_MB_PER_HOUR: ${SIDETRAY_MEDIA_MB_PER_HOUR:-}
       SIDETRAY_JOINS_PER_HOUR: ${SIDETRAY_JOINS_PER_HOUR:-}
       SIDETRAY_LOOKUPS_PER_HOUR: ${SIDETRAY_LOOKUPS_PER_HOUR:-}
+      # Android push wake-ups (A3): the public address of the ntfy service below,
+      # and how the relay reaches it inside Docker. Empty = no wake-ups.
+      SIDETRAY_NTFY_URL: ${SIDETRAY_NTFY_URL:-}
+      SIDETRAY_NTFY_INTERNAL: ${SIDETRAY_NTFY_INTERNAL:-}
+      # Other push servers phones may use (host names, comma-separated), e.g. ntfy.sh.
+      SIDETRAY_PUSH_HOSTS: ${SIDETRAY_PUSH_HOSTS:-}
     volumes:
       - api_data:/data
     mem_limit: 256m
@@ -36,16 +42,54 @@ services:
       SIDETRAY_HOST: ${SIDETRAY_HOST:?set SIDETRAY_HOST in .env}
       # Let's Encrypt account email; only the production Caddyfile from install.sh uses it.
       SIDETRAY_ACME_EMAIL: ${SIDETRAY_ACME_EMAIL:-}
+      SIDETRAY_NTFY_PORT: ${SIDETRAY_NTFY_PORT:-8443}
     ports:
       - "80:80"
       - "443:443"
+      # ntfy, when install.sh turned push on (nothing listens there otherwise).
+      - "${SIDETRAY_NTFY_PORT:-8443}:${SIDETRAY_NTFY_PORT:-8443}"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Test mode: the long-lived certificate for the ntfy port (install.sh makes it).
+      - ./ntfy-tls:/etc/caddy/ntfy-tls:ro
       - caddy_data:/data
       - caddy_config:/config
+    mem_limit: 128m
+
+  # Optional push server for the Android app (UnifiedPush distributor
+  # backend). Started only with the "push" profile: install.sh sets
+  # COMPOSE_PROFILES=push in .env when the operator turns push on. Caddy
+  # serves it on its own port, SIDETRAY_NTFY_PORT. It only ever carries empty
+  # wake-ups: phones then sync over the relay's API.
+  ntfy:
+    image: binwiederhier/ntfy:v2.28.0
+    profiles: ["push"]
+    command: serve
+    restart: unless-stopped
+    environment:
+      NTFY_BASE_URL: ${SIDETRAY_NTFY_URL:-}
+      NTFY_LISTEN_HTTP: ":80"
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+      NTFY_CACHE_DURATION: "12h"
+      # Private server: nobody may use it except for UnifiedPush topics (up*),
+      # which the phones read and the relay writes.
+      NTFY_AUTH_FILE: /var/lib/ntfy/auth.db
+      NTFY_AUTH_DEFAULT_ACCESS: deny-all
+      NTFY_AUTH_ACCESS: "*:up*:rw"
+      NTFY_WEB_ROOT: disable
+      # The relay sends every wake-up from one address; don't rate-limit it.
+      NTFY_VISITOR_REQUEST_LIMIT_EXEMPT_HOSTS: api
+    depends_on:
+      - api
+    volumes:
+      - ntfy_cache:/var/cache/ntfy
+      - ntfy_lib:/var/lib/ntfy
     mem_limit: 128m
 
 volumes:
   api_data:
   caddy_data:
   caddy_config:
+  ntfy_cache:
+  ntfy_lib:

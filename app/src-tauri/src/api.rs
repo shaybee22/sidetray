@@ -608,13 +608,13 @@ mod tests {
         assert!(fingerprint(&format!("{ROOT}{ROOT}")).is_err());
         assert!(tls_config(None).is_ok());
         assert!(tls_config(Some("not a pem")).is_err());
-        assert!(Api::new("https://10.1.1.191", Some(ROOT), None).unwrap().pinned.is_some());
+        assert!(Api::new("https://10.1.1.188", Some(ROOT), None).unwrap().pinned.is_some());
         assert!(Api::new("https://tray.example.org", None, None).unwrap().pinned.is_none());
     }
 
     #[test]
     fn test_servers_are_ip_addresses() {
-        assert!(is_ip_server("https://10.1.1.191"));
+        assert!(is_ip_server("https://10.1.1.188"));
         assert!(is_ip_server("https://[::1]:8443"));
         assert!(!is_ip_server("https://tray.example.org"));
         assert!(normalize_server("https://tray.example.org/api").is_err());

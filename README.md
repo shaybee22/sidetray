@@ -152,7 +152,7 @@ SHA-256 fingerprint: tell it to everyone who connects, by a channel you trust
 Caddyfile changed, re-running the installer restarts Caddy so it takes effect.
 
 For unattended runs, every question has a flag:
-`--domain tray.example.org --email you@example.org` or `--ip 10.1.1.191`,
+`--domain tray.example.org --email you@example.org` or `--ip 10.1.1.188`,
 `--retention 90`, `--yes` (keep existing settings), and `--new-group` (also print a
 token for another group). Piped from a release, `curl -fsSL <url>/install.sh |
 sudo SIDETRAY_SOURCE_URL=<release tarball> bash` works the same way.
@@ -266,7 +266,7 @@ in a dev checkout, export it and point curl at it:
 
 ```sh
 docker compose exec -T caddy cat /data/caddy/pki/authorities/local/root.crt > sidetray-root.crt
-curl --cacert sidetray-root.crt https://10.1.1.191/api/v1/health
+curl --cacert sidetray-root.crt https://10.1.1.188/api/v1/health
 ```
 
 For a Let's Encrypt cert, run `install.sh` with a domain (production mode).

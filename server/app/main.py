@@ -21,6 +21,11 @@ numbers, which count per group. Rate limits per device and per client IP.
 Phase 5b: end-to-end encrypted direct messages. Each one is stored with the
 list of devices its key was sealed to (dm_keys); only those devices can fetch
 it or its photos, and it's pruned once they have all acked it.
+
+Android A3: phones register a UnifiedPush endpoint (POST /push). Whenever the
+relay would push to a device on /ws but that device has no socket open, it
+POSTs an empty wake-up to the endpoint instead (Waker), and the phone syncs
+over the normal API. The wake-up carries no content, names or group details.
 """
 
 import asyncio
@@ -33,6 +38,9 @@ import secrets
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -82,6 +90,20 @@ EVENTS_PER_MINUTE = env_int("SIDETRAY_EVENTS_PER_MINUTE", 30)
 MEDIA_BYTES_PER_HOUR = env_int("SIDETRAY_MEDIA_MB_PER_HOUR", 50) * 1024 * 1024
 JOINS_PER_HOUR = env_int("SIDETRAY_JOINS_PER_HOUR", 10)
 LOOKUPS_PER_HOUR = env_int("SIDETRAY_LOOKUPS_PER_HOUR", 60)
+
+# UnifiedPush wake-ups (Android A3). SIDETRAY_NTFY_URL is the public address of
+# the ntfy server install.sh runs next to the relay (e.g. https://tray.example.org:8443);
+# SIDETRAY_NTFY_INTERNAL is how the relay reaches the same server inside Docker
+# (http://ntfy), so a wake-up never leaves the machine. SIDETRAY_PUSH_HOSTS lists
+# other push servers' host names the operator allows (e.g. ntfy.sh); empty by default.
+NTFY_URL = os.environ.get("SIDETRAY_NTFY_URL", "").strip().rstrip("/")
+NTFY_INTERNAL = os.environ.get("SIDETRAY_NTFY_INTERNAL", "").strip().rstrip("/")
+PUSH_HOSTS = {h.strip().lower() for h in os.environ.get("SIDETRAY_PUSH_HOSTS", "").split(",") if h.strip()}
+# At most one wake-up per device this often; one that comes sooner waits, so
+# the last change is never lost.
+WAKE_EVERY_SECONDS = float(os.environ.get("SIDETRAY_WAKE_EVERY_SECONDS") or 5)
+WAKE_TIMEOUT_SECONDS = 10
+MAX_ENDPOINT_LEN = 1000
 
 # Seeded by the Phase 1 skeleton for its hardcoded test token; removed on startup.
 LEGACY_TEST_GROUP_ID = "g_test"
@@ -194,6 +216,11 @@ CREATE TABLE IF NOT EXISTS dm_acks (
     device_id   TEXT PRIMARY KEY REFERENCES devices(id),
     last_seq    INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_endpoints (
+    device_id   TEXT PRIMARY KEY REFERENCES devices(id),
+    endpoint    TEXT NOT NULL UNIQUE,
+    created_at  INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS setup_tokens (
     token_hash  TEXT PRIMARY KEY,
@@ -491,6 +518,142 @@ class Hub:
 hub = Hub()
 
 
+def push_target(endpoint: str) -> str | None:
+    """Where a wake-up for this UnifiedPush endpoint goes, or None if the relay
+    won't send to it. Allowed: a topic on this server's own ntfy (sent over
+    the internal Docker address when there is one), or any https URL on a host
+    the operator listed in SIDETRAY_PUSH_HOSTS. Nothing else, so a device can't
+    make the relay call arbitrary addresses."""
+    if len(endpoint) > MAX_ENDPOINT_LEN or any(c.isspace() for c in endpoint):
+        return None
+    try:
+        u = urllib.parse.urlsplit(endpoint)
+        port = u.port
+    except ValueError:
+        return None
+    if u.scheme != "https" or not u.hostname or u.username or u.password or u.fragment:
+        return None
+    if NTFY_URL:
+        n = urllib.parse.urlsplit(NTFY_URL)
+        if (u.hostname.lower(), port or 443) == ((n.hostname or "").lower(), n.port or 443):
+            # ntfy endpoints look like <base>/up<random>?up=1.
+            topic = u.path[1:]
+            if not (u.path[:1] == "/" and 0 < len(topic) <= 64 and all(c.isalnum() or c in "-_" for c in topic)):
+                return None
+            if u.query not in ("", "up=1"):
+                return None
+            base = NTFY_INTERNAL or NTFY_URL
+            return base + u.path + (f"?{u.query}" if u.query else "")
+    if u.hostname.lower() in PUSH_HOSTS:
+        return endpoint
+    return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # a push server that redirects gets an error, not a follow
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+class Waker:
+    """Empty UnifiedPush wake-ups for devices that have no /ws socket open.
+
+    `wake` is callable from any thread; the timing runs on the event loop and
+    the HTTP POSTs in the default thread pool. Per device, at most one wake-up
+    every WAKE_EVERY_SECONDS: a change that comes sooner schedules one for when
+    the interval is up. The POST has an empty body; the push server only learns
+    that this endpoint should wake up now."""
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.last: dict[str, float] = {}
+        self.waiting: dict[str, str] = {}
+
+    def wake(self, targets: dict[str, str]) -> None:
+        """`targets`: device id -> endpoint URL, as stored."""
+        if not targets or self.loop is None or self.loop.is_closed():
+            return
+        self.loop.call_soon_threadsafe(self._wake, dict(targets))
+
+    def _wake(self, targets: dict[str, str]) -> None:
+        t = self.loop.time()
+        if len(self.last) > 10_000:
+            self.last = {d: x for d, x in self.last.items() if x > t - WAKE_EVERY_SECONDS}
+        for device_id, endpoint in targets.items():
+            if hub.count(device_id):
+                continue  # it has a socket: /ws already told it
+            if device_id in self.waiting:
+                self.waiting[device_id] = endpoint
+                continue
+            wait = self.last.get(device_id, float("-inf")) + WAKE_EVERY_SECONDS - t
+            if wait <= 0:
+                self._send(device_id, endpoint)
+            else:
+                self.waiting[device_id] = endpoint
+                self.loop.call_later(wait, self._later, device_id)
+
+    def _later(self, device_id: str) -> None:
+        endpoint = self.waiting.pop(device_id, None)
+        if endpoint and not hub.count(device_id):
+            self._send(device_id, endpoint)
+
+    def _send(self, device_id: str, endpoint: str) -> None:
+        self.last[device_id] = self.loop.time()
+        self.loop.run_in_executor(None, send_wake, device_id, endpoint)
+
+
+def send_wake(device_id: str, endpoint: str) -> bool:
+    """POST one empty wake-up. A push server that says the endpoint is gone
+    (404/410) gets it deleted, as UnifiedPush expects. True if it was accepted."""
+    url = push_target(endpoint)
+    if url is None:
+        return False
+    req = urllib.request.Request(url, data=b"", method="POST", headers={
+        "Content-Type": "application/octet-stream",
+        # RFC 8030 headers, for Web Push style servers; ntfy ignores them.
+        "TTL": "3600",
+        "Urgency": "high",
+    })
+    try:
+        with _opener.open(req, timeout=WAKE_TIMEOUT_SECONDS) as r:
+            r.read(1024)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            with db() as conn:
+                conn.execute("DELETE FROM push_endpoints WHERE device_id = ? AND endpoint = ?", (device_id, endpoint))
+            print(f"push: endpoint of device {device_id} is gone ({e.code}); deleted", flush=True)
+        else:
+            print(f"push: wake-up for device {device_id} failed: HTTP {e.code}", flush=True)
+    except (OSError, ValueError) as e:
+        print(f"push: wake-up for device {device_id} failed: {e!r}", flush=True)
+    return False
+
+
+waker = Waker()
+
+
+def endpoints_for(conn: sqlite3.Connection, device_ids) -> dict[str, str]:
+    ids = list(device_ids)
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    return {r["device_id"]: r["endpoint"] for r in conn.execute(
+        f"SELECT device_id, endpoint FROM push_endpoints WHERE device_id IN ({marks})", ids)}
+
+
+def wake(device_ids) -> None:
+    """Wake these devices through their push endpoints if they have no socket."""
+    ids = [d for d in device_ids if not hub.count(d)]
+    if not ids:
+        return
+    with db() as conn:
+        targets = endpoints_for(conn, ids)
+    waker.wake(targets)
+
+
 class Limiter:
     """Sliding-window limit per key (a device id or a client IP). In memory,
     like the Hub, so it relies on the single process. `take` records `amount`
@@ -562,12 +725,16 @@ def push_new_event(group_id: str, author_device_id: str, seq: int, kind: str) ->
     with db() as conn:
         to = [d for d in active_device_ids(conn, group_id) if d != author_device_id]
     hub.send(to, {"type": "new_event", "seq": seq, "kind": kind})
+    # Reactions and profile changes never notify anyone: they wait for the next sync.
+    if kind not in ("reaction", "profile"):
+        wake(to)
 
 
 def push_new_dm(device_ids: list[str], seq: int) -> None:
     """The devices a direct message is for (the recipient's, and the sender's
     other devices): fetch it with GET /dms."""
     hub.send(device_ids, {"type": "new_dm", "seq": seq})
+    wake(device_ids)
 
 
 def push_join_request(group_id: str, device_id: str, display_name: str, existing_member: bool) -> None:
@@ -576,6 +743,7 @@ def push_join_request(group_id: str, device_id: str, display_name: str, existing
         to = active_device_ids(conn, group_id, keymasters_only=True)
     hub.send(to, {"type": "join_request", "device_id": device_id,
                   "display_name": display_name, "existing_member": existing_member})
+    wake(to)
 
 
 def push_key_rotated(group_id: str, key_version: int) -> None:
@@ -584,6 +752,7 @@ def push_key_rotated(group_id: str, key_version: int) -> None:
     with db() as conn:
         to = active_device_ids(conn, group_id)
     hub.send(to, {"type": "key_rotated", "key_version": key_version})
+    wake(to)
 
 
 def push_roster(group_id: str) -> None:
@@ -592,6 +761,7 @@ def push_roster(group_id: str) -> None:
     with db() as conn:
         to = active_device_ids(conn, group_id)
     hub.send(to, {"type": "roster"})
+    wake(to)
 
 
 def push_removed(device_ids: list[str], scope: str) -> None:
@@ -599,6 +769,13 @@ def push_removed(device_ids: list[str], scope: str) -> None:
     is "member" (the member was removed) or "device" (just this device).
     Sent by removal and revocation, and by /ws itself when it notices."""
     hub.send(device_ids, {"type": "removed", "scope": scope}, close=True)
+    # Wake them one last time so they find out, then forget their endpoints.
+    with db() as conn:
+        targets = endpoints_for(conn, device_ids)
+        if targets:
+            marks = ",".join("?" * len(targets))
+            conn.execute(f"DELETE FROM push_endpoints WHERE device_id IN ({marks})", list(targets))
+    waker.wake({d: e for d, e in targets.items() if not hub.count(d)})
 
 
 def group_by_name(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
@@ -881,6 +1058,7 @@ class DmIn(BaseModel):
 async def lifespan(_app: FastAPI):
     init_db()
     hub.loop = asyncio.get_running_loop()
+    waker.loop = hub.loop
     pruner = asyncio.create_task(prune_loop())
     yield
     pruner.cancel()
@@ -1674,6 +1852,56 @@ def download_media(media_id: str, dev: Device = Depends(current_device)):
     if row is None:
         raise HTTPException(404, "media not found")
     return FileResponse(MEDIA_DIR / row["path"], media_type="application/octet-stream")
+
+
+class PushIn(BaseModel):
+    endpoint: str = Field(min_length=8, max_length=MAX_ENDPOINT_LEN)
+
+
+def push_offered() -> bool:
+    return bool(NTFY_URL or PUSH_HOSTS)
+
+
+@api.get("/push")
+def get_push(dev: Device = Depends(current_device)):
+    """Whether this server sends wake-ups, where (its own ntfy, other allowed
+    push hosts), and the endpoint this device registered, if any."""
+    with db() as conn:
+        row = conn.execute("SELECT endpoint FROM push_endpoints WHERE device_id = ?", (dev.id,)).fetchone()
+    return {"offered": push_offered(), "ntfy": NTFY_URL or None, "hosts": sorted(PUSH_HOSTS),
+            "endpoint": row["endpoint"] if row else None}
+
+
+@api.post("/push")
+def register_push(body: PushIn, dev: Device = Depends(current_device)):
+    """Register (or replace) this device's UnifiedPush endpoint. From now on,
+    whenever /ws would tell this device something while it has no socket open,
+    the relay POSTs an empty wake-up there."""
+    endpoint = body.endpoint.strip()
+    if not push_offered():
+        raise HTTPException(404, "this server doesn't send push wake-ups")
+    if push_target(endpoint) is None:
+        where = f"its own push server, {NTFY_URL}" if NTFY_URL else "the push servers its operator allows"
+        if PUSH_HOSTS and NTFY_URL:
+            where += f" (or {', '.join(sorted(PUSH_HOSTS))})"
+        raise HTTPException(400, f"this server only sends wake-ups to {where}")
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # One device per endpoint: a re-registration on a new device takes it over.
+        conn.execute("DELETE FROM push_endpoints WHERE endpoint = ? AND device_id != ?", (endpoint, dev.id))
+        conn.execute(
+            "INSERT INTO push_endpoints (device_id, endpoint, created_at) VALUES (?, ?, ?)"
+            " ON CONFLICT (device_id) DO UPDATE SET endpoint = excluded.endpoint, created_at = excluded.created_at",
+            (dev.id, endpoint, now()),
+        )
+    return {"endpoint": endpoint}
+
+
+@api.delete("/push")
+def unregister_push(dev: Device = Depends(current_device)):
+    with db() as conn:
+        n = conn.execute("DELETE FROM push_endpoints WHERE device_id = ?", (dev.id,)).rowcount
+    return {"deleted": bool(n)}
 
 
 @api.websocket("/ws")
