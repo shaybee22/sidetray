@@ -144,6 +144,7 @@ All endpoints are HTTPS under `/api/v1`, authenticated with a per-device bearer 
 | POST | /joins/{device_id}/deny | Key Master | Reject the request |
 | GET | /members | member | Roster: names, roles, signing public keys |
 | POST | /members/{id}/remove | Key Master | Remove member, revoke devices |
+| POST | /leave | member | Leave the group: revoke all my devices (Phase 8) |
 | POST | /devices/{id}/revoke | Key Master | Revoke one device (lost or replaced); the member stays |
 | POST | /members/{id}/role | Key Master | Promote or demote Key Master |
 | POST | /keys/rotate | Key Master | Upload a new key version sealed to every active device |
@@ -262,7 +263,7 @@ Re-running it is safe: it updates the stack, keeps the data volumes and `.env`, 
 - `docker compose exec api sidetray-admin new-group` prints a fresh one-time setup token (stored hashed, valid 7 days). The first device to join with it creates a new group and becomes its Key Master, exactly like the first group today. `SIDETRAY_SETUP_TOKEN` in `.env` keeps working for a server's first group.
 - The server never lists its groups. `GET /group?name=<name>` only answers whether that exact name (case-insensitive) exists, and every authenticated call works within the group of the calling device's token. Group names are unique per server.
 - Pruning, rate limits and the `/ws` hub are already per group; the tables already carry `group_id`.
-- In the app, one install still joins one group. An in-app group switcher (several identities side by side) is a later phase.
+- In the app, one install still joins one group. An in-app group switcher (several identities side by side) is Phase 8.
 
 **Done when** `install.sh` brings up a fresh VPS on a real domain, the app joins it with no pasted certificate, an invite link opens the wizard pre-filled, a cropped avatar and a new name show up on another member's device, and a second group created with `sidetray-admin new-group` can't see or be found from the first.
 
@@ -364,6 +365,74 @@ What this Windows machine needs to build for Android:
 - "Start Side Tray when I sign in" (*This device → Settings*) defaults to ON for new installs. Existing installs keep whatever they have.
   - As built: an installed copy (the NSIS install, an AppImage, or a Linux package under `/usr`) decides once per data folder, at its first start of 0.2.0 or later: no identity yet means a new install, so it turns autostart on; otherwise it leaves it. A marker file `autostart-default` in the data folder records that it decided. Copies run from a build or with `SIDETRAY_DATA_DIR` never register.
 
+## Phase 8: Several groups in the app
+
+One install can belong to several groups (on one server or several), switch between them from the header, and leave a group. The relay has hosted several groups since Phase 6b; this phase is the app side, plus one new endpoint for leaving. Built in three steps, in this order: 8a (profiles and the migration), 8b (switching, background groups, push), 8c (leaving).
+
+**Profiles**
+
+- Each group the app belongs to is a **profile**: its own folder `groups/<local_id>/` in the app's data folder, holding its own `sidetray.db` (identity, device keys' wrapped group keys, posts, messages, `kv`) and `media/`. Its private keys and token stay in the OS keychain entry `device-<local_id>` (Android: the profile database's `secrets` table, wrapped by the app's one Keystore key). So a profile is one device of one member in one group, with nothing shared with the others: separate keypairs, separate tokens, separate archives.
+- The folder name is the identity's `local_id`, which already names the keychain entry. A new profile picks a fresh random `local_id` when it's created (before the wizard) and keeps it.
+- The app opens every profile at start: each has its own `App` (database connection, secrets cache, sync loop, push socket, locks). One of them is **active**: the one the window shows and every UI command acts on. The commands take the active `App` instead of a single managed one; feed, DM, crypto and Key Master code is unchanged, it just receives whichever `App` is active.
+- The active profile's `local_id` is saved in `active-group` in the data folder, so the app comes back to the group last looked at.
+- Files that belong to the install, not a group, stay at the top of the data folder: `autostart-default`, `notification-icon.png`, `active-group`.
+
+**Migration (8a)**
+
+On the first start of this version, an existing `sidetray.db` at the top of the data folder becomes the first profile, without touching its contents:
+
+1. Open it, checkpoint the WAL into the main file (`PRAGMA wal_checkpoint(TRUNCATE)`), and write a consistent backup copy next to it (`VACUUM INTO 'sidetray-before-groups.db'`), kept until a later release removes it.
+2. Read the identity's `local_id` (an install that never joined gets a fresh one) and close the database.
+3. Move `sidetray.db` (and any `-wal`/`-shm` left), and `media/`, into `groups/<local_id>.migrating/`, then rename that folder to `groups/<local_id>/`. Every step is a rename on the same disk, so nothing is copied and no photo is re-downloaded.
+4. Make it the active profile.
+
+If the app stops halfway, the next start sees the `.migrating` folder, moves in whatever is still at the top, and finishes the rename. The keychain entry doesn't move (it's named by `local_id`). On Android the push registration moves to the profile's own instance (below).
+
+**Switching (8b)**
+
+- The group name in the header becomes a menu button ("Powwow ▾"). The menu lists every profile by group name (with "waiting for approval" or "left / removed" where that applies), a dot on any group other than the active one with unread posts, messages or join requests, a tick on the active one, and *Join another group*.
+- Picking a group switches the active profile (`switch_group`) and the page re-reads its state and redraws, as at start. Unsent text or photos in the composer or a chat: "Discard what you haven't sent?" first, since staged photos belong to the profile they were picked in.
+- *Join another group* creates an empty profile, makes it active and runs the existing wizard (with a *Cancel* that deletes the empty profile and goes back). An invite link opened while the app is in a group does the same, pre-filled; the old "already belongs to a group" block is gone. A link for a group the app is already in (same server and group name) switches to it instead. `register` refuses a second profile for the same server and group.
+- The waiting and removed screens get the same menu when there's more than one group, so a pending join doesn't trap the window.
+- An empty profile (no identity) that isn't active is deleted at start, so an abandoned wizard leaves nothing behind.
+
+**Groups in the background (8b)**
+
+- Every profile keeps syncing on its own loop and socket, active or not. Events that redraw the page (`synced`, `push-status`, `removed`) are only sent for the active profile; any profile's sync also sends `groups-changed`, which redraws the menu's dots.
+- Notifications fire for every profile. With more than one group, their titles name it ("Ana posted in Powwow"). Clicking one (a Windows toast, an Android notification) switches to that group first, then opens the post or conversation: the target carries the profile's `local_id`. The "don't notify, they're looking at it" rule only applies to the active profile.
+- The tray badge and tooltip add up every profile's unread posts, messages and join requests.
+
+**Android push per profile (8b)**
+
+- Each profile registers its own UnifiedPush instance, named by its `local_id`, so it gets its own endpoint (the relay keeps one endpoint per device, and each profile is a separate device). Push state (`push_endpoint`, `push_registered` and so on) stays in each profile's `kv`.
+- Kotlin passes the instance through: `nativePush(dir, kind, value, instance)` and `nativeSync(dir, instance)` (a wake-up syncs that profile; the periodic job, with an empty instance, syncs them all). Events for an instance no profile owns are ignored, and the old single instance (`default`) is unregistered once.
+- The periodic 15-minute sync is on while any active profile has no working instant push. The battery and notification-permission cards are about the phone, not a group, so they stay where they are.
+
+**Leaving a group (8c)**
+
+Server: `POST /leave`, by any active device, for its own member.
+
+- Revokes every device of the calling member in that group (active and pending), records `revoked_seq`/`revoked_dm_seq` as a removal does (their earlier posts and messages still verify), marks the member as gone (the member row says `removed`, the devices' reason says `left`), and sets `rotation_pending` if any other active member remains, so a Key Master's app rotates the group key as after a removal. Pushes `removed` (scope `left`) to the member's devices and `roster` to the group.
+- The last active Key Master can't leave while anyone else is still in the group: 409, "promote someone to Key Master first". If they're the only member left, they can.
+- `GET /join/status` then says `left` for those devices. Another device of the same member records `left` (read-only archive, like `removed`, with its own wording: "You left Powwow").
+- Tests in `server/tests/test_leave.py`, alongside `test_groups.py`: leaving revokes all the member's devices and sets rotation_pending; a Key Master with a co-Key Master can leave; the last Key Master with other members can't; the last member can; other groups are untouched; a left device's token stops working; a left member's earlier events stay in `/members` former devices.
+
+App: *Leave this group* at the bottom of *Device* (and *Delete these saved posts* on the removed screen, *Cancel this request* while waiting, which become the same action for a profile that's no longer active on the relay).
+
+- A confirm dialog says what happens: everyone keeps what you posted, this device deletes everything it saved from that group, and coming back means asking to join again.
+- For an active profile the app calls `POST /leave` first and stops if it fails (offline, or the last Key Master: the dialog shows the reason). Then: stop the profile's loops, unregister its push instance, close its database, delete its keychain entry and its folder.
+- The app switches to another profile (the most recently used one left), or to the wizard in a new empty profile if none remain.
+
+**Done when** the live Powwow install updates and comes up in Powwow with every post, photo and message still there; it joins a second group from an invite link and switches between the two; a post in the inactive group notifies (desktop toast and Android push) and puts a dot in the menu, and clicking the notification opens it in that group; the app restarts in the group last used; and leaving the second group revokes its devices on the relay, deletes its folder and keychain entry, and lands back in Powwow.
+
+**As built (not yet released):**
+
+- `profiles.rs` holds the profiles; every UI command takes the active one through a small `Active` command argument, so the feed, DM, crypto and Key Master modules didn't change. The window's Tauri handle moved from each `App` into one process-wide static (it's one per process anyway, and it keeps tests that build an `App` from loading window code).
+- A profile is deleted by showing the next one first (the one used before, another joined group, or a new empty one), then closing its database and deleting its keychain entry and folder, so the active profile is never a deleted one.
+- The relay's `members.status` only allows `active`/`removed`, so a member who left is `removed` there and their devices carry `revoked_reason = 'left'`; `GET /join/status` says `left`.
+- The old *Start over* (`reset`) is gone: cancelling a join, starting over after a denial and *Delete these saved posts* after a removal all delete the profile the same way as leaving (without the relay call).
+- Tested with a local relay and two desktop copies: an install with its data at the top of the folder (and most of it still in the WAL after an unclean exit) moved into `groups/<local_id>/` with its posts and keys working; a second group founded from *Join another group*; a post in the hidden group gave a toast "Rosa posted in Alpha" and a dot on the menu, and its notification target switched groups; a restart came back in the last group; the only Key Master was refused (409); a member leaving landed in the wizard with folder and keychain entry gone, and the Key Master's app rotated the key. Android compiles (`aarch64-linux-android`) but the per-group push instances haven't been tried on a phone yet.
+
 ## Distribution and later
 
 **Distribution**
@@ -374,7 +443,6 @@ What this Windows machine needs to build for Android:
 
 **Later**
 
-- In-app group switcher (one install in several groups); the server side is Phase 6b
 - Facebook "Send to Side Tray too?" browser extension
 - Android app: see "Android app" above; iPhone later
 - Archive sharing for new members, SQLCipher at rest, email verification via the M365 domain

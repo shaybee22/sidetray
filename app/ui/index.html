@@ -27,6 +27,7 @@
     <p class="lede">A private feed for one group of friends and family. Posts are encrypted on this device before they leave it.</p>
 
     <p class="note" id="wz-invite-note" hidden>Opened from an invite link.</p>
+    <p class="note" id="wz-another-note" hidden>Joining another group. Your other groups stay as they are.</p>
 
     <form id="wz-server" class="stack" novalidate>
       <label>Server address
@@ -75,12 +76,14 @@
       </div>
     </form>
     <p class="hint app-version"></p>
+    <button class="link" id="wz-cancel" hidden>Cancel</button>
   </div>
 </main>
 
 <!-- Join request sent: show the code, wait for a Key Master -->
 <main id="screen-waiting" class="screen screen-center" hidden>
   <div class="card narrow center">
+    <button class="ghost small group-switch" id="wt-groups" hidden aria-haspopup="menu" aria-expanded="false">Your groups <span class="caret" aria-hidden="true">▾</span><span class="dot" hidden></span></button>
     <div id="wt-pending">
       <p class="eyebrow" id="wt-group"></p>
       <h1>Call a Key Master</h1>
@@ -116,6 +119,7 @@
 <!-- Removed from the group, or this device revoked: syncing has stopped -->
 <main id="screen-removed" class="screen screen-center" hidden>
   <div class="card narrow center">
+    <button class="ghost small group-switch" id="rm-groups" hidden aria-haspopup="menu" aria-expanded="false">Your groups <span class="caret" aria-hidden="true">▾</span><span class="dot" hidden></span></button>
     <p class="eyebrow" id="rm-group"></p>
     <h1 id="rm-title">You've been removed from this group</h1>
     <p id="rm-body"></p>
@@ -131,7 +135,9 @@
   <header class="topbar">
     <div class="brand">
       <span class="logo" aria-hidden="true"></span>
-      <span id="tb-group"></span>
+      <button class="group-switch" id="tb-group-btn" aria-haspopup="menu" aria-expanded="false" title="Your groups">
+        <span id="tb-group"></span><span class="caret" aria-hidden="true">▾</span><span class="dot" id="tb-group-dot" hidden></span>
+      </button>
     </div>
     <nav class="tabs" role="tablist">
       <button class="tab" role="tab" data-tab="feed" aria-selected="true"><svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h16M4 12h16M4 17.5h10"/></svg><span class="tab-label">Feed</span></button>
@@ -346,8 +352,16 @@
       <h2>This device</h2>
       <dl class="facts" id="device-facts"></dl>
     </div>
+    <div class="card">
+      <h2>Leave this group</h2>
+      <p class="muted" id="leave-text"></p>
+      <div class="actions start"><button class="ghost danger" id="leave-btn">Leave this group</button></div>
+      <p class="error" id="leave-err" hidden></p>
+    </div>
   </section>
 </div>
+
+<div class="group-menu" id="group-menu" role="menu" hidden></div>
 
 <div id="lightbox" hidden aria-label="Photo. Pinch or double-tap to zoom.">
   <img id="lightbox-img" alt="">

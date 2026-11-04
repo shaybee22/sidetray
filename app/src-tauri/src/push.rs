@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 use tokio_tungstenite::Connector;
 
@@ -41,6 +41,9 @@ pub fn spawn(handle: AppHandle, app: Arc<App>) {
     tauri::async_runtime::spawn(async move {
         let mut backoff = BACKOFF_MIN;
         loop {
+            if app.is_closed() {
+                break;
+            }
             // A phone keeps no socket in the background (A3): a frozen app's
             // socket would look connected to the relay, which then sends no
             // wake-ups. Wait until it's back in front.
@@ -66,11 +69,12 @@ pub fn spawn(handle: AppHandle, app: Arc<App>) {
             let started = Instant::now();
             let outcome = run(&handle, &app, &id).await;
             if app.push_connected.swap(false, Ordering::SeqCst) {
-                let _ = handle.emit("push-status", false);
+                crate::profiles::emit(&handle, &app, "push-status", false);
                 // Sync now, and the sync loop goes back to polling.
                 app.wake.notify_one();
             }
             match outcome {
+                _ if app.is_closed() => break,
                 Ok(Ended::Removed) => {
                     eprintln!("push: the server says this device was removed");
                     // Confirm with /join/status; that records it and stops syncing.
@@ -114,7 +118,7 @@ async fn run(handle: &AppHandle, app: &App, id: &Identity) -> Result<Ended> {
     let (mut tx, mut rx) = ws.split();
 
     app.push_connected.store(true, Ordering::SeqCst);
-    let _ = handle.emit("push-status", true);
+    crate::profiles::emit(handle, app, "push-status", true);
     // Catch up on whatever happened while we weren't connected.
     app.wake.notify_one();
 
@@ -142,6 +146,9 @@ async fn run(handle: &AppHandle, app: &App, id: &Identity) -> Result<Ended> {
                 Some(Ok(_)) => last_heard = Instant::now(),
             },
             _ = app.push_pause.notified() => {
+                if app.is_closed() {
+                    return Ok(Ended::Dropped);
+                }
                 #[cfg(mobile)]
                 if !tray::foreground() {
                     return Ok(Ended::Dropped);

@@ -75,13 +75,17 @@ object SideTrayAndroid {
   const val TAG = "SideTray"
   const val ACTION_OPEN = "org.sidetray.app.OPEN"
   const val EXTRA_TARGET = "target"
-  private const val PUSH_INSTANCE = "default"
+  /** The one instance from before groups each had their own (SPEC.md Phase 8); unregistered once. */
+  private const val LEGACY_INSTANCE = "default"
+  private const val PREFS = "sidetray"
+  private const val LEGACY_GONE = "legacy_push_instance_gone"
   private const val NTFY = "io.heckel.ntfy"
 
   @JvmStatic external fun nativeInit(context: Context)
   @JvmStatic external fun nativeForeground(visible: Boolean)
-  @JvmStatic external fun nativeSync(dataDir: String): String
-  @JvmStatic external fun nativePush(dataDir: String, kind: String, value: String): String
+  /** `instance`: the group (profile) to sync, or "" for all of them. */
+  @JvmStatic external fun nativeSync(dataDir: String, instance: String): String
+  @JvmStatic external fun nativePush(dataDir: String, kind: String, value: String, instance: String): String
 
   private var nativeReady = false
   private var observing = false
@@ -411,11 +415,12 @@ object SideTrayAndroid {
   /**
    * Register with the UnifiedPush distributor: the one already chosen, or else
    * ntfy, or else the first one installed. "fresh" unregisters first, so the
-   * distributor makes a new endpoint (on its current default server). Returns
-   * the distributor's package, or "" if the phone has none.
+   * distributor makes a new endpoint (on its current default server). Each
+   * group (profile) is its own instance, named by its local id, with its own
+   * endpoint. Returns the distributor's package, or "" if the phone has none.
    */
   @JvmStatic
-  fun pushRegister(mode: String): String {
+  fun pushRegister(mode: String, instance: String): String {
     val ctx = appContext ?: return ""
     var d = UnifiedPush.getAckDistributor(ctx) ?: UnifiedPush.getSavedDistributor(ctx)
     if (d == null) {
@@ -424,18 +429,24 @@ object SideTrayAndroid {
       if (d != null) UnifiedPush.saveDistributor(ctx, d)
     }
     if (d == null) return ""
+    val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    if (!prefs.getBoolean(LEGACY_GONE, false)) {
+      UnifiedPush.unregister(ctx, LEGACY_INSTANCE)
+      UnifiedPush.saveDistributor(ctx, d)
+      prefs.edit().putBoolean(LEGACY_GONE, true).apply()
+    }
     if (mode == "fresh") {
-      UnifiedPush.unregister(ctx, PUSH_INSTANCE)
+      UnifiedPush.unregister(ctx, instance)
       // Unregistering the last registration also forgets the distributor.
       UnifiedPush.saveDistributor(ctx, d)
     }
-    UnifiedPush.register(ctx, PUSH_INSTANCE, "Side Tray", null)
+    UnifiedPush.register(ctx, instance, "Side Tray", null)
     return d
   }
 
   @JvmStatic
-  fun pushUnregister(): String? {
-    appContext?.let { UnifiedPush.unregister(it, PUSH_INSTANCE) }
+  fun pushUnregister(instance: String): String? {
+    appContext?.let { UnifiedPush.unregister(it, instance) }
     return null
   }
 

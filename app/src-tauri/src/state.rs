@@ -8,13 +8,30 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+/// This process's Tauri handle, once Tauri is up (a push wake-up on Android
+/// may sync with no window); used for notifications and the tray from
+/// background tasks. A static, never dropped, so tests can build an `App`
+/// without loading any window code.
+static HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+pub fn handle() -> Option<&'static tauri::AppHandle> {
+    HANDLE.get()
+}
+
+pub fn set_handle(h: tauri::AppHandle) {
+    let _ = HANDLE.set(h);
+}
+
+/// One profile: this install's device in one group (SPEC.md Phase 8). The
+/// window shows the active one (`profiles.rs`); every profile syncs.
 pub struct App {
+    /// The profile's folder name, which is also its identity's `local_id`.
+    pub profile_id: String,
+    pub dir: PathBuf,
     pub media_dir: PathBuf,
-    /// Set once Tauri is up; used for notifications and the tray from background tasks.
-    pub handle: OnceLock<tauri::AppHandle>,
     db: Mutex<Connection>,
     secrets: Mutex<Option<Arc<Secrets>>>,
     /// Photos picked in the composer, already resized and encoded, waiting for "Post".
@@ -42,30 +59,8 @@ pub struct App {
     pub repin: Mutex<Option<ServerTrust>>,
     /// The last sync was refused over the server's certificate (the message to show).
     pub cert_problem: Mutex<Option<String>>,
-    /// An invite link that opened the app, until the wizard picks it up.
-    pub pending_invite: Mutex<Option<InviteMsg>>,
-}
-
-/// The one App of this process. On Android a push wake-up can start the
-/// process without the window; the window, if it opens later, then uses the
-/// same App (one database connection, one sync lock).
-static SHARED: Mutex<Option<Arc<App>>> = Mutex::new(None);
-
-/// This process's App, opened on `data_dir` if there isn't one yet.
-pub fn shared(data_dir: PathBuf) -> Result<Arc<App>> {
-    let mut g = SHARED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(a) = g.as_ref() {
-        return Ok(a.clone());
-    }
-    let a = Arc::new(App::open(data_dir)?);
-    *g = Some(a.clone());
-    Ok(a)
-}
-
-/// This process's App, if one was opened.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-pub fn current() -> Option<Arc<App>> {
-    SHARED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    /// Set when the profile is being deleted (left the group): its loops stop.
+    closed: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -85,14 +80,15 @@ pub struct InviteMsg {
 }
 
 impl App {
-    pub fn open(data_dir: PathBuf) -> Result<Self> {
+    pub fn open(data_dir: PathBuf, profile_id: String) -> Result<Self> {
         std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
         let media_dir = data_dir.join("media");
         std::fs::create_dir_all(&media_dir)?;
         let conn = db::open(&data_dir.join("sidetray.db"))?;
         Ok(App {
+            profile_id,
+            dir: data_dir,
             media_dir,
-            handle: OnceLock::new(),
             db: Mutex::new(conn),
             secrets: Mutex::new(None),
             staged: Mutex::new(HashMap::new()),
@@ -107,8 +103,24 @@ impl App {
             wizard_server: Mutex::new(None),
             repin: Mutex::new(None),
             cert_problem: Mutex::new(None),
-            pending_invite: Mutex::new(None),
+            closed: AtomicBool::new(false),
         })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Stop this profile's loops and close its database file (an empty
+    /// in-memory one takes its place), so its folder can be deleted.
+    pub fn close(&self) -> Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        *self.db() = db::open(std::path::Path::new(":memory:"))?;
+        self.set_secrets(None);
+        self.wake.notify_one();
+        self.push_wake.notify_one();
+        self.push_pause.notify_one();
+        Ok(())
     }
 
     /// The database. Never hold this across an `.await`.
@@ -130,6 +142,7 @@ impl App {
             "active" => Ok(id),
             "removed" => bail!("you've been removed from {}", id.group_name),
             "revoked" => bail!("this device has been disconnected from {}", id.group_name),
+            "left" => bail!("you left {}", id.group_name),
             s => bail!("this device is {s}; it can't do that until a Key Master approves it"),
         }
     }
@@ -137,7 +150,7 @@ impl App {
     /// A device whose archive can be read: active, or removed with its history kept.
     pub fn require_archive(&self) -> Result<Identity> {
         let id = self.require_identity()?;
-        if !matches!(id.status.as_str(), "active" | "removed" | "revoked") {
+        if !matches!(id.status.as_str(), "active" | "removed" | "revoked" | "left") {
             bail!("this device hasn't joined yet");
         }
         Ok(id)

@@ -336,7 +336,7 @@ def init_db() -> None:
         add_column(conn, "groups", "key_version", "INTEGER NOT NULL DEFAULT 1")
         add_column(conn, "groups", "pruned_through", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "groups", "rotation_pending", "INTEGER NOT NULL DEFAULT 0")
-        add_column(conn, "devices", "revoked_reason", "TEXT")  # denied / removed / revoked
+        add_column(conn, "devices", "revoked_reason", "TEXT")  # denied / removed / revoked / left
         add_column(conn, "devices", "revoked_at", "INTEGER")
         add_column(conn, "devices", "revoked_seq", "INTEGER")  # last event seq when it was cut off
         drop_legacy_test_group(conn)  # before group names become unique
@@ -1184,7 +1184,8 @@ def join_status(dev: Device = Depends(any_device)):
 
 def revoked_status(device_id: str) -> str:
     """Where a device stands: "active", "denied" (its join was turned down),
-    "removed" (its member was removed) or "revoked" (just this device)."""
+    "removed" (its member was removed), "left" (its member left) or "revoked"
+    (just this device)."""
     with db() as conn:
         r = conn.execute(
             "SELECT d.status, d.revoked_reason, d.approved_by, m.status AS member_status"
@@ -1197,6 +1198,8 @@ def revoked_status(device_id: str) -> str:
         return "active"
     if r["revoked_reason"] == "denied" or (r["revoked_reason"] is None and r["approved_by"] is None):
         return "denied"
+    if r["revoked_reason"] == "left":
+        return "left"
     if r["member_status"] == "removed" or r["revoked_reason"] == "removed":
         return "removed"
     return "revoked"
@@ -1593,6 +1596,50 @@ def revoke_device(device_id: str, km: Device = Depends(keymaster_device)):
     return {"device_id": device_id, "status": "revoked", "rotation_pending": True}
 
 
+@api.post("/leave")
+def leave_group(dev: Device = Depends(current_device)):
+    """The calling member leaves the group (SPEC.md Phase 8). Like a removal:
+    every one of their devices is revoked, earlier posts and messages still
+    verify up to the cut-off, and the group key needs rotating if anyone is
+    left. The member row says `removed`; the devices' reason says `left`.
+    The last active Key Master can't leave while others are still in the group."""
+    t = now()
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        others = conn.execute(
+            "SELECT COUNT(*) FROM members WHERE group_id = ? AND status = 'active' AND id != ?",
+            (dev.group_id, dev.member_id),
+        ).fetchone()[0]
+        if dev.role == "keymaster" and others:
+            other_kms = conn.execute(
+                "SELECT COUNT(*) FROM members WHERE group_id = ? AND status = 'active' AND role = 'keymaster'"
+                " AND id != ?",
+                (dev.group_id, dev.member_id),
+            ).fetchone()[0]
+            if not other_kms:
+                raise HTTPException(409, "you're the group's only Key Master: promote someone to Key Master first")
+        devices = [r["id"] for r in conn.execute(
+            "SELECT id FROM devices WHERE member_id = ? AND status IN ('active', 'pending')", (dev.member_id,))]
+        conn.execute("UPDATE members SET status = 'removed' WHERE id = ?", (dev.member_id,))
+        conn.execute(
+            "UPDATE devices SET revoked_seq = ?, revoked_dm_seq = ? WHERE member_id = ? AND status = 'active'",
+            (last_seq(conn, dev.group_id), last_dm_seq(conn, dev.group_id), dev.member_id),
+        )
+        conn.execute(
+            "UPDATE devices SET status = 'revoked', revoked_reason = 'left', revoked_at = ?"
+            " WHERE member_id = ? AND status IN ('active', 'pending')",
+            (t, dev.member_id),
+        )
+        if others:
+            conn.execute("UPDATE groups SET rotation_pending = 1 WHERE id = ?", (dev.group_id,))
+    push_removed(devices, "left")
+    if others:
+        # Key Masters' apps sync now, see rotation_pending and change the key.
+        push_roster(dev.group_id)
+    return {"member_id": dev.member_id, "status": "left", "revoked_devices": devices,
+            "rotation_pending": bool(others)}
+
+
 @api.post("/events", status_code=201)
 def post_event(ev: EventIn, dev: Device = Depends(current_device)):
     limit(event_limit, dev.id, "events from this device")
@@ -1924,8 +1971,8 @@ async def ws(websocket: WebSocket):
       {"type": "roster"}                        names in the certificates changed: sync
       {"type": "join_request", "device_id", "display_name", "existing_member"}  Key Masters only
       {"type": "key_rotated", "key_version"}    fetch GET /keys
-      {"type": "removed", "scope"}              this device was revoked ("device") or its
-                                                member removed ("member"); the socket closes
+      {"type": "removed", "scope"}              this device was revoked ("device"), its member
+                                                removed ("member") or left ("left"); the socket closes
       {"type": "pong"}                          reply to a ping
     Client -> server: {"type": "ping"} at least every WS_IDLE_SECONDS.
     """

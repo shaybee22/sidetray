@@ -16,20 +16,21 @@ import org.unifiedpush.android.connector.data.PushMessage
  * what's new over the relay's API.
  */
 class SideTrayPushService : PushService() {
+  // `instance` is the group (profile) the registration belongs to (SPEC.md Phase 8).
   override fun onMessage(message: PushMessage, instance: String) {
-    SideTrayWorker.syncNow(this)
+    SideTrayWorker.syncNow(this, instance)
   }
 
   override fun onNewEndpoint(endpoint: PushEndpoint, instance: String) {
-    SideTrayWorker.pushEvent(this, "endpoint", endpoint.url)
+    SideTrayWorker.pushEvent(this, "endpoint", endpoint.url, instance)
   }
 
   override fun onRegistrationFailed(reason: FailedReason, instance: String) {
-    Log.w(SideTrayAndroid.TAG, "UnifiedPush registration failed: $reason")
-    SideTrayWorker.pushEvent(this, "failed", reason.name)
+    Log.w(SideTrayAndroid.TAG, "UnifiedPush registration failed for $instance: $reason")
+    SideTrayWorker.pushEvent(this, "failed", reason.name, instance)
   }
 
   override fun onUnregistered(instance: String) {
-    SideTrayWorker.pushEvent(this, "unregistered", "")
+    SideTrayWorker.pushEvent(this, "unregistered", "", instance)
   }
 }

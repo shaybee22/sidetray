@@ -14,6 +14,10 @@
 //! frozen background app would otherwise hold a socket that the relay counts
 //! as connected (so no wake-ups) until it times out.
 //!
+//! Each group the app is in (a profile, SPEC.md Phase 8) registers its own
+//! UnifiedPush instance, named by its local id, and its state lives in that
+//! profile's database. The periodic sync is one job for every group.
+//!
 //! State lives in the local database's `kv` table:
 //! - `push_distributor`: the distributor app's package
 //! - `push_endpoint`: the latest endpoint it gave us
@@ -27,7 +31,8 @@
 //! - `push_note_seen`: the one-time note about getting instant notifications was read
 //! - `battery_later`: "Not now" on the card about battery restrictions
 
-use crate::state::{self, App};
+use crate::profiles;
+use crate::state::App;
 use crate::{android, api, db, feed, manage};
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -68,9 +73,15 @@ fn instant(app: &App) -> bool {
     e.is_some() && e == r
 }
 
-/// The periodic sync runs whenever wake-ups don't (or the device isn't active: then neither).
+/// The periodic sync runs whenever wake-ups don't reach some active group
+/// (and not at all if no group is active).
 fn update_periodic(app: &App) {
-    let on = active(app) && !instant(app);
+    let apps = profiles::current().map(|p| p.all()).unwrap_or_default();
+    let on = if apps.is_empty() {
+        active(app) && !instant(app)
+    } else {
+        apps.iter().any(|a| !a.is_closed() && active(a) && !instant(a))
+    };
     if let Err(e) = android::periodic_sync(on) {
         eprintln!("push: periodic sync: {e:#}");
     }
@@ -96,7 +107,7 @@ pub fn setup_with(app: &Arc<App>, fresh: bool) {
     if fresh {
         set(app, FRESH_AT, Some(&crate::now().to_string()));
     }
-    match android::push_register(fresh) {
+    match android::push_register(fresh, &app.profile_id) {
         Ok(Some(d)) => {
             set(app, DISTRIBUTOR, Some(&d));
             if get(app, ENDPOINT).is_none() {
@@ -124,6 +135,14 @@ pub fn setup_with(app: &Arc<App>, fresh: bool) {
                 eprintln!("push: checking the relay has our endpoint: {e:#}");
             }
         });
+    }
+}
+
+/// The group is being left or deleted: drop its registration with the
+/// distributor (the relay forgets the endpoint when the device is revoked).
+pub fn forget(app: &Arc<App>) {
+    if let Err(e) = android::push_unregister(&app.profile_id) {
+        eprintln!("push: unregistering: {e:#}");
     }
 }
 
@@ -195,10 +214,14 @@ async fn register(app: &App, endpoint: &str) {
     update_periodic(app);
 }
 
-/// From Kotlin (a background job): the distributor's news.
-pub fn push_event(dir: PathBuf, kind: &str, value: &str) -> String {
-    let app = match state::shared(dir) {
-        Ok(a) => a,
+/// From Kotlin (a background job): the distributor's news for one group's instance.
+pub fn push_event(dir: PathBuf, kind: &str, value: &str, instance: &str) -> String {
+    let app = match profiles::shared(dir) {
+        Ok(p) => match p.get(instance) {
+            Some(a) => a,
+            // The old single instance, or a group that was left meanwhile.
+            None => return format!("push: {kind} for {instance}, which isn't a group here; ignored"),
+        },
         Err(e) => return format!("push: opening the app's data: {e:#}"),
     };
     match kind {
@@ -226,21 +249,30 @@ pub fn push_event(dir: PathBuf, kind: &str, value: &str) -> String {
     }
 }
 
-/// From Kotlin (a background job): a wake-up, or the periodic sync.
-pub fn background_sync(dir: PathBuf) -> String {
-    let app = match state::shared(dir) {
-        Ok(a) => a,
+/// From Kotlin (a background job): a wake-up for one group's instance, or the
+/// periodic sync (`instance` empty: every group).
+pub fn background_sync(dir: PathBuf, instance: &str) -> String {
+    let p = match profiles::shared(dir) {
+        Ok(p) => p,
         Err(e) => return format!("sync: opening the app's data: {e:#}"),
     };
+    let apps: Vec<Arc<App>> = p.all().into_iter().filter(|a| instance.is_empty() || a.profile_id == instance).collect();
+    if apps.is_empty() {
+        return format!("sync: {instance} isn't a group here; nothing to do");
+    }
+    apps.iter().map(|a| sync_one(a)).collect::<Vec<_>>().join("; ")
+}
+
+fn sync_one(app: &Arc<App>) -> String {
+    let app = app.clone();
     if !active(&app) {
         return "sync: not an active member; nothing to do".into();
     }
     tauri::async_runtime::block_on(async {
         match feed::sync_once(&app).await {
             Ok(r) => {
-                if let Some(h) = app.handle.get() {
-                    use tauri::Emitter;
-                    let _ = h.emit("synced", &r);
+                if let Some(h) = crate::state::handle() {
+                    profiles::emit(h, &app, "synced", &r);
                 }
                 format!("sync: {} new events, {} new messages", r.new_events, r.new_dms)
             }
@@ -249,7 +281,7 @@ pub fn background_sync(dir: PathBuf) -> String {
                 match manage::check_standing(&app).await {
                     Ok(Some(status)) => {
                         crate::alerts::removed(&app, &status);
-                        let _ = android::push_unregister();
+                        let _ = android::push_unregister(&app.profile_id);
                         update_periodic(&app);
                         format!("sync: this device is {status}")
                     }
@@ -264,15 +296,17 @@ pub fn background_sync(dir: PathBuf) -> String {
 
 /// Kotlin's lifecycle observer: the app came to the front, or left it.
 pub fn foreground_changed(visible: bool) {
-    let Some(app) = state::current() else { return };
-    if visible {
-        app.wake.notify_one();
-        app.push_wake.notify_one();
-        // The person may have installed ntfy or changed its server meanwhile.
-        setup(&app);
-    } else {
-        // Close the socket so the relay starts sending wake-ups.
-        app.push_pause.notify_one();
+    let Some(p) = profiles::current() else { return };
+    for app in p.all() {
+        if visible {
+            app.wake.notify_one();
+            app.push_wake.notify_one();
+            // The person may have installed ntfy or changed its server meanwhile.
+            setup(&app);
+        } else {
+            // Close the socket so the relay starts sending wake-ups.
+            app.push_pause.notify_one();
+        }
     }
 }
 

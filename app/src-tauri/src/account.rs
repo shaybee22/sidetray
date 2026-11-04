@@ -28,12 +28,6 @@ pub fn codes_match(a: &str, b: &str) -> bool {
     !n(a).is_empty() && n(a) == n(b)
 }
 
-fn random_id() -> String {
-    let mut b = [0u8; 12];
-    getrandom::getrandom(&mut b).expect("OS random number generator");
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 // --- wizard ------------------------------------------------------------------
 
 /// Whether a group of exactly this name (ignoring case) exists on the server.
@@ -89,7 +83,8 @@ pub async fn register(app: &App, r: Registration<'_>) -> Result<String> {
         )
         .await?;
     let id = Identity {
-        local_id: random_id(),
+        // The profile's folder is named after it (SPEC.md Phase 8).
+        local_id: app.profile_id.clone(),
         server_url: server,
         ca_pem,
         group_id: resp.group_id,
@@ -276,27 +271,6 @@ pub async fn confirm_approval(app: &App, heard: &str) -> Result<()> {
     if let Err(e) = refresh_roster(app, &id, &api).await {
         eprintln!("roster refresh after joining failed: {e:#}");
     }
-    Ok(())
-}
-
-/// Start over after a denied or abandoned join, or after being removed (this
-/// deletes the saved posts and photos too). Refuses while the device is active.
-pub fn reset(app: &App) -> Result<()> {
-    let conn = app.db();
-    if let Some(id) = db::identity(&conn)? {
-        if id.status == "active" {
-            bail!("this device is a member of {}; it can't be reset from here", id.group_name);
-        }
-        secrets::delete(&conn, &id.local_id)?;
-    }
-    db::wipe(&conn)?;
-    drop(conn);
-    if let Ok(dir) = std::fs::read_dir(&app.media_dir) {
-        for f in dir.flatten() {
-            let _ = std::fs::remove_file(f.path());
-        }
-    }
-    app.set_secrets(None);
     Ok(())
 }
 

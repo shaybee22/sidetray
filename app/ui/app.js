@@ -133,13 +133,17 @@ async function boot() {
 
 function route() {
   clearInterval(pollTimer);
+  closeGroupMenu();
+  // Another group to go to: the waiting and removed screens offer the menu.
+  $("#wt-groups").hidden = $("#rm-groups").hidden = !view.other_groups;
   switch (view.stage) {
     case "setup": return startWizard();
     case "pending":
     case "denied": return startWaiting();
     case "active": return startMain();
     case "removed":
-    case "revoked": return startRemoved();
+    case "revoked":
+    case "left": return startRemoved();
     default: $("#screen-loading p").textContent = `Unexpected state: ${view.stage}`;
   }
 }
@@ -159,6 +163,12 @@ function startWizard(invite) {
   wizardStep("wz-server");
   for (const e of ["#wz-server-err", "#wz-trust-err", "#wz-details-err"]) hideError($(e));
   $("#wz-invite-note").hidden = !invite;
+  // Joining another group: it can go back to the one shown before.
+  $("#wz-another-note").hidden = !view.previous;
+  $("#wz-cancel").hidden = !view.previous;
+  if (!invite && view.previous) {
+    for (const f of ["#wz-url", "#wz-group", "#wz-ca", "#wz-name", "#wz-email", "#wz-token"]) $(f).value = "";
+  }
   if (invite) {
     // From a link: filled in and checked straight away; they type name and email.
     $("#wz-url").value = invite.server;
@@ -275,12 +285,16 @@ async function handleInvite() {
   if (msg.error) {
     return notice("That invite link can't be used", `${msg.error}.`);
   }
-  if (!view || view.stage !== "setup") {
-    const what = view && view.stage === "active" ? "a member of" : "set up for";
-    return notice("Side Tray is already set up",
-      `This app is already ${what} “${view ? view.group_name : ""}”. For now one installation joins one group, so the invite to “${msg.invite.group}” can't be used here.`);
+  if (!view || view.stage === "setup") return startWizard(msg.invite);
+  // Already in that group: show it. Otherwise join it as another group.
+  const same = (a, b) => (a || "").replace(/\/+$/, "").toLowerCase() === (b || "").replace(/\/+$/, "").toLowerCase();
+  const had = (await listGroups()).find((g) => g.group_name && same(g.server, msg.invite.server)
+    && g.group_name.toLowerCase() === msg.invite.group.trim().toLowerCase());
+  if (had) {
+    if (!had.active) await switchGroup(had.id);
+    return;
   }
-  startWizard(msg.invite);
+  joinAnother(msg.invite);
 }
 
 listen("invite", handleInvite);
@@ -540,14 +554,7 @@ $("#wt-form").addEventListener("submit", async (ev) => {
 });
 
 async function startOver() {
-  clearInterval(pollTimer);
-  try {
-    await invoke("reset");
-  } catch (e) {
-    return showError($("#wt-poll-err"), e);
-  }
-  view = await invoke("get_state");
-  route();
+  return deleteProfile($("#wt-poll-err"));
 }
 
 $("#wt-restart").addEventListener("click", startOver);
@@ -583,6 +590,7 @@ function startMain() {
   renderDmBadge();
   loadFeed().then(markReadIfViewed).then(checkOpen);
   refreshPush();
+  renderGroupDots();
 }
 
 function selectTab(name) {
@@ -594,7 +602,7 @@ function selectTab(name) {
     loadPending();
     pendingTimer = setInterval(loadPending, 10000);
   }
-  if (name === "device") { renderDevice(); loadSettings(); loadProfile(); refreshPush(); }
+  if (name === "device") { renderDevice(); renderLeave(); loadSettings(); loadProfile(); refreshPush(); }
   if (name === "members") loadMembers();
   if (name === "feed") loadFeed().then(markReadIfViewed);
   if (name === "messages") showMessages();
@@ -649,6 +657,12 @@ listen("open-item", (ev) => openItem(ev.payload));
 
 async function openItem(t) {
   if (t.kind === "update") return; // the window is up; the banner says the rest
+  // About another group: show that one first.
+  if (t.group && view && t.group !== view.profile) {
+    if (!(await letGoOfDrafts())) return;
+    try { await invoke("switch_group", { id: t.group }); } catch (e) { return console.warn("switch_group", e); }
+    await reloadView();
+  }
   if (!view || view.stage !== "active") return;
   if (t.kind === "joins" && view.keymaster) return selectTab("km");
   if (t.kind === "dm") { chatWith = t.member_id; return selectTab("messages"); }
@@ -1656,6 +1670,214 @@ function notice(title, body) {
   return askConfirm({ title, body, ok: "OK", cancel: false });
 }
 
+// --- groups (SPEC.md Phase 8) ----------------------------------------------------------------
+// One profile per group. The group name in the header (and a button on the
+// waiting and removed screens) opens a menu: every group, a dot on the ones
+// with something new, and "Join another group".
+
+let menuAnchor = null;
+
+function stageNote(g) {
+  switch (g.stage) {
+    case "pending": return "waiting for approval";
+    case "denied": return "request turned down";
+    case "removed": return "removed: saved posts only";
+    case "revoked": return "disconnected: saved posts only";
+    case "left": return "left: saved posts only";
+    default: return "";
+  }
+}
+
+async function listGroups() {
+  try { return await invoke("list_groups"); } catch (e) { console.warn("list_groups", e); return []; }
+}
+
+/** The dots on the menu buttons: something new in a group that isn't shown. */
+async function renderGroupDots() {
+  if (!view) return;
+  const groups = await listGroups();
+  const elsewhere = groups.some((g) => !g.active && g.unread);
+  $("#tb-group-dot").hidden = !elsewhere;
+  for (const b of [$("#wt-groups"), $("#rm-groups")]) b.querySelector(".dot").hidden = !elsewhere;
+  if (!$("#group-menu").hidden) fillGroupMenu(groups);
+}
+
+function fillGroupMenu(groups) {
+  const menu = $("#group-menu");
+  const items = [];
+  for (const g of groups) {
+    if (!g.group_name) continue; // the wizard's empty profile
+    const b = document.createElement("button");
+    b.setAttribute("role", "menuitemradio");
+    b.setAttribute("aria-checked", String(g.active));
+    const tick = document.createElement("span");
+    tick.className = "tick";
+    tick.textContent = g.active ? "✓" : "";
+    const name = document.createElement("span");
+    name.className = "g-name";
+    name.textContent = g.group_name;
+    const note = stageNote(g);
+    if (note) { const s = document.createElement("small"); s.textContent = note; name.append(s); }
+    b.append(tick, name);
+    if (g.unread && !g.active) {
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      dot.title = "Something new";
+      b.append(dot);
+    }
+    b.addEventListener("click", () => { closeGroupMenu(); if (!g.active) switchGroup(g.id); });
+    items.push(b);
+  }
+  const join = document.createElement("button");
+  join.setAttribute("role", "menuitem");
+  const plus = document.createElement("span");
+  plus.className = "tick";
+  plus.textContent = "+";
+  const label = document.createElement("span");
+  label.className = "g-name";
+  label.textContent = "Join another group";
+  join.append(plus, label);
+  join.addEventListener("click", () => { closeGroupMenu(); joinAnother(); });
+  menu.replaceChildren(...items, ...(items.length ? [document.createElement("hr")] : []), join);
+}
+
+async function openGroupMenu(anchor) {
+  const menu = $("#group-menu");
+  if (!menu.hidden && menuAnchor === anchor) return closeGroupMenu();
+  closeGroupMenu();
+  fillGroupMenu(await listGroups());
+  menuAnchor = anchor;
+  anchor.setAttribute("aria-expanded", "true");
+  menu.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  const w = menu.offsetWidth;
+  menu.style.top = `${Math.round(r.bottom + 6)}px`;
+  menu.style.left = `${Math.round(Math.max(12, Math.min(r.left, window.innerWidth - w - 12)))}px`;
+  (menu.querySelector("[aria-checked=true]") || menu.querySelector("button"))?.focus();
+}
+
+function closeGroupMenu() {
+  $("#group-menu").hidden = true;
+  if (menuAnchor) menuAnchor.setAttribute("aria-expanded", "false");
+  menuAnchor = null;
+}
+
+for (const b of [$("#tb-group-btn"), $("#wt-groups"), $("#rm-groups")]) {
+  b.addEventListener("click", (ev) => { ev.stopPropagation(); openGroupMenu(b); });
+}
+document.addEventListener("click", (ev) => { if (!$("#group-menu").contains(ev.target)) closeGroupMenu(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !$("#group-menu").hidden) { closeGroupMenu(); ev.stopPropagation(); } });
+window.addEventListener("resize", closeGroupMenu);
+listen("groups-changed", renderGroupDots);
+
+/** Unsent words or photos belong to the group shown: ask, then let them go. */
+async function letGoOfDrafts() {
+  const what = view && view.stage === "active" ? unsentWork() : [];
+  if (what.length) {
+    const yes = await askConfirm({
+      title: "Discard what you haven't sent?",
+      body: `You have an unsent ${what.join(" and ")} here. Switching groups throws it away.`,
+      ok: "Discard and switch",
+      danger: true,
+    });
+    if (!yes) return false;
+  }
+  $("#cp-text").value = "";
+  postTray.clear();
+  dmTray.clear();
+  $("#dm-text").value = "";
+  for (const t of commentTrays.values()) t.clear();
+  commentTrays.clear();
+  restoredCommentText = {};
+  chatWith = null;
+  draftFor = null;
+  if (mobile) saveDrafts();
+  return true;
+}
+
+/** Show what the app now has active, as at start, on the feed. */
+async function reloadView() {
+  clearInterval(pendingTimer);
+  view = await invoke("get_state");
+  route();
+  if (view.stage === "active") selectTab("feed");
+  renderGroupDots();
+}
+
+async function switchGroup(id) {
+  if (!(await letGoOfDrafts())) return;
+  try {
+    await invoke("switch_group", { id });
+  } catch (e) {
+    return notice("Couldn't switch groups", String(e));
+  }
+  await reloadView();
+}
+
+/** "Join another group", or an invite link while the app is in a group: the wizard, in a new profile. */
+async function joinAnother(invite) {
+  if (!(await letGoOfDrafts())) return;
+  try {
+    await invoke("start_join");
+  } catch (e) {
+    return notice("Couldn't start joining another group", String(e));
+  }
+  clearInterval(pendingTimer);
+  view = await invoke("get_state");
+  startWizard(invite);
+}
+
+$("#wz-cancel").addEventListener("click", async () => {
+  try {
+    await invoke("leave_group"); // the empty profile; back to the group shown before
+  } catch (e) {
+    return showError($("#wz-server-err"), e);
+  }
+  await reloadView();
+});
+
+function renderLeave() {
+  const name = view.group_name || "this group";
+  $("#leave-text").textContent = view.keymaster
+    ? `Everyone in ${name} keeps what you posted. This device deletes everything it saved from ${name}, and your other devices in it are disconnected too. To come back you'd ask to join again. If you're the only Key Master, promote someone first.`
+    : `Everyone in ${name} keeps what you posted. This device deletes everything it saved from ${name}, and your other devices in it are disconnected too. To come back you'd ask to join again.`;
+  hideError($("#leave-err"));
+}
+
+$("#leave-btn").addEventListener("click", async () => {
+  const name = view.group_name;
+  const yes = await askConfirm({
+    title: `Leave ${name}?`,
+    body: `Everyone keeps what you posted. This device deletes all the posts, photos and messages it saved from ${name}, and your other devices in ${name} are disconnected. It can't be undone: to come back you'd ask a Key Master to let you in again.`,
+    ok: `Leave ${name}`,
+    danger: true,
+  });
+  if (!yes) return;
+  await busy($("#leave-btn"), async () => {
+    $("#leave-btn").textContent = "Leaving…";
+    try {
+      if (!(await letGoOfDrafts())) return;
+      await invoke("leave_group");
+    } catch (e) {
+      $("#leave-btn").textContent = "Leave this group";
+      return showError($("#leave-err"), e);
+    }
+    $("#leave-btn").textContent = "Leave this group";
+    await reloadView();
+  });
+});
+
+/** Delete a profile that's no longer in its group (denied, cancelled, removed): back to another group or the wizard. */
+async function deleteProfile(errEl) {
+  clearInterval(pollTimer);
+  try {
+    await invoke("leave_group");
+  } catch (e) {
+    return showError(errEl, e);
+  }
+  await reloadView();
+}
+
 // --- members ---------------------------------------------------------------------------------
 
 function lastSeen(ts) {
@@ -1871,9 +2093,13 @@ $("#missed-dismiss").addEventListener("click", async () => {
 function startRemoved() {
   showScreen("screen-removed");
   $("#rm-group").textContent = view.group_name || "";
+  $("#rm-restart").textContent = view.other_groups ? "Delete these saved posts" : "Delete them and join a group again";
   if (view.stage === "removed") {
     $("#rm-title").textContent = "You've been removed from this group";
     $("#rm-body").textContent = `A Key Master removed you from ${view.group_name}. This app has stopped syncing and can't read anything posted from now on.`;
+  } else if (view.stage === "left") {
+    $("#rm-title").textContent = "You left this group";
+    $("#rm-body").textContent = `You left ${view.group_name} on another of your devices. This app has stopped syncing and can't read anything posted from now on.`;
   } else {
     $("#rm-title").textContent = "This device was disconnected";
     $("#rm-body").textContent = `A Key Master revoked this device's access to ${view.group_name}, for example because it was reported lost. It has stopped syncing. If that's a mistake, ask a Key Master: you can join again as a new device.`;
@@ -1886,7 +2112,7 @@ $("#rm-archive").addEventListener("click", async () => {
   $("#screen-main").classList.add("readonly");
   $("#tb-group").textContent = view.group_name;
   $("#readonly-banner").hidden = false;
-  $("#readonly-text").textContent = view.stage === "removed"
+  $("#readonly-text").textContent = view.stage === "removed" || view.stage === "left"
     ? `Saved posts from ${view.group_name}. You're no longer in this group, so this is read only.`
     : `Saved posts from ${view.group_name}. This device was disconnected, so this is read only.`;
   for (const p of $$(".panel")) p.hidden = p.id !== "panel-feed";
@@ -1907,18 +2133,14 @@ $("#readonly-switch").addEventListener("click", () => {
 $("#rm-restart").addEventListener("click", async () => {
   const yes = await askConfirm({
     title: "Delete the saved posts?",
-    body: `This deletes everything this app saved from ${view.group_name}, photos included, and starts the setup again so you can ask to join a group. It can't be undone.`,
-    ok: "Delete and start over",
+    body: view.other_groups
+      ? `This deletes everything this app saved from ${view.group_name}, photos included, and removes it from your groups. It can't be undone.`
+      : `This deletes everything this app saved from ${view.group_name}, photos included, and starts the setup again so you can ask to join a group. It can't be undone.`,
+    ok: view.other_groups ? "Delete" : "Delete and start over",
     danger: true,
   });
   if (!yes) return;
-  try {
-    await invoke("reset");
-  } catch (e) {
-    return showError($("#rm-err"), e);
-  }
-  view = await invoke("get_state");
-  route();
+  await deleteProfile($("#rm-err"));
 });
 
 // --- this device ---------------------------------------------------------------------------

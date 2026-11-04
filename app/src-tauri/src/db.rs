@@ -288,18 +288,6 @@ pub fn set_ca_pem(conn: &Connection, pem: &str) -> Result<()> {
     Ok(())
 }
 
-/// Forget everything (used to start over after a denied or abandoned join).
-pub fn wipe(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "DELETE FROM identity; DELETE FROM group_keys; DELETE FROM secrets; DELETE FROM anchors;
-         DELETE FROM members; DELETE FROM member_devices; DELETE FROM posts; DELETE FROM comments;
-         DELETE FROM reactions; DELETE FROM media; DELETE FROM profiles;
-         DELETE FROM conversations; DELETE FROM dm_messages; DELETE FROM dm_photos; DELETE FROM kv;
-         UPDATE sync_state SET last_seq = 0, last_sync_at = NULL, rejected = 0, unread = 0, missed_at = NULL, missed_days = NULL, dm_last_seq = 0;",
-    )?;
-    Ok(())
-}
-
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn kv_get(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get(0)).optional()?)

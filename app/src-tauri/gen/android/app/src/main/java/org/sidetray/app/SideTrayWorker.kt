@@ -34,10 +34,11 @@ class SideTrayWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, param
       SideTrayAndroid.ensureNative(ctx)
       val dir = ctx.dataDir.absolutePath
       val kind = inputData.getString(KIND)
+      val instance = inputData.getString(INSTANCE) ?: ""
       val out = if (kind != null) {
-        SideTrayAndroid.nativePush(dir, kind, inputData.getString(VALUE) ?: "")
+        SideTrayAndroid.nativePush(dir, kind, inputData.getString(VALUE) ?: "", instance)
       } else {
-        SideTrayAndroid.nativeSync(dir)
+        SideTrayAndroid.nativeSync(dir, instance)
       }
       Log.i(SideTrayAndroid.TAG, out)
       Result.success()
@@ -55,23 +56,25 @@ class SideTrayWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, param
   companion object {
     private const val KIND = "push_kind"
     private const val VALUE = "push_value"
+    private const val INSTANCE = "push_instance"
     private const val SYNC_NOTIFICATION = 7301
     private val online = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
 
-    /** A wake-up arrived: sync now. Another one during a sync queues one more after it. */
-    fun syncNow(ctx: Context) {
+    /** A wake-up arrived for `instance`'s group: sync it now. Another one during a sync queues one more after it. */
+    fun syncNow(ctx: Context, instance: String) {
       val req = OneTimeWorkRequestBuilder<SideTrayWorker>()
         .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
         .setConstraints(online)
+        .setInputData(Data.Builder().putString(INSTANCE, instance).build())
         .build()
       WorkManager.getInstance(ctx).enqueueUniqueWork("sync-now", ExistingWorkPolicy.APPEND_OR_REPLACE, req)
     }
 
     /** The distributor's news, for Rust to pass on to the relay. */
-    fun pushEvent(ctx: Context, kind: String, value: String) {
+    fun pushEvent(ctx: Context, kind: String, value: String, instance: String) {
       val req = OneTimeWorkRequestBuilder<SideTrayWorker>()
         .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-        .setInputData(Data.Builder().putString(KIND, kind).putString(VALUE, value).build())
+        .setInputData(Data.Builder().putString(KIND, kind).putString(VALUE, value).putString(INSTANCE, instance).build())
         .build()
       WorkManager.getInstance(ctx).enqueueUniqueWork("push-event", ExistingWorkPolicy.APPEND_OR_REPLACE, req)
     }
