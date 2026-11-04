@@ -1617,7 +1617,7 @@ def leave_group(dev: Device = Depends(current_device)):
                 (dev.group_id, dev.member_id),
             ).fetchone()[0]
             if not other_kms:
-                raise HTTPException(409, "you're the group's only Key Master: promote someone to Key Master first")
+                raise HTTPException(409, "You’re the only Key Master. Promote someone else before leaving.")
         devices = [r["id"] for r in conn.execute(
             "SELECT id FROM devices WHERE member_id = ? AND status IN ('active', 'pending')", (dev.member_id,))]
         conn.execute("UPDATE members SET status = 'removed' WHERE id = ?", (dev.member_id,))

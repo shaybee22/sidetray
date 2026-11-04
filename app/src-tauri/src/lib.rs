@@ -407,6 +407,9 @@ fn start_join(handle: AppHandle, profiles: State<'_, Arc<Profiles>>) -> Res<()> 
     Ok(())
 }
 
+/// What the app shows when the relay refuses /leave (409).
+const ONLY_KEYMASTER: &str = "You’re the only Key Master. Promote someone else before leaving.";
+
 /// Leave the group shown (SPEC.md Phase 8, "Leaving a group"): tell the relay
 /// if this device is still in it, then delete everything this app saved from
 /// it. Also how a denied, cancelled, removed or abandoned profile is deleted.
@@ -416,7 +419,16 @@ async fn leave_group(handle: AppHandle, app: Active, profiles: State<'_, Arc<Pro
     if let Some(id) = &id {
         if id.status == "active" {
             let api = app.api(id).map_err(err)?;
-            let _: serde_json::Value = api.post("/leave", &serde_json::json!({})).await.map_err(err)?;
+            app.set_leaving(true);
+            let left: anyhow::Result<serde_json::Value> = api.post("/leave", &serde_json::json!({})).await;
+            if let Err(e) = left {
+                app.set_leaving(false);
+                // 409 is the relay's only refusal here: the last Key Master with others still in the group.
+                if api::is_status(&e, 409) {
+                    return Err(ONLY_KEYMASTER.into());
+                }
+                return Err(err(e));
+            }
         }
     }
     #[cfg(target_os = "android")]
@@ -582,6 +594,9 @@ fn dismiss_missed(app: Active) -> Res<()> {
 /// it was removed, that's recorded (syncing stops; the archive stays), and the
 /// UI and a notification say so.
 pub async fn removed_check(handle: &AppHandle, app: &App) {
+    if app.is_leaving() {
+        return;
+    }
     match manage::check_standing(app).await {
         Ok(Some(status)) => {
             alerts::removed(app, &status);

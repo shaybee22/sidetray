@@ -61,6 +61,9 @@ pub struct App {
     pub cert_problem: Mutex<Option<String>>,
     /// Set when the profile is being deleted (left the group): its loops stop.
     closed: AtomicBool,
+    /// This device is leaving the group itself: the relay's "left" push that
+    /// follows isn't news here.
+    leaving: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -104,11 +107,21 @@ impl App {
             repin: Mutex::new(None),
             cert_problem: Mutex::new(None),
             closed: AtomicBool::new(false),
+            leaving: AtomicBool::new(false),
         })
     }
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    pub fn set_leaving(&self, on: bool) {
+        self.leaving.store(on, Ordering::SeqCst);
+    }
+
+    /// Leaving the group from this device, or already deleted.
+    pub fn is_leaving(&self) -> bool {
+        self.leaving.load(Ordering::SeqCst) || self.is_closed()
     }
 
     /// Stop this profile's loops and close its database file (an empty

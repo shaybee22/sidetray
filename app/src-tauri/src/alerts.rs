@@ -156,7 +156,14 @@ fn new_join_requests(app: &App, pending: &[(String, String)]) -> Vec<String> {
 
 /// The relay says this device was removed or revoked (`status`): tell the person.
 pub fn removed(app: &App, status: &str) {
-    let group = app.identity().ok().flatten().map(|i| i.group_name).unwrap_or_default();
+    // Left from this device: the person knows, and the profile is going away
+    // (its name may already be gone).
+    if app.is_leaving() {
+        return;
+    }
+    let Some(group) = app.identity().ok().flatten().map(|i| i.group_name).filter(|g| !g.is_empty()) else {
+        return;
+    };
     let (title, body) = match status {
         "removed" => (format!("You've been removed from {group}"), "Posts already on this device are kept."),
         "left" => (format!("You left {group}"), "You left on another device. Posts already on this one are kept."),
@@ -215,15 +222,24 @@ pub fn show(handle: &AppHandle, title: &str, body: &str, target: Target) {
 }
 
 /// A notification about the profile `group` (None: the app itself, like an update).
+/// About a group that isn't the one shown, the banner stays up longer (about
+/// 25 seconds instead of 5): it's the only sign of news there besides a dot.
 #[cfg(windows)]
 pub fn show_in(handle: &AppHandle, title: &str, body: &str, target: Target, group: Option<String>) {
-    use tauri_winrt_notification::{Sound, Toast};
+    use tauri_winrt_notification::{Duration, Sound, Toast};
+    let background = group
+        .as_deref()
+        .is_some_and(|g| crate::profiles::current().is_some_and(|p| p.active_id() != g));
     let target = target_json(&target, group.as_deref());
     let aumid = handle.config().identifier.clone();
     let (title, body, h) = (title.to_string(), body.to_string(), handle.clone());
     // WinRT calls block briefly; keep them off the async runtime.
     std::thread::spawn(move || {
-        let toast = Toast::new(&aumid).title(&title).text1(&body).sound(Some(Sound::Default)).on_activated(move |_| {
+        let mut toast = Toast::new(&aumid).title(&title).text1(&body).sound(Some(Sound::Default));
+        if background {
+            toast = toast.duration(Duration::Long);
+        }
+        let toast = toast.on_activated(move |_| {
             open(&h, &target);
             Ok(())
         });

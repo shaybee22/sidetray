@@ -107,7 +107,7 @@ class LeaveTest(unittest.TestCase):
     def test_the_only_key_master_must_promote_someone_first(self):
         r = self.leave(self.km)
         self.assertEqual(r.status_code, 409)
-        self.assertIn("promote", r.json()["detail"])
+        self.assertIn("Promote someone else", r.json()["detail"])
         self.assertEqual(self.post(self.km).status_code, 201)
         self.assertFalse(self.rotation_pending())
 
