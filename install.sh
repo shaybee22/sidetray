@@ -26,6 +26,8 @@
 #   --domain NAME --email ADDRESS   production mode
 #   --ip ADDRESS                    test mode
 #   --retention DAYS                how long the relay keeps undelivered posts (default 90)
+#   --history DAYS                  keep delivered posts this long for people who join later
+#                                   (default 14; 0 deletes them once every device has them)
 #   --push / --no-push              run your own push server for Android (ntfy), or not
 #   --new-group                     also issue a fresh setup token for another group
 #   --yes                           don't ask; keep existing settings, take defaults
@@ -41,13 +43,14 @@ die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
-DOMAIN="" EMAIL="" IP="" RETENTION="" NEW_GROUP=0 YES=0 MODE="" PUSH=""
+DOMAIN="" EMAIL="" IP="" RETENTION="" HISTORY="" NEW_GROUP=0 YES=0 MODE="" PUSH=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN=${2:?--domain needs a name}; MODE=production; shift 2 ;;
     --email) EMAIL=${2:?--email needs an address}; shift 2 ;;
     --ip) IP=${2:?--ip needs an address}; MODE=test; shift 2 ;;
     --retention) RETENTION=${2:?--retention needs a number of days}; shift 2 ;;
+    --history) HISTORY=${2:?--history needs a number of days}; shift 2 ;;
     --new-group) NEW_GROUP=1; shift ;;
     --push) PUSH=yes; shift ;;
     --no-push) PUSH=no; shift ;;
@@ -91,12 +94,14 @@ valid_ipv4() {
 valid_domain() { [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$ ]]; }
 valid_email() { [[ $1 =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
 valid_days() { [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 3650 ]; }
+valid_history() { [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -le 3650 ]; }
 
 DOMAIN=$(printf '%s' "$DOMAIN" | tr 'A-Z' 'a-z')
 [ -z "$DOMAIN" ] || valid_domain "$DOMAIN" || die "--domain: \"$DOMAIN\" isn't a domain name (like tray.example.org)"
 [ -z "$EMAIL" ] || valid_email "$EMAIL" || die "--email: \"$EMAIL\" doesn't look like an email address"
 [ -z "$IP" ] || valid_ipv4 "$IP" || die "--ip: \"$IP\" isn't an IPv4 address"
 [ -z "$RETENTION" ] || valid_days "$RETENTION" || die "--retention must be a whole number of days from 1 to 3650"
+[ -z "$HISTORY" ] || valid_history "$HISTORY" || die "--history must be a whole number of days from 0 to 3650"
 
 # env_get KEY: the value in $DIR/.env, or empty.
 env_get() {
@@ -139,6 +144,7 @@ OLD_HOST=$(env_get SIDETRAY_HOST)
 OLD_MODE=$(env_get SIDETRAY_MODE)
 OLD_EMAIL=$(env_get SIDETRAY_ACME_EMAIL)
 OLD_RETENTION=$(env_get SIDETRAY_RETENTION_DAYS)
+OLD_HISTORY=$(env_get SIDETRAY_HISTORY_DAYS)
 OLD_PUSH=$(env_get SIDETRAY_PUSH)
 NTFY_PORT=$(env_get SIDETRAY_NTFY_PORT); NTFY_PORT=${NTFY_PORT:-8443}
 if [ -n "$OLD_HOST" ] && [ -z "$OLD_MODE" ]; then
@@ -153,6 +159,7 @@ if [ -n "$OLD_HOST" ] && [ -z "$MODE" ]; then
   say "  address:   https://$OLD_HOST ($OLD_MODE mode)"
   [ "$OLD_MODE" = production ] && say "  email:     ${OLD_EMAIL:-none}"
   say "  retention: ${OLD_RETENTION:-90} days"
+  say "  history:   ${OLD_HISTORY:-14} days kept for people who join later"
   say "  own push server: ${OLD_PUSH:-not set up} (otherwise Android phones use ntfy.sh)"
   if yes_no "Keep these settings?" y; then KEEP=1; fi
 fi
@@ -161,6 +168,7 @@ if [ "$KEEP" = 1 ]; then
   MODE=$OLD_MODE
   if [ "$MODE" = production ]; then DOMAIN=$OLD_HOST; EMAIL=${EMAIL:-$OLD_EMAIL}; else IP=$OLD_HOST; fi
   RETENTION=${RETENTION:-${OLD_RETENTION:-90}}
+  HISTORY=${HISTORY:-${OLD_HISTORY:-14}}
 else
   if [ -z "$MODE" ]; then
     say ""
@@ -197,6 +205,10 @@ else
     [ -n "$RETENTION" ] && say "Enter a whole number of days from 1 to 3650."
     ask RETENTION "Days to keep posts that not every device has fetched yet" "${OLD_RETENTION:-90}"
   done
+  while [ -z "$HISTORY" ] || ! valid_history "$HISTORY"; do
+    [ -n "$HISTORY" ] && say "Enter a whole number of days from 0 to 3650."
+    ask HISTORY "Days of recent posts to keep for people who join later (0 = none)" "${OLD_HISTORY:-14}"
+  done
 fi
 # Push server: a flag decides; otherwise keep what .env says; otherwise ask
 # (default no). With --yes and nothing decided yet, it stays off.
@@ -218,6 +230,7 @@ fi
 case "$PUSH" in yes|no) ;; *) PUSH=no ;; esac
 
 valid_days "$RETENTION" || die "--retention must be a whole number of days from 1 to 3650"
+valid_history "$HISTORY" || die "--history must be a whole number of days from 0 to 3650"
 if [ "$MODE" = production ]; then
   valid_domain "$DOMAIN" || die "\"$DOMAIN\" isn't a domain name"
   valid_email "$EMAIL" || die "production mode needs an email address for Let's Encrypt (--email)"
@@ -470,6 +483,10 @@ SIDETRAY_ACME_EMAIL=$EMAIL
 # Days to keep events and photos that not every device has fetched yet.
 # Anything every active device has acked is deleted sooner, by the hourly prune job.
 SIDETRAY_RETENTION_DAYS=$RETENTION
+# Days of recent posts and photos kept even after every device has them, so
+# people who join later see them (0 = delete as soon as everyone has them).
+# The retention window above still applies.
+SIDETRAY_HISTORY_DAYS=$HISTORY
 # Optional: a secret that lets the first device create the server's first group.
 # install.sh leaves it empty and issues a one-time token instead
 # (sudo sidetray-admin new-group).
@@ -483,6 +500,7 @@ else
   env_set SIDETRAY_HOST "$HOST"
   env_set SIDETRAY_ACME_EMAIL "$EMAIL"
   env_set SIDETRAY_RETENTION_DAYS "$RETENTION"
+  env_set SIDETRAY_HISTORY_DAYS "$HISTORY"
   push_env
   chmod 600 "$DIR/.env"
   say "  kept .env (setup token and other settings untouched)"
@@ -596,6 +614,7 @@ else
   say "                 The app shows this fingerprint when someone first connects; it must match."
 fi
 say "Retention:       $RETENTION days"
+say "History:         $HISTORY days of recent posts kept for people who join later"
 if [ "$PUSH" = yes ]; then
   say "Push server:     $NTFY_URL (your own ntfy; Android phones set it as the ntfy app's default server)"
   if [ "$MODE" = test ] && command -v openssl >/dev/null; then

@@ -12,7 +12,8 @@ native notifications. Devices join with their public keys, compare safety codes
 with a Key Master by phone, and receive the group key sealed to them and signed by
 the approving Key Master. Key Masters manage members from the app: promote,
 remove, or revoke a lost device, after which their app rotates the group key
-for everyone left. The relay prunes what every device has fetched, and anything
+for everyone left. The relay prunes what every device has fetched once it's
+two weeks old (so people who join later see the recent feed), and anything
 past 90 days. The dev CLI (`cli/`) speaks the same formats. A server can host
 several groups that can't see or find each other, `install.sh` sets one up on
 a fresh Debian or Ubuntu machine, and the relay enforces rate limits (see
@@ -216,7 +217,7 @@ Caddyfile changed, re-running the installer restarts Caddy so it takes effect.
 
 For unattended runs, every question has a flag:
 `--domain tray.example.org --email you@example.org` or `--ip 10.1.1.188`,
-`--retention 90`, `--push` or `--no-push`, `--yes` (keep existing settings), and
+`--retention 90`, `--history 14`, `--push` or `--no-push`, `--yes` (keep existing settings), and
 `--new-group` (also print a token for another group). Piped from a release, `curl -fsSL <url>/install.sh |
 sudo SIDETRAY_SOURCE_URL=<release tarball> bash` works the same way.
 
@@ -503,7 +504,9 @@ proxies the upgrade with no extra configuration.
   pending flag makes the next Key Master sync finish the job.
 - **Stale keys are refused.** After a rotation, `POST /events` with an older
   `key_version` gets `409`; the app and CLI fetch the new key and retry once.
-  Approvals must include the current version.
+  Approvals must include the current version, and every older version that
+  events still on the relay use (as far as the approving Key Master's device
+  has it), so a new device can read the history it's given; otherwise `409`.
 - **Removed people's earlier posts.** `GET /members` lists revoked devices under
   `former`, with `revoked_seq`, the last event seq before they were cut off.
   Clients verify their certificates as usual and accept their events only up
@@ -513,8 +516,10 @@ proxies the upgrade with no extra configuration.
   unverified for some devices, so the removing Key Master's app first re-signs
   certificates for devices it verified just before.
 - **Pruning** runs hourly in the relay: it deletes events (and their media)
-  that every active device has acked, and anything older than
-  `SIDETRAY_RETENTION_DAYS`. Revoked devices and removed members don't hold
+  that every active device has acked once they're older than
+  `SIDETRAY_HISTORY_DAYS` (default 14; 0 = right away), so people who join
+  later still get the recent feed, and anything older than
+  `SIDETRAY_RETENTION_DAYS` whatever the acks say. Revoked devices and removed members don't hold
   anything back; a device that has never acked holds everything back.
   Uploads no event or message refers to go after a day. Direct messages
   count only their own devices: one goes (with its photos) once every

@@ -13,8 +13,9 @@ list-groups           Groups on this server with member, device, event and DM
                       only: the API never lists groups.
 setup-status          One line for scripts: groups=N tokens=N env_token=yes|no
 prune                 Run the prune job now (it also runs every hour): delete
-                      events, direct messages and media every device they're
-                      for has acked, and anything older than
+                      events and media every device has acked once past
+                      SIDETRAY_HISTORY_DAYS, direct messages every device
+                      they're for has acked, and anything older than
                       SIDETRAY_RETENTION_DAYS. Prints what it deleted as JSON.
 """
 

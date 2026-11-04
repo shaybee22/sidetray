@@ -70,9 +70,12 @@ KEY_LEN = 32
 MAX_SOCKETS_PER_DEVICE = 4
 WS_IDLE_SECONDS = float(os.environ.get("SIDETRAY_WS_IDLE_SECONDS", 75))
 WS_QUEUE = 256
-# Pruning: events and media go once every active device has acked them, or
-# after the retention window whatever the acks say.
+# Pruning: events and media go once every active device has acked them and
+# they're older than the history window (so people who join later still see
+# the recent feed), or after the retention window whatever the acks say.
+# SIDETRAY_HISTORY_DAYS=0 prunes acked events right away.
 RETENTION_DAYS = float(os.environ.get("SIDETRAY_RETENTION_DAYS") or 90)
+HISTORY_DAYS = float(os.environ.get("SIDETRAY_HISTORY_DAYS", "").strip() or 14)
 PRUNE_EVERY_SECONDS = float(os.environ.get("SIDETRAY_PRUNE_EVERY_SECONDS") or 3600)
 # Uploaded media that no event refers to (an upload whose post never came) is
 # dropped after this long.
@@ -384,13 +387,16 @@ KEPT_PROFILES = (
 
 
 def prune(t: int | None = None) -> dict:
-    """Delete events (and their media) that every active device has acked, and
-    events and media older than the retention window. Revoked devices and
+    """Delete events (and their media) that every active device has acked and
+    that are older than the history window, and events and media older than
+    the retention window (direct messages: acked or past retention, no
+    history window). Revoked devices and
     removed members don't count. Records the highest seq deleted per group
     (`pruned_through`), so a device that comes back with an older cursor
     knows it missed something."""
     t = now() if t is None else t
     cutoff = t - int(RETENTION_DAYS * 86400)
+    history = t - int(HISTORY_DAYS * 86400)
     out = {"events": 0, "media": 0, "dms": 0}
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -407,9 +413,9 @@ def prune(t: int | None = None) -> dict:
             acked = row["low"] if row["n"] else 0
             # Each active member's latest profile event (name, avatar) stays, so
             # devices that join later still see everyone's face.
-            where = ("group_id = ? AND (gseq <= ? OR created_at < ?)"
+            where = ("group_id = ? AND ((gseq <= ? AND created_at < ?) OR created_at < ?)"
                      f" AND seq NOT IN ({KEPT_PROFILES})")
-            args = (gid, acked, cutoff, gid)
+            args = (gid, acked, history, cutoff, gid)
             top = conn.execute(f"SELECT MAX(gseq) FROM events WHERE {where}", args).fetchone()[0]
             if top is None:
                 continue
@@ -1362,6 +1368,19 @@ def pending_device(conn: sqlite3.Connection, device_id: str, group_id: str) -> s
     return row
 
 
+def history_key_versions(conn: sqlite3.Connection, km: Device) -> set[int]:
+    """Group key versions a new device needs for the history still on the
+    relay, as far as this Key Master can give them: versions some kept event
+    uses that were sealed to this Key Master's device (a group's founder made
+    version 1 itself, so has it without a sealed copy)."""
+    used = {r[0] for r in conn.execute(
+        "SELECT DISTINCT key_version FROM events WHERE group_id = ?", (km.group_id,))}
+    held = {r[0] for r in conn.execute("SELECT key_version FROM sealed_keys WHERE device_id = ?", (km.id,))}
+    if conn.execute("SELECT approved_by IS NULL FROM devices WHERE id = ?", (km.id,)).fetchone()[0]:
+        held.add(1)
+    return used & held
+
+
 @api.post("/joins/{device_id}/approve")
 def approve_join(device_id: str, body: ApproveIn, km: Device = Depends(keymaster_device)):
     versions = [k.key_version for k in body.sealed_keys]
@@ -1373,6 +1392,10 @@ def approve_join(device_id: str, body: ApproveIn, km: Device = Depends(keymaster
         cur = group_row(conn, km.group_id)["key_version"]
         if cur not in versions:
             raise HTTPException(409, f"include the current group key (version {cur}); fetch GET /keys first")
+        missing = sorted(history_key_versions(conn, km) - set(versions))
+        if missing:
+            raise HTTPException(409, "include every group key the kept posts use (missing version"
+                                     f"{'s' if len(missing) > 1 else ''} {', '.join(map(str, missing))})")
         if body.cert.device_id != device_id:
             raise HTTPException(422, "certificate is for a different device")
         store_cert(conn, km, body.cert, member_role_of(conn, device_id), allowed_status=("pending",))

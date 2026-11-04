@@ -130,7 +130,8 @@ class GroupsTest(Base):
             self.post(a["token"])
         self.post(b["token"])
         self.c.post("/api/v1/ack", headers=self.auth(a["token"]), json={"seq": 2})
-        self.assertEqual(self.m.prune()["events"], 2)
+        # Past the 14-day history window, inside retention.
+        self.assertEqual(self.m.prune(self.m.now() + 15 * 86400)["events"], 2)
         self.assertEqual(len(self.c.get("/api/v1/events", headers=self.auth(b["token"])).json()["events"]), 1)
         self.assertEqual(self.post(a["token"]).json()["seq"], 3)  # numbers never go back
 

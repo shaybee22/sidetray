@@ -116,12 +116,12 @@ The feed is an append-only log with a sequence number; each device pulls everyth
 
 **Pruning (server cron, hourly)**
 
-- Delete events and media where every active device's `last_seq` is at or past them
+- Delete events and media where every active device's `last_seq` is at or past them, once they're older than the history window (default 14 days, `SIDETRAY_HISTORY_DAYS`; 0 = right away), so new members still see the recent feed
 - Also delete anything older than the retention window (default 90 days, `SIDETRAY_RETENTION_DAYS`), even if someone hasn't synced
 - A device that hasn't checked in for longer than the retention window gets a "you missed some posts" notice on return
 - Revoked devices don't count toward "everyone has it"
 
-**New members** only get what's still on the server (up to 90 days). Optional later: an existing member's app can share its local archive with a newly approved device.
+**New members** get what's still on the server: at least the last 14 days (the history window), up to 90 days of what someone hasn't fetched yet. Approval seals them every group key version those events use. Optional later: an existing member's app can share its local archive with a newly approved device.
 
 **Media**
 

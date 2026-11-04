@@ -12,6 +12,9 @@ services:
       SIDETRAY_SETUP_TOKEN: ${SIDETRAY_SETUP_TOKEN:-}
       # Days the relay keeps events and photos nobody has fetched yet (prune job, hourly).
       SIDETRAY_RETENTION_DAYS: ${SIDETRAY_RETENTION_DAYS:-90}
+      # Days of recent events and photos kept even once everyone has them, so
+      # people who join later see them. 0 = delete as soon as everyone has them.
+      SIDETRAY_HISTORY_DAYS: ${SIDETRAY_HISTORY_DAYS:-14}
       # Rate limits; empty means the defaults (30 events/minute and 50 MB of
       # uploads/hour per device; 10 join attempts and 60 group lookups/hour per IP).
       SIDETRAY_EVENTS_PER_MINUTE: ${SIDETRAY_EVENTS_PER_MINUTE:-}

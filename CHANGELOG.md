@@ -5,6 +5,19 @@ the app, the Rust crates and the relay share one version number.
 
 ## [Unreleased]
 
+### Relay
+
+- **People who join later see the recent feed.** The relay used to delete a
+  post as soon as every device had fetched it, so a new member started with
+  an empty feed. Posts and their photos now stay for at least 14 days
+  (`SIDETRAY_HISTORY_DAYS`, `install.sh --history DAYS`; 0 restores the old
+  behaviour); anything past the retention window (90 days) still goes.
+  Direct messages are unchanged.
+- Approving a join now has to include every group key version the kept posts
+  use (the apps already send all the keys they hold), so a new device can
+  read that history after a key rotation.
+- Update with `git pull && sudo ./install.sh`; it adds the setting to `.env`.
+
 ## [0.3.0] - 2026-11-04
 
 One app, several groups. Highlights:
