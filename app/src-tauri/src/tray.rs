@@ -98,11 +98,18 @@ fn is_foreground(w: &tauri::WebviewWindow) -> bool {
     w.is_focused().unwrap_or(false)
 }
 
-/// Redraw the badge and tooltip from the unread count and pending joins.
+/// Redraw the badge and tooltip from the unread counts and pending joins,
+/// added up over every group this app is in (SPEC.md Phase 8).
 pub fn refresh(handle: &AppHandle, app: &App) {
-    let unread = db::unread(&app.db()).unwrap_or(0).max(0) as u32;
-    let messages = db::dm_unread(&app.db()).unwrap_or(0).max(0) as u32;
-    let joins = app.pending_joins.load(Ordering::SeqCst);
+    let apps = crate::profiles::current().map(|p| p.all()).unwrap_or_default();
+    let all: Vec<&App> = if apps.is_empty() { vec![app] } else { apps.iter().map(|a| &**a).collect() };
+    let (mut unread, mut messages, mut joins) = (0u32, 0u32, 0usize);
+    for a in all {
+        let conn = a.db();
+        unread += db::unread(&conn).unwrap_or(0).max(0) as u32;
+        messages += db::dm_unread(&conn).unwrap_or(0).max(0) as u32;
+        joins += a.pending_joins.load(Ordering::SeqCst);
+    }
     let Some(tray) = handle.tray_by_id(TRAY_ID) else { return };
     let mut tip = String::from("Side Tray");
     match unread {

@@ -288,12 +288,13 @@ pub fn is_foreground() -> bool {
 /// yet). `fresh` unregisters first, so the distributor makes a new endpoint
 /// (say, after its default server changed). The distributor's package, or
 /// None if there's no distributor app on the phone.
-pub fn push_register(fresh: bool) -> Result<Option<String>> {
-    Ok(call_string("pushRegister", &[if fresh { "fresh" } else { "" }])?.filter(|d| !d.is_empty()))
+/// `instance`: the profile's local id; each group has its own registration (SPEC.md Phase 8).
+pub fn push_register(fresh: bool, instance: &str) -> Result<Option<String>> {
+    Ok(call_string("pushRegister", &[if fresh { "fresh" } else { "" }, instance])?.filter(|d| !d.is_empty()))
 }
 
-pub fn push_unregister() -> Result<()> {
-    call_string("pushUnregister", &[])?;
+pub fn push_unregister(instance: &str) -> Result<()> {
+    call_string("pushUnregister", &[instance])?;
     Ok(())
 }
 
@@ -361,12 +362,18 @@ pub extern "system" fn Java_org_sidetray_app_SideTrayAndroid_nativeForeground(_e
     crate::mobile_push::foreground_changed(visible);
 }
 
-/// `SideTrayAndroid.nativeSync(dataDir)`: a wake-up or the periodic job. Syncs
-/// (which shows any notifications) and returns a line for the log.
+/// `SideTrayAndroid.nativeSync(dataDir, instance)`: a wake-up for one group's
+/// instance, or the periodic job (`""`: every group). Syncs (which shows any
+/// notifications) and returns a line for the log.
 #[no_mangle]
-pub extern "system" fn Java_org_sidetray_app_SideTrayAndroid_nativeSync(mut env: JNIEnv, _class: JClass, dir: JString) -> jstring {
-    let dir = PathBuf::from(jstr(&mut env, &dir));
-    let out = guarded("sync", move || crate::mobile_push::background_sync(dir));
+pub extern "system" fn Java_org_sidetray_app_SideTrayAndroid_nativeSync(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+    instance: JString,
+) -> jstring {
+    let (dir, instance) = (PathBuf::from(jstr(&mut env, &dir)), jstr(&mut env, &instance));
+    let out = guarded("sync", move || crate::mobile_push::background_sync(dir, &instance));
     ret(&mut env, out)
 }
 
@@ -380,8 +387,10 @@ pub extern "system" fn Java_org_sidetray_app_SideTrayAndroid_nativePush(
     dir: JString,
     kind: JString,
     value: JString,
+    instance: JString,
 ) -> jstring {
     let (dir, kind, value) = (PathBuf::from(jstr(&mut env, &dir)), jstr(&mut env, &kind), jstr(&mut env, &value));
-    let out = guarded("push", move || crate::mobile_push::push_event(dir, &kind, &value));
+    let instance = jstr(&mut env, &instance);
+    let out = guarded("push", move || crate::mobile_push::push_event(dir, &kind, &value, &instance));
     ret(&mut env, out)
 }

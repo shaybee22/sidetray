@@ -126,6 +126,21 @@ button.ghost.danger:hover { border-color: var(--danger); }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.05rem; }
 .logo { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #d9a441)); }
 .tabs { display: flex; gap: 4px; flex: 1; }
+
+/* The group menu (SPEC.md Phase 8): the group name in the header, and on the waiting and removed screens */
+.group-switch { position: relative; display: inline-flex; align-items: center; gap: 6px; font: inherit; font-weight: 700; color: var(--text); background: none; border: 1px solid transparent; border-radius: 8px; padding: 3px 8px; margin: -3px -8px; min-width: 0; }
+.group-switch:hover, .group-switch[aria-expanded="true"] { border-color: var(--line); background: var(--surface); }
+.group-switch .caret { color: var(--muted); font-size: .8em; }
+.group-switch .dot, .group-menu .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); flex: none; }
+.group-switch .dot { position: absolute; top: 0; right: -2px; }
+#wt-groups, #rm-groups { margin: 0 auto 12px; font-weight: 600; }
+.group-menu { position: fixed; z-index: 30; min-width: 220px; max-width: min(340px, calc(100vw - 24px)); background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 6px; }
+.group-menu button { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: none; border: none; border-radius: 8px; padding: 9px 10px; font-weight: normal; color: var(--text); }
+.group-menu button:hover, .group-menu button:focus-visible { background: var(--surface-2); }
+.group-menu .tick { width: 1em; flex: none; color: var(--accent); }
+.group-menu .g-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-menu .g-name small { display: block; color: var(--muted); }
+.group-menu hr { border: none; border-top: 1px solid var(--line); margin: 6px 4px; }
 .tab { border: none; background: none; padding: 6px 12px; color: var(--muted); border-radius: 8px; }
 .tab[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 .badge { background: var(--danger); color: #fff; border-radius: 999px; font-size: .72rem; padding: 0 7px; min-width: 18px; text-align: center; }

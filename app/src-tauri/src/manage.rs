@@ -429,6 +429,7 @@ pub async fn check_standing(app: &App) -> Result<Option<String>> {
     let status = match js.status.as_str() {
         "active" | "pending" => return Ok(None),
         "removed" => "removed",
+        "left" => "left",
         _ => "revoked",
     };
     db::set_status(&app.db(), status, &id.role)?;

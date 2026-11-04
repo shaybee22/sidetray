@@ -28,6 +28,7 @@ mod manage;
 mod mobile_push;
 mod photo;
 mod profile;
+mod profiles;
 mod push;
 mod secrets;
 mod state;
@@ -39,6 +40,7 @@ mod update;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Serialize;
 use sidetray_crypto as crypto;
+use profiles::Profiles;
 use state::App;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -61,6 +63,27 @@ pub fn now() -> i64 {
 }
 
 type Res<T> = Result<T, String>;
+
+/// The profile the window shows (SPEC.md Phase 8): what every UI command acts on.
+pub struct Active(Arc<App>);
+
+impl std::ops::Deref for Active {
+    type Target = App;
+    fn deref(&self) -> &App {
+        &self.0
+    }
+}
+
+impl<'de, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R> for Active {
+    fn from_command(command: tauri::ipc::CommandItem<'de, R>) -> Result<Self, tauri::ipc::InvokeError> {
+        let p = command
+            .message
+            .webview_ref()
+            .try_state::<Arc<Profiles>>()
+            .ok_or_else(|| tauri::ipc::InvokeError::from_anyhow(anyhow::anyhow!("the app isn't ready yet")))?;
+        Ok(Active(p.active()))
+    }
+}
 
 fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
@@ -100,11 +123,24 @@ struct AppView {
     /// What the group sees: the certified name (a chosen one waits for a Key Master).
     shown_name: Option<String>,
     avatar: Option<String>,
+    /// This profile (SPEC.md Phase 8).
+    profile: String,
+    /// Other profiles that joined (or asked to join) a group: the group menu shows when there are any.
+    other_groups: usize,
+    /// The wizard for another group can go back to this profile.
+    previous: Option<String>,
 }
 
 #[tauri::command]
-fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
+fn get_state(app: Active, profiles: State<'_, Arc<Profiles>>) -> Res<AppView> {
     let id = app.identity().map_err(err)?;
+    let profile = app.profile_id.clone();
+    let other_groups = profiles
+        .all()
+        .iter()
+        .filter(|a| a.profile_id != profile && matches!(a.identity(), Ok(Some(_))))
+        .count();
+    let previous = profiles.previous();
     let conn = app.db();
     let (last_seq, last_sync_at, rejected) = db::sync_info(&conn).map_err(err)?;
     let trusted = db::anchors(&conn).map_err(err)?.into_iter().map(|(_, name, _)| name).collect();
@@ -140,6 +176,9 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             cert_problem: None,
             shown_name: None,
             avatar: None,
+            profile,
+            other_groups,
+            previous,
         },
         Some(id) => AppView {
             test_server: id.ca_pem.is_some() || api::is_ip_server(&id.server_url),
@@ -164,6 +203,9 @@ fn get_state(app: State<'_, Arc<App>>) -> Res<AppView> {
             dm_unread,
             live,
             missed,
+            profile,
+            other_groups,
+            previous: None,
         },
     })
 }
@@ -183,7 +225,7 @@ struct ServerCheck {
 /// roots (checked by connecting); a bare IP address, or a pasted root, is a
 /// test server whose root waits for the person to confirm its fingerprint.
 #[tauri::command]
-async fn check_server(app: State<'_, Arc<App>>, server: String, ca_pem: Option<String>) -> Res<ServerCheck> {
+async fn check_server(app: Active, server: String, ca_pem: Option<String>) -> Res<ServerCheck> {
     let server = api::normalize_server(&server).map_err(err)?;
     let pasted = ca_pem.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
     let root_pem = match pasted {
@@ -214,7 +256,7 @@ async fn check_server(app: State<'_, Arc<App>>, server: String, ca_pem: Option<S
 
 /// The person compared the fingerprint and it matches.
 #[tauri::command]
-fn trust_server(app: State<'_, Arc<App>>, fingerprint: String) -> Res<()> {
+fn trust_server(app: Active, fingerprint: String) -> Res<()> {
     let mut w = app.wizard_server.lock().unwrap_or_else(|e| e.into_inner());
     let t = w.as_mut().ok_or("check the server first")?;
     match &t.fingerprint {
@@ -235,20 +277,25 @@ fn confirmed_server(app: &App) -> Res<state::ServerTrust> {
 }
 
 #[tauri::command]
-async fn probe_group(app: State<'_, Arc<App>>, group_name: String) -> Res<api::GroupInfo> {
+async fn probe_group(app: Active, group_name: String) -> Res<api::GroupInfo> {
     let t = confirmed_server(&app)?;
     account::probe(&t.server, t.root_pem.as_deref(), &group_name).await.map_err(err)
 }
 
 #[tauri::command]
 async fn register(
-    app: State<'_, Arc<App>>,
+    app: Active,
+    profiles: State<'_, Arc<Profiles>>,
     group_name: String,
     display_name: String,
     email: String,
     setup_token: Option<String>,
 ) -> Res<String> {
     let t = confirmed_server(&app)?;
+    if let Some(other) = profiles.find_group(&t.server, &group_name, &app.profile_id) {
+        let name = other.identity().ok().flatten().map(|i| i.group_name).unwrap_or_default();
+        return Err(format!("This app is already in “{name}”. Pick it from the group menu at the top."));
+    }
     let code = account::register(
         &app,
         account::Registration {
@@ -262,6 +309,7 @@ async fn register(
     )
     .await
     .map_err(err)?;
+    profiles.remember();
     app.wake.notify_one();
     app.push_wake.notify_one();
     Ok(code)
@@ -269,55 +317,146 @@ async fn register(
 
 /// The invite link that opened the app, if the wizard hasn't taken it yet.
 #[tauri::command]
-fn take_invite(app: State<'_, Arc<App>>) -> Option<state::InviteMsg> {
-    app.pending_invite.lock().unwrap_or_else(|e| e.into_inner()).take()
+fn take_invite(profiles: State<'_, Arc<Profiles>>) -> Option<state::InviteMsg> {
+    profiles.pending_invite.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// A `sidetray://` link reached the app (at launch, or from a second launch).
-fn got_link(handle: &AppHandle, app: &App, url: &str) {
+fn got_link(handle: &AppHandle, profiles: &Profiles, url: &str) {
     let msg = match invite::parse(url) {
         Ok(i) => state::InviteMsg { invite: Some(i), error: None },
         Err(e) => state::InviteMsg { invite: None, error: Some(format!("{e:#}")) },
     };
-    *app.pending_invite.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+    *profiles.pending_invite.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
     let _ = handle.emit("invite", ());
     tray::show_main(handle);
 }
 
 #[tauri::command]
-async fn join_progress(app: State<'_, Arc<App>>) -> Res<account::JoinProgress> {
+async fn join_progress(app: Active) -> Res<account::JoinProgress> {
     account::join_progress(&app).await.map_err(err)
 }
 
 #[tauri::command]
-async fn confirm_approval(app: State<'_, Arc<App>>, code: String) -> Res<()> {
+async fn confirm_approval(app: Active, code: String) -> Res<()> {
     account::confirm_approval(&app, &code).await.map_err(err)?;
     app.wake.notify_one();
     app.push_wake.notify_one();
     #[cfg(target_os = "android")]
-    mobile_push::setup(&app);
+    mobile_push::setup(&app.0);
     Ok(())
 }
 
+// --- groups (Phase 8) ------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct GroupView {
+    id: String,
+    /// None: the wizard hasn't joined anything yet.
+    group_name: Option<String>,
+    server: Option<String>,
+    /// setup / pending / denied / active / removed / revoked / left
+    stage: String,
+    active: bool,
+    /// Unread posts, messages or join requests.
+    unread: bool,
+}
+
 #[tauri::command]
-fn reset(app: State<'_, Arc<App>>) -> Res<()> {
-    account::reset(&app).map_err(err)
+fn list_groups(profiles: State<'_, Arc<Profiles>>) -> Vec<GroupView> {
+    let active = profiles.active_id();
+    let mut out: Vec<GroupView> = profiles
+        .all()
+        .iter()
+        .map(|a| {
+            let id = a.identity().ok().flatten();
+            let unread = {
+                let conn = a.db();
+                db::unread(&conn).unwrap_or(0) + db::dm_unread(&conn).unwrap_or(0) > 0
+            } || a.pending_joins.load(Ordering::SeqCst) > 0;
+            GroupView {
+                id: a.profile_id.clone(),
+                stage: id.as_ref().map_or("setup".into(), |i| i.status.clone()),
+                server: id.as_ref().map(|i| i.server_url.clone()),
+                group_name: id.map(|i| i.group_name),
+                active: a.profile_id == active,
+                unread,
+            }
+        })
+        .collect();
+    out.sort_by_key(|g| (g.group_name.is_none(), g.group_name.clone().unwrap_or_default().to_lowercase()));
+    out
+}
+
+#[tauri::command]
+fn switch_group(handle: AppHandle, profiles: State<'_, Arc<Profiles>>, id: String) -> Res<()> {
+    let app = profiles.switch(&id).map_err(err)?;
+    app.wake.notify_one();
+    tray::refresh(&handle, &app);
+    Ok(())
+}
+
+/// "Join another group" (or an invite link while in a group): an empty
+/// profile, shown in the wizard.
+#[tauri::command]
+fn start_join(handle: AppHandle, profiles: State<'_, Arc<Profiles>>) -> Res<()> {
+    let (app, new) = profiles.start_join().map_err(err)?;
+    if new {
+        start_profile(&handle, &app);
+    }
+    Ok(())
+}
+
+/// What the app shows when the relay refuses /leave (409).
+const ONLY_KEYMASTER: &str = "You’re the only Key Master. Promote someone else before leaving.";
+
+/// Leave the group shown (SPEC.md Phase 8, "Leaving a group"): tell the relay
+/// if this device is still in it, then delete everything this app saved from
+/// it. Also how a denied, cancelled, removed or abandoned profile is deleted.
+#[tauri::command]
+async fn leave_group(handle: AppHandle, app: Active, profiles: State<'_, Arc<Profiles>>) -> Res<()> {
+    let id = app.identity().map_err(err)?;
+    if let Some(id) = &id {
+        if id.status == "active" {
+            let api = app.api(id).map_err(err)?;
+            app.set_leaving(true);
+            let left: anyhow::Result<serde_json::Value> = api.post("/leave", &serde_json::json!({})).await;
+            if let Err(e) = left {
+                app.set_leaving(false);
+                // 409 is the relay's only refusal here: the last Key Master with others still in the group.
+                if api::is_status(&e, 409) {
+                    return Err(ONLY_KEYMASTER.into());
+                }
+                return Err(err(e));
+            }
+        }
+    }
+    #[cfg(target_os = "android")]
+    mobile_push::forget(&app.0);
+    profiles.remove(&app.profile_id).map_err(err)?;
+    let next = profiles.active();
+    next.wake.notify_one();
+    #[cfg(target_os = "android")]
+    mobile_push::setup(&next);
+    tray::refresh(&handle, &next);
+    let _ = handle.emit("groups-changed", ());
+    Ok(())
 }
 
 // --- Key Master ----------------------------------------------------------------------
 
 #[tauri::command]
-async fn list_pending(app: State<'_, Arc<App>>) -> Res<Vec<account::PendingView>> {
+async fn list_pending(app: Active) -> Res<Vec<account::PendingView>> {
     account::list_pending(&app).await.map_err(err)
 }
 
 #[tauri::command]
-async fn approve(app: State<'_, Arc<App>>, device_id: String, code: String, as_keymaster: bool) -> Res<account::Approved> {
+async fn approve(app: Active, device_id: String, code: String, as_keymaster: bool) -> Res<account::Approved> {
     account::approve(&app, &device_id, &code, as_keymaster).await.map_err(err)
 }
 
 #[tauri::command]
-async fn deny(app: State<'_, Arc<App>>, device_id: String) -> Res<()> {
+async fn deny(app: Active, device_id: String) -> Res<()> {
     account::deny(&app, &device_id).await.map_err(err)
 }
 
@@ -328,7 +467,7 @@ struct InviteView {
 }
 
 #[tauri::command]
-fn invite_link(app: State<'_, Arc<App>>) -> Res<InviteView> {
+fn invite_link(app: Active) -> Res<InviteView> {
     let id = app.require_keymaster().map_err(err)?;
     let link = invite::link(&id.server_url, &id.group_name).map_err(err)?;
     Ok(InviteView { qr: invite::qr_data_url(&link).map_err(err)?, link })
@@ -337,12 +476,12 @@ fn invite_link(app: State<'_, Arc<App>>) -> Res<InviteView> {
 // --- profile (Phase 6b) --------------------------------------------------------------
 
 #[tauri::command]
-fn get_profile(app: State<'_, Arc<App>>) -> Res<profile::MyProfile> {
+fn get_profile(app: Active) -> Res<profile::MyProfile> {
     profile::mine(&app).map_err(err)
 }
 
 #[tauri::command]
-async fn set_display_name(app: State<'_, Arc<App>>, name: String) -> Res<profile::MyProfile> {
+async fn set_display_name(app: Active, name: String) -> Res<profile::MyProfile> {
     profile::save(&app, Some(&name), profile::AvatarChange::Keep).await.map_err(err)?;
     profile::mine(&app).map_err(err)
 }
@@ -358,20 +497,20 @@ fn body_bytes(request: &tauri::ipc::Request<'_>) -> Option<Vec<u8>> {
 
 /// The cropped photo from the app's canvas (a PNG; see `body_bytes`).
 #[tauri::command]
-async fn set_avatar(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) -> Res<profile::MyProfile> {
+async fn set_avatar(app: Active, request: tauri::ipc::Request<'_>) -> Res<profile::MyProfile> {
     let bytes = body_bytes(&request).ok_or("expected the cropped photo")?;
     profile::save(&app, None, profile::AvatarChange::New(bytes)).await.map_err(err)?;
     profile::mine(&app).map_err(err)
 }
 
 #[tauri::command]
-async fn remove_avatar(app: State<'_, Arc<App>>) -> Res<profile::MyProfile> {
+async fn remove_avatar(app: Active) -> Res<profile::MyProfile> {
     profile::save(&app, None, profile::AvatarChange::Remove).await.map_err(err)?;
     profile::mine(&app).map_err(err)
 }
 
 #[tauri::command]
-async fn accept_name(app: State<'_, Arc<App>>, member_id: String) -> Res<String> {
+async fn accept_name(app: Active, member_id: String) -> Res<String> {
     let name = manage::accept_name(&app, &member_id).await.map_err(err)?;
     app.wake.notify_one();
     Ok(name)
@@ -388,7 +527,7 @@ struct CertCheck {
 
 /// Fetch a test server's current root certificate to compare with the pinned one.
 #[tauri::command]
-async fn check_server_cert(app: State<'_, Arc<App>>) -> Res<CertCheck> {
+async fn check_server_cert(app: Active) -> Res<CertCheck> {
     let id = app.require_identity().map_err(err)?;
     if id.ca_pem.is_none() && !api::is_ip_server(&id.server_url) {
         return Err("this server uses a publicly trusted certificate; there's nothing to pin".into());
@@ -404,7 +543,7 @@ async fn check_server_cert(app: State<'_, Arc<App>>) -> Res<CertCheck> {
 
 /// The server's operator confirmed the new fingerprint: pin that root instead.
 #[tauri::command]
-fn repin_server_cert(app: State<'_, Arc<App>>, fingerprint: String) -> Res<()> {
+fn repin_server_cert(app: Active, fingerprint: String) -> Res<()> {
     let id = app.require_identity().map_err(err)?;
     let t = app.repin.lock().unwrap_or_else(|e| e.into_inner()).take().ok_or("check the certificate first")?;
     let (Some(pem), Some(fp)) = (t.root_pem, t.fingerprint) else { return Err("check the certificate first".into()) };
@@ -421,33 +560,33 @@ fn repin_server_cert(app: State<'_, Arc<App>>, fingerprint: String) -> Res<()> {
 // --- members (Phase 6) ------------------------------------------------------------------
 
 #[tauri::command]
-async fn list_members(app: State<'_, Arc<App>>) -> Res<Vec<manage::MemberView>> {
+async fn list_members(app: Active) -> Res<Vec<manage::MemberView>> {
     manage::list_members(&app).await.map_err(err)
 }
 
 #[tauri::command]
-async fn promote_member(app: State<'_, Arc<App>>, member_id: String) -> Res<String> {
+async fn promote_member(app: Active, member_id: String) -> Res<String> {
     let name = manage::promote(&app, &member_id).await.map_err(err)?;
     app.wake.notify_one();
     Ok(name)
 }
 
 #[tauri::command]
-async fn remove_member(app: State<'_, Arc<App>>, member_id: String) -> Res<manage::Change> {
+async fn remove_member(app: Active, member_id: String) -> Res<manage::Change> {
     let c = manage::remove_member(&app, &member_id).await.map_err(err)?;
     app.wake.notify_one();
     Ok(c)
 }
 
 #[tauri::command]
-async fn revoke_device(app: State<'_, Arc<App>>, device_id: String) -> Res<manage::Change> {
+async fn revoke_device(app: Active, device_id: String) -> Res<manage::Change> {
     let c = manage::revoke_device(&app, &device_id).await.map_err(err)?;
     app.wake.notify_one();
     Ok(c)
 }
 
 #[tauri::command]
-fn dismiss_missed(app: State<'_, Arc<App>>) -> Res<()> {
+fn dismiss_missed(app: Active) -> Res<()> {
     db::clear_missed(&app.db()).map_err(err)
 }
 
@@ -455,12 +594,15 @@ fn dismiss_missed(app: State<'_, Arc<App>>) -> Res<()> {
 /// it was removed, that's recorded (syncing stops; the archive stays), and the
 /// UI and a notification say so.
 pub async fn removed_check(handle: &AppHandle, app: &App) {
+    if app.is_leaving() {
+        return;
+    }
     match manage::check_standing(app).await {
         Ok(Some(status)) => {
             alerts::removed(app, &status);
             app.push_wake.notify_one();
             tray::refresh(handle, app);
-            let _ = handle.emit("removed", status);
+            profiles::emit(handle, app, "removed", status);
         }
         Ok(None) => {}
         Err(e) => eprintln!("checking whether this device was removed: {e:#}"),
@@ -470,7 +612,7 @@ pub async fn removed_check(handle: &AppHandle, app: &App) {
 // --- feed ------------------------------------------------------------------------------
 
 #[tauri::command]
-async fn sync_now(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<feed::SyncReport> {
+async fn sync_now(handle: AppHandle, app: Active) -> Res<feed::SyncReport> {
     match feed::sync_once(&app).await {
         Ok(r) => {
             app.set_cert_problem(None);
@@ -489,7 +631,7 @@ async fn sync_now(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<feed::Sync
 }
 
 #[tauri::command]
-fn get_feed(app: State<'_, Arc<App>>, before: Option<i64>, limit: Option<i64>) -> Res<Vec<feed::PostView>> {
+fn get_feed(app: Active, before: Option<i64>, limit: Option<i64>) -> Res<Vec<feed::PostView>> {
     // A removed device can still read what it saved.
     let id = app.require_archive().map_err(err)?;
     feed::feed(&app.db(), &id.member_id, id.is_keymaster(), before, limit.unwrap_or(50).clamp(1, 500)).map_err(err)
@@ -521,7 +663,7 @@ fn staged_view(id: &str, p: &photo::Processed) -> StagedView {
 /// (Android may rebuild the window, e.g. moving between a flip phone's screens).
 /// `None` for any that are gone.
 #[tauri::command]
-fn staged_photos(app: State<'_, Arc<App>>, ids: Vec<String>) -> Vec<Option<StagedView>> {
+fn staged_photos(app: Active, ids: Vec<String>) -> Vec<Option<StagedView>> {
     let staged = app.staged.lock().unwrap_or_else(|e| e.into_inner());
     ids.iter().map(|id| staged.get(id).map(|p| staged_view(id, p))).collect()
 }
@@ -543,7 +685,7 @@ async fn stage(app: &App, bytes: Vec<u8>) -> Res<StagedView> {
 /// Takes the raw file bytes as the request body (no JSON), so large photos
 /// cross the IPC bridge without being turned into number arrays.
 #[tauri::command]
-async fn stage_photo(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) -> Res<StagedView> {
+async fn stage_photo(app: Active, request: tauri::ipc::Request<'_>) -> Res<StagedView> {
     let bytes = body_bytes(&request).ok_or("expected the photo's bytes")?;
     stage(&app, bytes).await
 }
@@ -551,7 +693,7 @@ async fn stage_photo(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>)
 /// An image dragged in from a web page that came with only its address:
 /// download it (http or https, at most `photo::MAX_INPUT_BYTES`) and stage it.
 #[tauri::command]
-async fn stage_photo_url(app: State<'_, Arc<App>>, url: String) -> Res<StagedView> {
+async fn stage_photo_url(app: Active, url: String) -> Res<StagedView> {
     let bytes = download_image(&url).await.map_err(err)?;
     stage(&app, bytes).await
 }
@@ -597,7 +739,7 @@ fn take_share() -> Res<Option<()>> {
 
 /// Shared picture number `index`, through the same pipeline as any photo.
 #[tauri::command]
-async fn stage_shared_photo(app: State<'_, Arc<App>>, index: usize) -> Res<StagedView> {
+async fn stage_shared_photo(app: Active, index: usize) -> Res<StagedView> {
     #[cfg(target_os = "android")]
     {
         let bytes = tauri::async_runtime::spawn_blocking(move || android::take_shared_photo(index))
@@ -670,33 +812,33 @@ async fn photo_preview(request: tauri::ipc::Request<'_>) -> Res<String> {
 }
 
 #[tauri::command]
-fn unstage_photo(app: State<'_, Arc<App>>, id: String) {
+fn unstage_photo(app: Active, id: String) {
     app.staged.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
 #[tauri::command]
-async fn create_post(app: State<'_, Arc<App>>, text: String, photos: Vec<String>) -> Res<()> {
+async fn create_post(app: Active, text: String, photos: Vec<String>) -> Res<()> {
     feed::create_post(&app, &text, &photos).await.map_err(err)
 }
 
 #[tauri::command]
-async fn add_comment(app: State<'_, Arc<App>>, post_id: String, text: String, photos: Option<Vec<String>>) -> Res<()> {
+async fn add_comment(app: Active, post_id: String, text: String, photos: Option<Vec<String>>) -> Res<()> {
     feed::add_comment(&app, &post_id, &text, &photos.unwrap_or_default()).await.map_err(err)
 }
 
 #[tauri::command]
-async fn set_reaction(app: State<'_, Arc<App>>, post_id: String, emoji: String) -> Res<()> {
+async fn set_reaction(app: Active, post_id: String, emoji: String) -> Res<()> {
     feed::set_reaction(&app, &post_id, &emoji).await.map_err(err)
 }
 
 #[tauri::command]
-async fn delete_post(app: State<'_, Arc<App>>, post_id: String) -> Res<()> {
+async fn delete_post(app: Active, post_id: String) -> Res<()> {
     feed::delete_post(&app, &post_id).await.map_err(err)
 }
 
 /// The feed was looked at: clear the unread badge.
 #[tauri::command]
-fn mark_read(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<()> {
+fn mark_read(handle: AppHandle, app: Active) -> Res<()> {
     db::clear_unread(&app.db()).map_err(err)?;
     tray::refresh(&handle, &app);
     Ok(())
@@ -705,31 +847,31 @@ fn mark_read(handle: AppHandle, app: State<'_, Arc<App>>) -> Res<()> {
 // --- direct messages (Phase 5b) -------------------------------------------------------------
 
 #[tauri::command]
-fn list_conversations(app: State<'_, Arc<App>>) -> Res<Vec<dm::ConversationView>> {
+fn list_conversations(app: Active) -> Res<Vec<dm::ConversationView>> {
     app.require_archive().map_err(err)?;
     dm::conversations(&app.db()).map_err(err)
 }
 
 #[tauri::command]
-fn open_chat(app: State<'_, Arc<App>>, member_id: String) -> Res<dm::ChatView> {
+fn open_chat(app: Active, member_id: String) -> Res<dm::ChatView> {
     let id = app.require_archive().map_err(err)?;
     dm::chat(&app.db(), &id, &member_id).map_err(err)
 }
 
 #[tauri::command]
-fn dm_recipients(app: State<'_, Arc<App>>) -> Res<Vec<dm::Recipient>> {
+fn dm_recipients(app: Active) -> Res<Vec<dm::Recipient>> {
     let id = app.require_active().map_err(err)?;
     dm::recipients(&app.db(), &id.member_id).map_err(err)
 }
 
 #[tauri::command]
-async fn send_dm(app: State<'_, Arc<App>>, member_id: String, text: String, photos: Vec<String>) -> Res<()> {
+async fn send_dm(app: Active, member_id: String, text: String, photos: Vec<String>) -> Res<()> {
     dm::send(&app, &member_id, &text, &photos).await.map_err(err)
 }
 
 /// The conversation was looked at: clear its unread count (and the badge).
 #[tauri::command]
-fn mark_dm_read(handle: AppHandle, app: State<'_, Arc<App>>, member_id: String) -> Res<()> {
+fn mark_dm_read(handle: AppHandle, app: Active, member_id: String) -> Res<()> {
     dm::mark_read(&app.db(), &member_id).map_err(err)?;
     tray::refresh(&handle, &app);
     Ok(())
@@ -741,7 +883,7 @@ fn mark_dm_read(handle: AppHandle, app: State<'_, Arc<App>>, member_id: String) 
 /// the periodic sync). None on a computer.
 #[cfg(target_os = "android")]
 #[tauri::command]
-fn push_status(app: State<'_, Arc<App>>) -> Res<Option<mobile_push::PushView>> {
+fn push_status(app: Active) -> Res<Option<mobile_push::PushView>> {
     mobile_push::view(&app).map(Some).map_err(err)
 }
 
@@ -754,16 +896,16 @@ fn push_status() -> Res<Option<()>> {
 /// Register with the distributor again, asking it for a fresh endpoint (the
 /// person installed ntfy, or changed its server).
 #[tauri::command]
-fn push_setup(app: State<'_, Arc<App>>) {
+fn push_setup(app: Active) {
     #[cfg(target_os = "android")]
-    mobile_push::setup_with(&app, true);
+    mobile_push::setup_with(&app.0, true);
     #[cfg(not(target_os = "android"))]
     let _ = app;
 }
 
 /// Battery settings for Side Tray ("app") or the push app ("distributor").
 #[tauri::command]
-fn open_battery_settings(app: State<'_, Arc<App>>, which: String) -> Res<()> {
+fn open_battery_settings(app: Active, which: String) -> Res<()> {
     #[cfg(target_os = "android")]
     mobile_push::open_battery_settings(&app, &which).map_err(err)?;
     #[cfg(not(target_os = "android"))]
@@ -773,7 +915,7 @@ fn open_battery_settings(app: State<'_, Arc<App>>, which: String) -> Res<()> {
 
 /// The person chose to turn notifications on: Android's permission prompt.
 #[tauri::command]
-fn request_notifications(app: State<'_, Arc<App>>) -> Res<String> {
+fn request_notifications(app: Active) -> Res<String> {
     #[cfg(target_os = "android")]
     {
         mobile_push::mark(&app, mobile_push::NOTIF_ASKED);
@@ -788,7 +930,7 @@ fn request_notifications(app: State<'_, Arc<App>>) -> Res<String> {
 
 /// "Not now" on the offer, or the one-time note about instant notifications was read.
 #[tauri::command]
-fn dismiss_notice(app: State<'_, Arc<App>>, which: String) {
+fn dismiss_notice(app: Active, which: String) {
     #[cfg(target_os = "android")]
     match which.as_str() {
         "notifications" => mobile_push::mark(&app, mobile_push::NOTIF_ASKED),
@@ -807,13 +949,15 @@ fn open_notification_settings() -> Res<()> {
     Ok(())
 }
 
-/// What a tapped notification was about, if the app was opened by one.
+/// What a tapped notification was about, if the app was opened by one: an
+/// `alerts::Target`, plus the group it's in (`group`, see `alerts::target_json`).
 #[tauri::command]
-fn take_open() -> Res<Option<alerts::Target>> {
+fn take_open() -> Res<Option<serde_json::Value>> {
     #[cfg(target_os = "android")]
     {
         let Some(t) = android::take_open().map_err(err)? else { return Ok(None) };
-        Ok(serde_json::from_str(&t).ok())
+        let v: Option<serde_json::Value> = serde_json::from_str(&t).ok();
+        Ok(v.filter(|v| serde_json::from_value::<alerts::Target>(v.clone()).is_ok()))
     }
     #[cfg(not(target_os = "android"))]
     Ok(None)
@@ -936,23 +1080,33 @@ fn note_sync_error(app: &App, e: &anyhow::Error) {
     }
 }
 
+/// A profile's background work: its sync loop and push socket (every
+/// profile syncs, shown or not). Both stop when it's closed.
+fn start_profile(handle: &AppHandle, app: &Arc<App>) {
+    spawn_sync_loop(handle.clone(), app.clone());
+    push::spawn(handle.clone(), app.clone());
+}
+
 fn spawn_sync_loop(handle: AppHandle, app: Arc<App>) {
     tauri::async_runtime::spawn(async move {
         loop {
+            if app.is_closed() {
+                break;
+            }
             let active = matches!(app.identity(), Ok(Some(id)) if id.status == "active");
             if active {
                 match feed::sync_once(&app).await {
                     Ok(r) => {
                         app.set_cert_problem(None);
-                        let _ = handle.emit("synced", &r);
+                        profiles::emit(&handle, &app, "synced", &r);
                     }
                     Err(e) => {
                         note_sync_error(&app, &e);
-                        if api::is_status(&e, 401) {
+                        if api::is_status(&e, 401) && !app.is_closed() {
                             // Token refused: removed or revoked while we weren't connected?
                             removed_check(&handle, &app).await;
                         }
-                        let _ = handle.emit("sync-error", format!("{e:#}"));
+                        profiles::emit(&handle, &app, "sync-error", format!("{e:#}"));
                     }
                 }
             }
@@ -994,7 +1148,7 @@ pub fn run() {
     }
     builder
         .register_uri_scheme_protocol("media", |ctx, req| {
-            let app = ctx.app_handle().state::<Arc<App>>();
+            let app = ctx.app_handle().state::<Arc<Profiles>>().active();
             serve_media(&app, req.uri().path())
         })
         .setup(|tauri_app| {
@@ -1003,11 +1157,12 @@ pub fn run() {
                 Some(d) => d.into(),
                 None => tauri_app.path().app_data_dir()?,
             };
-            // A push wake-up may have opened it already, in this process (Android).
-            let app = state::shared(dir.clone())?;
+            // A push wake-up may have opened them already, in this process (Android).
+            let profiles = profiles::shared(dir.clone())?;
             let handle = tauri_app.handle().clone();
-            let _ = app.handle.set(handle.clone());
-            tauri_app.manage(app.clone());
+            state::set_handle(handle.clone());
+            let app = profiles.active();
+            tauri_app.manage(profiles.clone());
             tauri_app.manage(update::Updates::default());
             // The installer registers the notification app id and sidetray:// links
             // against the installed exe; a copy run from a build does it itself.
@@ -1036,27 +1191,30 @@ pub fn run() {
                 }
             }
             {
-                let (h, a) = (handle.clone(), app.clone());
+                let (h, p) = (handle.clone(), profiles.clone());
                 tauri_app.deep_link().on_open_url(move |event| {
                     for url in event.urls() {
-                        got_link(&h, &a, url.as_str());
+                        got_link(&h, &p, url.as_str());
                     }
                 });
             }
             // Started by clicking a link.
             if let Ok(Some(urls)) = tauri_app.deep_link().get_current() {
                 for url in urls {
-                    got_link(&handle, &app, url.as_str());
+                    got_link(&handle, &profiles, url.as_str());
                 }
             }
-            spawn_sync_loop(handle.clone(), app.clone());
+            for a in profiles.all() {
+                start_profile(&handle, &a);
+            }
             update::spawn(handle.clone());
             #[cfg(target_os = "android")]
             {
                 android::ANDROID_CONTEXT_READY.store(true, Ordering::SeqCst);
-                mobile_push::setup(&app);
+                for a in profiles.all() {
+                    mobile_push::setup(&a);
+                }
             }
-            push::spawn(handle, app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1076,7 +1234,10 @@ pub fn run() {
             repin_server_cert,
             join_progress,
             confirm_approval,
-            reset,
+            list_groups,
+            switch_group,
+            start_join,
+            leave_group,
             list_pending,
             approve,
             deny,
@@ -1139,9 +1300,11 @@ pub fn run() {
                     tray::set_foreground(true);
                     // Maybe brought back by "Share → Side Tray": the page checks.
                     let _ = _handle.emit("resumed", ());
-                    if let Some(app) = _handle.try_state::<Arc<App>>() {
-                        app.wake.notify_one();
-                        app.push_wake.notify_one();
+                    if let Some(p) = _handle.try_state::<Arc<Profiles>>() {
+                        for app in p.all() {
+                            app.wake.notify_one();
+                            app.push_wake.notify_one();
+                        }
                     }
                     update::resumed(_handle);
                 }

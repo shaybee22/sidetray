@@ -3,6 +3,26 @@
 All notable changes to Side Tray. Versions follow [Semantic Versioning](https://semver.org/);
 the app, the Rust crates and the relay share one version number.
 
+## [Unreleased]
+
+### Several groups in one app
+
+- **Be in more than one group.** The group name at the top is now a menu:
+  switch between your groups, see a dot on any with something new, and
+  *Join another group* (invite links work too, even when you're already in a
+  group). Every group keeps syncing and notifying in the background; with more
+  than one, notifications say which group ("Ana posted in Powwow"); on
+  Windows, banners about a group you aren't looking at stay up longer.
+- **Leave a group** from *This device*. Everyone keeps what you posted; this
+  device deletes what it saved from that group. The only Key Master of a group
+  has to promote someone first ("You’re the only Key Master. Promote someone
+  else before leaving."). Leaving no longer pops up a "You left" notification
+  (sometimes without the group's name) on the device you left from.
+- Updating keeps your current group as it is: its posts, photos and messages
+  move into a folder of their own the first time the new version starts (a
+  backup copy, `sidetray-before-groups.db`, is kept next to it).
+- Relay: `POST /api/v1/leave`.
+
 ## [0.2.0] - 2026-11-01
 
 Side Tray comes to Android phones. Highlights:
