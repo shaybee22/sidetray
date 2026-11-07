@@ -196,6 +196,10 @@ jobs:
           version=${TAG#v}
           apk=app/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
           tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          # A local test build's WebView DevTools switch must never ship.
+          if unzip -l "$apk" | grep -q "assets/webview-debug"; then
+            echo "::error::this APK was built with SIDETRAY_WEBVIEW_DEBUG (WebView DevTools on)"; exit 1
+          fi
           "$tools/apksigner" verify --print-certs "$apk" | tee certs.txt
           grep -qi "certificate SHA-256 digest: $CERT_SHA256" certs.txt || { echo "::error::the APK isn't signed with the release key"; exit 1; }
           name=$("$tools/aapt2" dump badging "$apk" | grep -o "versionName='[^']*'" | cut -d"'" -f2)

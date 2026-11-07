@@ -24,6 +24,21 @@ val keystoreProperties = Properties().apply {
     }
 }
 
+// Local test builds only: SIDETRAY_WEBVIEW_DEBUG=1 turns on WebView DevTools in
+// a release build (the test phone runs release-signed builds). Such a build also
+// carries assets/webview-debug, which the release workflow refuses, and Gradle
+// refuses the switch outright under CI.
+val webviewDebug = System.getenv("SIDETRAY_WEBVIEW_DEBUG") == "1"
+if (webviewDebug && System.getenv("CI") != null) {
+    throw GradleException("SIDETRAY_WEBVIEW_DEBUG is for local test builds only, never in CI")
+}
+val webviewDebugAssets = layout.buildDirectory.dir("generated/webview-debug-assets").get().asFile
+if (webviewDebug) {
+    val dir = webviewDebugAssets
+    dir.mkdirs()
+    File(dir, "webview-debug").writeText("WebView DevTools are on in this build. Not for release.\n")
+}
+
 android {
     compileSdk = 37
     namespace = "org.sidetray.app"
@@ -34,6 +49,10 @@ android {
         targetSdk = 37
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        buildConfigField("boolean", "WEBVIEW_DEBUG", webviewDebug.toString())
+    }
+    if (webviewDebug) {
+        sourceSets.getByName("main").assets.srcDir(webviewDebugAssets)
     }
     signingConfigs {
         if (keystoreProperties.containsKey("storeFile")) {

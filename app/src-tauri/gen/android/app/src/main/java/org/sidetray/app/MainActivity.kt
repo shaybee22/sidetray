@@ -14,6 +14,8 @@ import androidx.activity.enableEdgeToEdge
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
+    // Local test builds only (SIDETRAY_WEBVIEW_DEBUG, see build.gradle.kts).
+    if (BuildConfig.WEBVIEW_DEBUG) WebView.setWebContentsDebuggingEnabled(true)
     super.onCreate(savedInstanceState)
     SideTrayAndroid.attach(this, savedInstanceState == null)
     // Started by "Share → Side Tray" (a recreated activity has already handled it).
