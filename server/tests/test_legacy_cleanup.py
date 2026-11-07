@@ -40,7 +40,7 @@ class LegacyCleanupTest(unittest.TestCase):
                      (group_id, device_id, device_id))
         (m.MEDIA_DIR / group_id).mkdir(parents=True, exist_ok=True)
         (m.MEDIA_DIR / group_id / media_id).write_bytes(b"blob")
-        conn.execute("INSERT INTO media VALUES (?, ?, ?, 4, ?, 1)",
+        conn.execute("INSERT INTO media (id, group_id, uploader_device_id, size_bytes, path, created_at) VALUES (?, ?, ?, 4, ?, 1)",
                      (media_id, group_id, device_id, f"{group_id}/{media_id}"))
 
     def counts(self, group_id):

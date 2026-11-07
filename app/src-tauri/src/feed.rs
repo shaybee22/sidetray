@@ -215,6 +215,7 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
         Err(e) => eprintln!("syncing direct messages: {e:#}"),
     }
     download_media(app, &id, &s, &api).await;
+    ack_media(app, &api).await;
     report.avatars = crate::profile::download(app, &id, &s, &api).await;
     if let Some(keys) = &km_keys {
         match manage::rotate_if_pending(app, keys).await {
@@ -486,20 +487,89 @@ pub fn write_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// (full id, thumb id, full file, thumb file, acked to the relay)
+type DeletedPhoto = (String, String, Option<String>, Option<String>, bool);
+
 fn remove_deleted_media(app: &App, conn: &Connection) -> Result<()> {
     let mut st = conn.prepare(
-        "SELECT m.id, m.local_path, m.thumb_path FROM media m JOIN posts p ON p.id = m.post_id WHERE p.deleted = 1",
+        "SELECT m.id, m.thumb_id, m.local_path, m.thumb_path, m.server_acked FROM media m
+         JOIN posts p ON p.id = m.post_id WHERE p.deleted = 1",
     )?;
-    let rows: Vec<(String, Option<String>, Option<String>)> =
-        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-    for (mid, full, thumb) in rows {
+    let rows: Vec<DeletedPhoto> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (mid, thumb_id, full, thumb, acked) in rows {
         for f in [full, thumb].into_iter().flatten() {
             let _ = std::fs::remove_file(app.media_dir.join(f));
+        }
+        if !acked {
+            // Still tell the relay this device won't need them, so it can let them go.
+            for id in [&mid, &thumb_id] {
+                conn.execute("INSERT OR IGNORE INTO media_acks_pending (id) VALUES (?1)", params![id])?;
+            }
         }
         conn.execute("DELETE FROM media WHERE id = ?1", params![mid])?;
     }
     Ok(())
 }
+
+/// How many file ids one `POST /media/acks` carries (the relay takes up to 500).
+const ACK_BATCH: usize = 400;
+
+/// Tell the relay which photo files this device no longer needs from it
+/// (Phase 9 per-file acks): downloaded, given up on, or of a deleted post. Until
+/// every such device has, the relay keeps a post's photos even once every event
+/// cursor is past it. The first call (even empty) tells the relay this device
+/// acks files. A relay from before Phase 9 doesn't know the endpoint: fine.
+async fn ack_media(app: &App, api: &Api) {
+    loop {
+        let (photos, pending) = {
+            let conn = app.db();
+            let photos: Vec<(String, String)> = match conn
+                .prepare(
+                    "SELECT id, thumb_id FROM media WHERE server_acked = 0
+                     AND ((local_path IS NOT NULL AND thumb_path IS NOT NULL) OR attempts >= ?1) LIMIT ?2",
+                )
+                .and_then(|mut st| {
+                    st.query_map(params![MAX_MEDIA_ATTEMPTS, (ACK_BATCH / 2) as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect()
+                }) {
+                Ok(p) => p,
+                Err(e) => return eprintln!("acking photos: {e}"),
+            };
+            let pending: Vec<String> = conn
+                .prepare("SELECT id FROM media_acks_pending LIMIT ?1")
+                .and_then(|mut st| st.query_map(params![(ACK_BATCH / 2) as i64], |r| r.get(0))?.collect())
+                .unwrap_or_default();
+            (photos, pending)
+        };
+        let declared = matches!(db::kv_get(&app.db(), MEDIA_ACKS_KEY), Ok(Some(_)));
+        if photos.is_empty() && pending.is_empty() && declared {
+            return;
+        }
+        let ids: Vec<&String> = photos.iter().flat_map(|(f, t)| [f, t]).chain(&pending).collect();
+        if let Err(e) = api.post::<_, serde_json::Value>("/media/acks", &serde_json::json!({ "ids": ids })).await {
+            if !(is_status(&e, 404) || is_status(&e, 405)) {
+                eprintln!("acking photos: {e:#}");
+            }
+            return;
+        }
+        let conn = app.db();
+        let _ = db::kv_set(&conn, MEDIA_ACKS_KEY, Some("1"));
+        for (full, _) in &photos {
+            let _ = conn.execute("UPDATE media SET server_acked = 1 WHERE id = ?1", params![full]);
+        }
+        for id in &pending {
+            let _ = conn.execute("DELETE FROM media_acks_pending WHERE id = ?1", params![id]);
+        }
+        if photos.len() < ACK_BATCH / 2 && pending.len() < ACK_BATCH / 2 {
+            return;
+        }
+    }
+}
+
+/// Set once the relay has accepted this device's first `POST /media/acks`.
+const MEDIA_ACKS_KEY: &str = "media_acks_declared";
 
 // --- posting ----------------------------------------------------------------------
 

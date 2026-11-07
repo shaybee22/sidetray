@@ -174,6 +174,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     // with it); `comment_id` is the comment, NULL for the post's own photos.
     add_column(&conn, "media", "comment_id", "TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS media_comment ON media(comment_id, idx)")?;
+    // Phase 9: photos this device has told the relay it no longer needs
+    // (downloaded, or given up on), and ids of a deleted post's photos to tell it.
+    add_column(&conn, "media", "server_acked", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS media_acks_pending (id TEXT PRIMARY KEY)")?;
     Ok(conn)
 }
 

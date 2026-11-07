@@ -48,7 +48,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field, field_validator
 
@@ -80,6 +80,16 @@ PRUNE_EVERY_SECONDS = float(os.environ.get("SIDETRAY_PRUNE_EVERY_SECONDS") or 36
 # Uploaded media that no event refers to (an upload whose post never came) is
 # dropped after this long.
 ORPHAN_MEDIA_SECONDS = 24 * 3600
+# Phase 9: video files go once every device they're for has acked them, after
+# this many days whatever the acks, and oldest first beyond the caps (per group
+# and for the whole server). A fresh upload no post refers to yet is never evicted.
+VIDEO_TTL_DAYS = float(os.environ.get("SIDETRAY_VIDEO_TTL_DAYS") or 14)
+VIDEO_CAP_BYTES = int(float(os.environ.get("SIDETRAY_VIDEO_CAP_GB") or 5) * 1024**3)
+VIDEO_GROUP_CAP_BYTES = int(float(os.environ.get("SIDETRAY_VIDEO_GROUP_CAP_GB") or 2) * 1024**3)
+VIDEO_FRESH_SECONDS = 3600
+# Tombstones of deleted video files (for 410) stay this long after the TTL.
+GONE_KEEP_DAYS = 7
+MAX_MEDIA_ACKS = 500
 
 
 def env_int(name: str, default: int) -> int:
@@ -223,6 +233,21 @@ CREATE TABLE IF NOT EXISTS dm_acks (
     last_seq    INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
 );
+-- Phase 9: which device has downloaded which file (photos and videos), and
+-- the tombstones of video files that are gone, so GET /media can say 410.
+CREATE TABLE IF NOT EXISTS media_acks (
+    media_id    TEXT NOT NULL,
+    device_id   TEXT NOT NULL REFERENCES devices(id),
+    acked_at    INTEGER NOT NULL,
+    PRIMARY KEY (media_id, device_id)
+);
+CREATE TABLE IF NOT EXISTS media_gone (
+    id          TEXT PRIMARY KEY,
+    group_id    TEXT NOT NULL REFERENCES groups(id),
+    kind        TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    gone_at     INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS push_endpoints (
     device_id   TEXT PRIMARY KEY REFERENCES devices(id),
     endpoint    TEXT NOT NULL UNIQUE,
@@ -363,6 +388,9 @@ def init_db() -> None:
         # device's last DM seq (its messages up to then still count).
         add_column(conn, "groups", "dm_seq", "INTEGER NOT NULL DEFAULT 0")
         add_column(conn, "devices", "revoked_dm_seq", "INTEGER")
+        # Phase 9: videos, and devices that ack each file they download.
+        add_column(conn, "media", "kind", "TEXT NOT NULL DEFAULT 'image'")
+        add_column(conn, "devices", "media_acks", "INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS events_group_gseq ON events (group_id, gseq)")
         # Numbers each new event within its group, inside the inserting transaction.
         conn.execute(
@@ -386,6 +414,91 @@ KEPT_PROFILES = (
 )
 
 
+# Phase 9. The devices that must have acked file `m` (a media row) before it
+# may go: active devices of active members that existed when it was uploaded,
+# other than the uploader; for a direct message's file, only those the message
+# was sealed to. For photos only devices that ack files count (older apps are
+# covered by their event cursor); for videos every such device does, so a
+# video waits for apps that haven't updated yet (up to the TTL).
+def unacked_sql(capable_only: bool) -> str:
+    """SQL, true while some required device hasn't acked file `m`."""
+    return (
+        "EXISTS (SELECT d.id FROM devices d JOIN members rm ON rm.id = d.member_id"
+        " WHERE d.group_id = m.group_id AND d.status = 'active' AND rm.status = 'active'"
+        + (" AND d.media_acks = 1" if capable_only else "") +
+        " AND COALESCE(d.requested_at, 0) <= m.created_at AND d.id != m.uploader_device_id"
+        " AND (NOT EXISTS (SELECT 1 FROM dm_media x WHERE x.media_id = m.id)"
+        "      OR d.id IN (SELECT k.device_id FROM dm_media x JOIN dm_keys k ON k.message_id = x.message_id"
+        "                  WHERE x.media_id = m.id))"
+        " AND NOT EXISTS (SELECT 1 FROM media_acks a WHERE a.media_id = m.id AND a.device_id = d.id))"
+    )
+
+
+PHOTO_UNACKED = unacked_sql(capable_only=True)
+VIDEO_UNACKED = unacked_sql(capable_only=False)
+
+
+def media_in(media_ids: str) -> set[str]:
+    return {m for m in media_ids.split(",") if m}
+
+
+def referenced_media(conn: sqlite3.Connection) -> set[str]:
+    """Media ids some event or direct message refers to."""
+    live: set[str] = set()
+    for r in conn.execute("SELECT media_ids FROM events WHERE media_ids != ''"):
+        live |= media_in(r["media_ids"])
+    live.update(r["media_id"] for r in conn.execute("SELECT media_id FROM dm_media"))
+    return live
+
+
+def video_evictions(conn: sqlite3.Connection, t: int, group_id: str | None = None, extra: int = 0) -> tuple[list, bool]:
+    """Video files to evict, oldest first, so every group is within its cap and
+    the server within its own, counting `extra` more bytes for `group_id` (an
+    upload). Fresh uploads no post refers to yet are never evicted. Returns the
+    rows and whether everything then fits."""
+    rows = conn.execute(
+        "SELECT id, group_id, path, size_bytes, created_at FROM media WHERE kind = 'video' ORDER BY created_at, id"
+    ).fetchall()
+    used = referenced_media(conn)
+    per_group: dict[str, int] = {}
+    for r in rows:
+        per_group[r["group_id"]] = per_group.get(r["group_id"], 0) + r["size_bytes"]
+    if group_id is not None:
+        per_group[group_id] = per_group.get(group_id, 0) + extra
+    total = sum(per_group.values())
+    out = []
+    for r in rows:
+        g = r["group_id"]
+        if total <= VIDEO_CAP_BYTES and per_group[g] <= VIDEO_GROUP_CAP_BYTES:
+            continue
+        if r["id"] not in used and r["created_at"] >= t - VIDEO_FRESH_SECONDS:
+            continue
+        out.append(r)
+        per_group[g] -= r["size_bytes"]
+        total -= r["size_bytes"]
+    fits = total <= VIDEO_CAP_BYTES and all(v <= VIDEO_GROUP_CAP_BYTES for v in per_group.values())
+    return out, fits
+
+
+def drop_media(conn: sqlite3.Connection, rows, reason: str, t: int) -> None:
+    """Delete media rows (the caller unlinks the files after committing). A
+    video leaves a tombstone, so GET /media can answer 410 with the reason."""
+    for r in rows:
+        kind = conn.execute("SELECT kind FROM media WHERE id = ?", (r["id"],)).fetchone()
+        if kind is None:
+            continue
+        if kind["kind"] == "video":
+            conn.execute("INSERT OR REPLACE INTO media_gone (id, group_id, kind, reason, gone_at)"
+                         " VALUES (?, ?, 'video', ?, ?)", (r["id"], r["group_id"], reason, t))
+        conn.execute("DELETE FROM media WHERE id = ?", (r["id"],))
+        conn.execute("DELETE FROM media_acks WHERE media_id = ?", (r["id"],))
+
+
+def unlink_media(rows) -> None:
+    for r in rows:
+        (MEDIA_DIR / r["path"]).unlink(missing_ok=True)
+
+
 def prune(t: int | None = None) -> dict:
     """Delete events (and their media) that every active device has acked and
     that are older than the history window, and events and media older than
@@ -393,13 +506,32 @@ def prune(t: int | None = None) -> dict:
     history window). Revoked devices and
     removed members don't count. Records the highest seq deleted per group
     (`pruned_through`), so a device that comes back with an older cursor
-    knows it missed something."""
+    knows it missed something.
+
+    Phase 9: an event's photos must also have been acked file by file by every
+    device that acks files before the event goes (retention still wins), and
+    video files go on their own rules: delivered to everyone, past the video
+    TTL, or beyond the caps. A direct message stays while its video does."""
     t = now() if t is None else t
     cutoff = t - int(RETENTION_DAYS * 86400)
     history = t - int(HISTORY_DAYS * 86400)
     out = {"events": 0, "media": 0, "dms": 0}
+    gone: list = []
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        # Video files first, so their messages can go in the same run.
+        used = referenced_media(conn)
+        ttl = t - int(VIDEO_TTL_DAYS * 86400)
+        videos = conn.execute(
+            f"SELECT m.id, m.group_id, m.path, m.created_at, {VIDEO_UNACKED} AS waiting FROM media m WHERE m.kind = 'video'"
+        ).fetchall()
+        expired = [r for r in videos if r["created_at"] < ttl]
+        delivered = [r for r in videos if r["created_at"] >= ttl and r["id"] in used and not r["waiting"]]
+        drop_media(conn, expired, "ttl", t)
+        drop_media(conn, delivered, "delivered", t)
+        evicted, _ = video_evictions(conn, t)
+        drop_media(conn, evicted, "cap", t)
+        gone += expired + delivered + evicted
         doomed_media: set[str] = set()
         for g in conn.execute("SELECT id FROM groups").fetchall():
             gid = g["id"]
@@ -413,7 +545,14 @@ def prune(t: int | None = None) -> dict:
             acked = row["low"] if row["n"] else 0
             # Each active member's latest profile event (name, avatar) stays, so
             # devices that join later still see everyone's face.
-            where = ("group_id = ? AND ((gseq <= ? AND created_at < ?) OR created_at < ?)"
+            # Acked and past the history window, once every photo of it has been
+            # acked file by file too; or past retention whatever the acks.
+            # Only posts and comments: apps fetch just the latest avatar of each member.
+            photos_acked = ("events.kind NOT IN ('post', 'comment') OR NOT EXISTS (SELECT 1 FROM media m"
+                            " WHERE m.group_id = events.group_id"
+                            " AND m.kind = 'image' AND instr(',' || events.media_ids || ',', ',' || m.id || ',') > 0"
+                            f" AND {PHOTO_UNACKED})")
+            where = (f"group_id = ? AND ((gseq <= ? AND created_at < ? AND ({photos_acked})) OR created_at < ?)"
                      f" AND seq NOT IN ({KEPT_PROFILES})")
             args = (gid, acked, history, cutoff, gid)
             top = conn.execute(f"SELECT MAX(gseq) FROM events WHERE {where}", args).fetchone()[0]
@@ -424,13 +563,16 @@ def prune(t: int | None = None) -> dict:
             out["events"] += conn.execute(f"DELETE FROM events WHERE {where}", args).rowcount
             conn.execute("UPDATE groups SET pruned_through = MAX(pruned_through, ?) WHERE id = ?", (top, gid))
         # Direct messages: only the devices each one is for count. It goes once
-        # every one of them that's still active has acked it, or past retention.
+        # every one of them that's still active has acked it and its video file
+        # (if any) is gone, or past retention.
         dms = conn.execute(
-            "SELECT m.id, m.media_ids FROM dm_messages m WHERE m.created_at < ? OR NOT EXISTS ("
+            "SELECT m.id, m.media_ids FROM dm_messages m WHERE m.created_at < ? OR (NOT EXISTS ("
             " SELECT 1 FROM dm_keys k JOIN devices d ON d.id = k.device_id JOIN members mm ON mm.id = d.member_id"
             " LEFT JOIN dm_acks a ON a.device_id = k.device_id"
             " WHERE k.message_id = m.id AND d.status = 'active' AND mm.status = 'active'"
-            " AND COALESCE(a.last_seq, 0) < m.seq)",
+            " AND COALESCE(a.last_seq, 0) < m.seq)"
+            " AND NOT EXISTS (SELECT 1 FROM dm_media x JOIN media v ON v.id = x.media_id"
+            " WHERE x.message_id = m.id AND v.kind = 'video'))",
             (cutoff,),
         ).fetchall()
         for r in dms:
@@ -441,26 +583,24 @@ def prune(t: int | None = None) -> dict:
         out["dms"] = len(dms)
         # Media: referenced by a deleted event, past retention, or never referenced.
         # Avatars of the kept profile events stay whatever their age.
-        live: set[str] = set()
-        for r in conn.execute("SELECT media_ids FROM events WHERE media_ids != ''"):
-            live.update(m for m in r["media_ids"].split(",") if m)
-        live.update(r["media_id"] for r in conn.execute("SELECT media_id FROM dm_media"))
+        live = referenced_media(conn)
         kept: set[str] = set()
         for g in conn.execute("SELECT id FROM groups").fetchall():
             for r in conn.execute(f"SELECT media_ids FROM events WHERE seq IN ({KEPT_PROFILES})", (g["id"],)):
-                kept.update(m for m in r["media_ids"].split(",") if m)
+                kept |= media_in(r["media_ids"])
         doomed = [
-            r for r in conn.execute("SELECT id, path, created_at FROM media").fetchall()
+            r for r in conn.execute("SELECT id, group_id, path, created_at FROM media").fetchall()
             if r["id"] not in kept and (
                 r["id"] in doomed_media or r["created_at"] < cutoff
                 or (r["id"] not in live and r["created_at"] < t - ORPHAN_MEDIA_SECONDS))
         ]
-        for r in doomed:
-            conn.execute("DELETE FROM media WHERE id = ?", (r["id"],))
-        out["media"] = len(doomed)
+        drop_media(conn, doomed, "retention", t)
+        gone += doomed
+        out["media"] = len(gone)
+        conn.execute("DELETE FROM media_acks WHERE media_id NOT IN (SELECT id FROM media)")
+        conn.execute("DELETE FROM media_gone WHERE gone_at < ?", (t - int((VIDEO_TTL_DAYS + GONE_KEEP_DAYS) * 86400),))
     # Files after the commit: a crash in between leaves a stray file, never a dangling row.
-    for r in doomed:
-        (MEDIA_DIR / r["path"]).unlink(missing_ok=True)
+    unlink_media(gone)
     return out
 
 
@@ -1876,7 +2016,11 @@ def ack_dms(body: AckIn, dev: Device = Depends(current_device)):
 
 
 @api.post("/media", status_code=201)
-async def upload_media(request: Request, dev: Device = Depends(current_device)):
+async def upload_media(
+    request: Request,
+    kind: Literal["image", "video"] = Query("image"),
+    dev: Device = Depends(current_device),
+):
     declared = request.headers.get("content-length")
     if declared and int(declared) > MAX_MEDIA_BYTES:
         raise HTTPException(413, f"media larger than {MAX_MEDIA_BYTES} bytes")
@@ -1902,33 +2046,86 @@ async def upload_media(request: Request, dev: Device = Depends(current_device)):
         tmp.rename(final)
     finally:
         tmp.unlink(missing_ok=True)
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO media (id, group_id, uploader_device_id, size_bytes, path, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (media_id, dev.group_id, dev.id, size, str(final.relative_to(MEDIA_DIR)), now()),
-        )
+    t = now()
+    evicted: list = []
+    try:
+        with db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if kind == "video":
+                # Make room under the caps first, oldest first; refuse if it can't be made.
+                evicted, fits = video_evictions(conn, t, dev.group_id, size)
+                if not fits:
+                    evicted = []
+                    raise HTTPException(507, "video storage is full, try again later")
+                drop_media(conn, evicted, "cap", t)
+            conn.execute(
+                "INSERT INTO media (id, group_id, uploader_device_id, size_bytes, path, created_at, kind)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (media_id, dev.group_id, dev.id, size, str(final.relative_to(MEDIA_DIR)), t, kind),
+            )
+    except BaseException:
+        final.unlink(missing_ok=True)
+        raise
+    unlink_media(evicted)
     return {"id": media_id, "size_bytes": size}
+
+
+def fetchable(conn: sqlite3.Connection, dev: Device, media_id: str, table: str = "media"):
+    """The row of `table` (media, or media_gone) for this file if this device may
+    fetch it: same group, and for a direct message's file only the devices it
+    was sealed to and the sender's. Otherwise None, as for another group's."""
+    row = conn.execute(f"SELECT * FROM {table} WHERE id = ? AND group_id = ?", (media_id, dev.group_id)).fetchone()
+    dm = conn.execute(
+        "SELECT dm.message_id, m.sender_device_id FROM dm_media dm JOIN dm_messages m ON m.id = dm.message_id"
+        " WHERE dm.media_id = ?", (media_id,)
+    ).fetchone()
+    if row is not None and dm is not None and dm["sender_device_id"] != dev.id and not conn.execute(
+        "SELECT 1 FROM dm_keys WHERE message_id = ? AND device_id = ?", (dm["message_id"], dev.id)
+    ).fetchone():
+        return None
+    return row
 
 
 @api.get("/media/{media_id}")
 def download_media(media_id: str, dev: Device = Depends(current_device)):
     with db() as conn:
-        row = conn.execute(
-            "SELECT path FROM media WHERE id = ? AND group_id = ?", (media_id, dev.group_id)
-        ).fetchone()
-        # A direct message's photo: only the devices it was sealed to, and the sender's.
-        dm = conn.execute(
-            "SELECT dm.message_id, m.sender_device_id FROM dm_media dm JOIN dm_messages m ON m.id = dm.message_id"
-            " WHERE dm.media_id = ?", (media_id,)
-        ).fetchone()
-        if row is not None and dm is not None and dm["sender_device_id"] != dev.id and not conn.execute(
-            "SELECT 1 FROM dm_keys WHERE message_id = ? AND device_id = ?", (dm["message_id"], dev.id)
-        ).fetchone():
-            row = None  # looks like it doesn't exist, as another group's media does
+        row = fetchable(conn, dev, media_id)
+        gone = None if row is not None else fetchable(conn, dev, media_id, "media_gone")
+    if gone is not None:
+        # A video file the relay let go of (delivered to everyone, too old, or over the cap).
+        return JSONResponse({"detail": "this video has expired", "reason": gone["reason"]}, status_code=410)
     if row is None:
         raise HTTPException(404, "media not found")
     return FileResponse(MEDIA_DIR / row["path"], media_type="application/octet-stream")
+
+
+class MediaAcksIn(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=MAX_MEDIA_ACKS)
+
+
+def record_media_acks(dev: Device, ids: list[str]) -> int:
+    """This device has downloaded, checked and decrypted these files. Also marks
+    the device as one that acks files. Files it may not fetch, or that are
+    gone, are skipped. Returns how many were recorded."""
+    n = 0
+    with db() as conn:
+        conn.execute("UPDATE devices SET media_acks = 1 WHERE id = ?", (dev.id,))
+        for mid in dict.fromkeys(ids):
+            if fetchable(conn, dev, mid) is not None:
+                conn.execute("INSERT OR IGNORE INTO media_acks (media_id, device_id, acked_at) VALUES (?, ?, ?)",
+                             (mid, dev.id, now()))
+                n += 1
+    return n
+
+
+@api.post("/media/acks")
+def ack_media(body: MediaAcksIn, dev: Device = Depends(current_device)):
+    return {"acked": record_media_acks(dev, body.ids)}
+
+
+@api.post("/media/{media_id}/ack")
+def ack_one_media(media_id: str, dev: Device = Depends(current_device)):
+    return {"acked": record_media_acks(dev, [media_id])}
 
 
 class PushIn(BaseModel):

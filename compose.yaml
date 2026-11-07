@@ -15,6 +15,11 @@ services:
       # Days of recent events and photos kept even once everyone has them, so
       # people who join later see them. 0 = delete as soon as everyone has them.
       SIDETRAY_HISTORY_DAYS: ${SIDETRAY_HISTORY_DAYS:-14}
+      # Video files (Phase 9): kept until every device has downloaded them, at most
+      # this many days, and oldest first beyond these caps (per group, whole server).
+      SIDETRAY_VIDEO_TTL_DAYS: ${SIDETRAY_VIDEO_TTL_DAYS:-14}
+      SIDETRAY_VIDEO_GROUP_CAP_GB: ${SIDETRAY_VIDEO_GROUP_CAP_GB:-2}
+      SIDETRAY_VIDEO_CAP_GB: ${SIDETRAY_VIDEO_CAP_GB:-5}
       # Rate limits; empty means the defaults (30 events/minute and 50 MB of
       # uploads/hour per device; 10 join attempts and 60 group lookups/hour per IP).
       SIDETRAY_EVENTS_PER_MINUTE: ${SIDETRAY_EVENTS_PER_MINUTE:-}
