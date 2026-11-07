@@ -120,6 +120,13 @@ fn is_animated(bytes: &[u8], format: Option<ImageFormat>) -> bool {
     }
 }
 
+/// A video's poster frame (a JPEG from ffmpeg, or PNG) as a feed thumbnail:
+/// the same size and encoding as a photo's thumbnail.
+pub fn poster(frame: &[u8]) -> Result<Vec<u8>> {
+    let img = image::load_from_memory(frame).context("reading the video's poster frame")?;
+    Ok(encode_webp(&fit(&img, THUMB_SIDE), THUMB_QUALITY))
+}
+
 fn fit(img: &DynamicImage, side: u32) -> DynamicImage {
     if img.width().max(img.height()) <= side {
         img.clone()

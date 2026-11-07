@@ -36,6 +36,10 @@ pub struct App {
     secrets: Mutex<Option<Arc<Secrets>>>,
     /// Photos picked in the composer, already resized and encoded, waiting for "Post".
     pub staged: Mutex<HashMap<String, Processed>>,
+    /// Videos prepared in the composer (Phase 9), waiting for "Post" or "Send".
+    pub staged_videos: Mutex<HashMap<String, crate::video::Prepared>>,
+    /// Cancels the video being prepared, if any (one at a time).
+    pub transcode: Mutex<Option<crate::video::Cancel>>,
     /// One sync at a time.
     pub sync_lock: tokio::sync::Mutex<()>,
     /// One key rotation at a time (after a removal, or picked up by a sync).
@@ -88,6 +92,8 @@ impl App {
         let media_dir = data_dir.join("media");
         std::fs::create_dir_all(&media_dir)?;
         let conn = db::open(&data_dir.join("sidetray.db"))?;
+        // Videos prepared but never sent in an earlier run.
+        let _ = std::fs::remove_dir_all(data_dir.join(crate::video::STAGING_DIR));
         Ok(App {
             profile_id,
             dir: data_dir,
@@ -95,6 +101,8 @@ impl App {
             db: Mutex::new(conn),
             secrets: Mutex::new(None),
             staged: Mutex::new(HashMap::new()),
+            staged_videos: Mutex::new(HashMap::new()),
+            transcode: Mutex::new(None),
             sync_lock: tokio::sync::Mutex::new(()),
             rotate_lock: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),

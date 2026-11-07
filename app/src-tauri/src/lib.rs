@@ -823,6 +823,117 @@ async fn video_support() -> video::Support {
     video::support().await
 }
 
+#[derive(Serialize)]
+struct StagedVideoView {
+    id: String,
+    /// The poster frame.
+    preview: String,
+    width: u32,
+    height: u32,
+    duration_ms: u64,
+    bytes: u64,
+}
+
+fn staged_video_view(id: &str, v: &video::Prepared) -> StagedVideoView {
+    StagedVideoView {
+        id: id.to_string(),
+        preview: format!("data:image/webp;base64,{}", B64.encode(&v.thumb)),
+        width: v.width,
+        height: v.height,
+        duration_ms: v.duration_ms,
+        bytes: v.size,
+    }
+}
+
+/// `needs_trim` (the clip's length) when it's over 60 s and the person hasn't
+/// said yet to use its first 60 seconds; otherwise the prepared video.
+#[derive(Serialize)]
+struct StageVideoResult {
+    needs_trim: Option<u64>,
+    video: Option<StagedVideoView>,
+}
+
+/// The native file dialog for a video; its path, or None if cancelled.
+#[tauri::command]
+async fn pick_video(handle: AppHandle) -> Option<String> {
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_dialog::DialogExt;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle
+            .dialog()
+            .file()
+            .set_title("Choose a video")
+            .add_filter("Videos", &["mp4", "mov", "m4v", "mkv", "webm", "avi", "3gp", "mts", "m2ts", "wmv", "mpg", "mpeg"])
+            .pick_file(move |f| {
+                let _ = tx.send(f);
+            });
+        rx.await.ok().flatten().and_then(|f| f.into_path().ok()).map(|p| p.display().to_string())
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = handle;
+        None
+    }
+}
+
+/// Prepare the video at `path` for sending (SPEC "Transcoding"), reporting
+/// progress as `video-progress` events, and keep it until it's posted.
+#[tauri::command]
+async fn stage_video(handle: AppHandle, app: Active, path: String, trim: Option<bool>) -> Res<StageVideoResult> {
+    let ffmpeg = video::ffmpeg_path().ok_or("This copy of Side Tray can't prepare videos.")?;
+    let source = std::path::PathBuf::from(&path);
+    let info = video::probe(&ffmpeg, &source).await.map_err(err)?;
+    if info.duration_ms > video::MAX_DURATION_MS + video::TRIM_SLACK_MS && trim != Some(true) {
+        return Ok(StageVideoResult { needs_trim: Some(info.duration_ms), video: None });
+    }
+    let cancel = video::Cancel::default();
+    if let Some(old) = app.transcode.lock().unwrap_or_else(|e| e.into_inner()).replace(cancel.clone()) {
+        old.notify_one();
+    }
+    let mut idb = [0u8; 9];
+    getrandom::getrandom(&mut idb).map_err(|e| e.to_string())?;
+    let id: String = idb.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = app.dir.join(video::STAGING_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let out = dir.join(format!("{id}.mp4"));
+    let (h, profile) = (handle.clone(), app.profile_id.clone());
+    let result = video::prepare(&ffmpeg, &source, &out, &cancel, move |fraction| {
+        let _ = h.emit("video-progress", serde_json::json!({ "profile": profile, "fraction": fraction }));
+    })
+    .await;
+    {
+        let mut slot = app.transcode.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &cancel)) {
+            *slot = None;
+        }
+    }
+    let v = result.map_err(err)?;
+    let view = staged_video_view(&id, &v);
+    app.staged_videos.lock().unwrap_or_else(|e| e.into_inner()).insert(id, v);
+    Ok(StageVideoResult { needs_trim: None, video: Some(view) })
+}
+
+#[tauri::command]
+fn cancel_transcode(app: Active) {
+    if let Some(c) = app.transcode.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        c.notify_one();
+    }
+}
+
+#[tauri::command]
+fn unstage_video(app: Active, id: String) {
+    if let Some(v) = app.staged_videos.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+        let _ = std::fs::remove_file(v.path);
+    }
+}
+
+/// Like `staged_photos`, for a reloaded page's draft video.
+#[tauri::command]
+fn staged_video(app: Active, id: String) -> Option<StagedVideoView> {
+    app.staged_videos.lock().unwrap_or_else(|e| e.into_inner()).get(&id).map(|v| staged_video_view(&id, v))
+}
+
 #[tauri::command]
 async fn create_post(app: Active, text: String, photos: Vec<String>) -> Res<()> {
     feed::create_post(&app, &text, &photos).await.map_err(err)
@@ -1139,6 +1250,7 @@ pub fn run() {
         }
         builder = builder
             .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_dialog::init())
             .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![MINIMIZED_ARG])))
             // Closing the window keeps the app running in the tray; Quit is in the tray menu.
             .on_window_event(|window, event| {
@@ -1227,6 +1339,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             video_support,
+            pick_video,
+            stage_video,
+            cancel_transcode,
+            unstage_video,
+            staged_video,
             check_server,
             trust_server,
             probe_group,

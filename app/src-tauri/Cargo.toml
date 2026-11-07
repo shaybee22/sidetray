@@ -63,6 +63,10 @@ tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
 # "Start with Windows" (login item on macOS, autostart entry on Linux).
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-updater = "2.14.1"
+# The video picker (Phase 9): a native file dialog, so the app gets the
+# file's path and never moves the whole file through the webview. Called from
+# Rust only; the webview gets no dialog permission.
+tauri-plugin-dialog = "2"
 
 # Android: the device's secrets are wrapped by a Keystore key, reached over JNI.
 [target.'cfg(target_os = "android")'.dependencies]
