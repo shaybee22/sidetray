@@ -53,8 +53,24 @@ jobs:
           id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
 
+  # The trimmed LGPL ffmpeg.exe the Windows app bundles to prepare videos
+  # (Phase 9), cross-compiled from the pinned FFmpeg source.
+  ffmpeg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ffmpeg.exe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 nasm make pkg-config xz-utils
+          scripts/build-ffmpeg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-windows
+          path: app/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
+
   build:
-    needs: draft
+    needs: [draft, ffmpeg]
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +95,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
 
+      - uses: actions/download-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: ffmpeg-windows
+          path: app/src-tauri/binaries
+
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -88,7 +110,7 @@ jobs:
         with:
           projectPath: app
           releaseId: ${{ needs.draft.outputs.release_id }}
-          args: --bundles ${{ matrix.bundles }}
+          args: --bundles ${{ matrix.bundles }} ${{ runner.os == 'Windows' && '--config src-tauri/tauri.ffmpeg.conf.json' || '' }}
           uploadUpdaterJson: true
 
       # A copy under a fixed name, so

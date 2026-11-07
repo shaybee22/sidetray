@@ -36,6 +36,7 @@ mod state;
 mod tray;
 #[cfg_attr(mobile, path = "update_mobile.rs")]
 mod update;
+mod video;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Serialize;
@@ -816,6 +817,12 @@ fn unstage_photo(app: Active, id: String) {
     app.staged.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
+/// Whether this computer can send videos (Phase 9), and if not, why.
+#[tauri::command]
+async fn video_support() -> video::Support {
+    video::support().await
+}
+
 #[tauri::command]
 async fn create_post(app: Active, text: String, photos: Vec<String>) -> Res<()> {
     feed::create_post(&app, &text, &photos).await.map_err(err)
@@ -1219,6 +1226,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            video_support,
             check_server,
             trust_server,
             probe_group,

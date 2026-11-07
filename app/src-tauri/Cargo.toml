@@ -38,7 +38,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 # rustls only, so the app trusts exactly the roots we give it (no OS store, no OpenSSL).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "process", "io-util", "fs", "rt"] }
 # Photos: decode common formats, apply EXIF orientation, resize; libwebp for lossy WebP.
 image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 webp = { version = "0.3", default-features = false }

@@ -933,6 +933,15 @@ environment the build still makes the installer but fails at the updater
 signature; set `TAURI_SIGNING_PRIVATE_KEY` (the key's contents or path) and
 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
+**ffmpeg for videos (Windows).** The Windows app prepares videos with a
+bundled `ffmpeg.exe` (Phase 9). Build it once on Linux or WSL with
+`scripts/build-ffmpeg.sh` (it needs `mingw-w64 nasm make pkg-config
+xz-utils`), which writes `app/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe`,
+then add `--config tauri.ffmpeg.conf.json` to `cargo tauri build`. The release
+workflow does both. Without it the app still builds and plays videos, but
+can't send them. For development, `SIDETRAY_FFMPEG=<path to an ffmpeg>` makes
+the app use another ffmpeg.
+
 **The Windows installer** (Tauri's NSIS template plus
 `app/src-tauri/windows/installer-hooks.nsh`) installs per user into
 `%LOCALAPPDATA%\Side Tray`, so it needs no administrator rights. It adds a
@@ -1183,3 +1192,11 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
+
+**ffmpeg.** The Windows app includes `ffmpeg.exe` from the [FFmpeg](https://ffmpeg.org)
+project, licensed under the GNU Lesser General Public License 2.1 or later.
+It is built from the unmodified FFmpeg 9.0.2 source
+(https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz) with only LGPL parts and no
+external libraries, by `scripts/build-ffmpeg.sh`, which holds the exact
+configuration. It runs as a separate program; you may replace it with your own
+build of FFmpeg.

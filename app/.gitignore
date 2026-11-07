@@ -1,2 +1,4 @@
 src-tauri/target/
 src-tauri/gen/schemas/
+# Built by scripts/build-ffmpeg.sh (Phase 9); not committed.
+src-tauri/binaries/ffmpeg-*

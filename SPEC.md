@@ -523,6 +523,12 @@ Built in three stages, each tested before the next: **9a** the relay (video rete
 
 **Done when** a 45 s phone clip posts at 720p and a 60 s one at 480p, each under 10 MB with a working poster frame and no metadata, and a 90 s clip posts as its first 60 s after the question. Every device of the group plays it after download, and the relay deletes the file once the last device acks (the post and poster frame stay). A video nobody fetched is gone after 14 days; with the caps set low, the oldest go first and an upload that can't fit gets a clear error. A DM video works the same for just the two people's devices, and a third member gets 404. With *Auto-download videos on mobile data* off, the razr on mobile data leaves a video pending until it's back on Wi-Fi. A member whose copy expired taps Request, and the poster taps Send it and the requester plays it. Desktop (Windows) and the razr both transcode, show progress and seek during playback. With `SIDETRAY_HISTORY_DAYS=0`, a feed photo stays on the relay until every device has downloaded it.
 
+**Progress** (branch `phase-9-video`; update after each step)
+
+- 9a done (relay retention and per-file acks, app feed-photo acks), tested live on tst-svr / Campfire Club.
+- 9b step 1 done: `scripts/build-ffmpeg.sh` (trimmed LGPL ffmpeg 9.0.2, cross-compiled with mingw-w64), `tauri.ffmpeg.conf.json` overlay (`externalBin`, used by the release workflow's Windows build so plain builds and tests don't need the binary), release job `ffmpeg`, `video.rs` (finds `ffmpeg.exe` next to the app or `SIDETRAY_FFMPEG`; `video_support` command checks for `h264_mf`, `aac` and Media Foundation). The binary itself hasn't been built yet: the build needs the user's go-ahead (auto mode refuses to compile downloaded source). Dev testing uses the winget ffmpeg via `SIDETRAY_FFMPEG`.
+- Next: transcode (probe, bitrate maths, 60 s trim offer, progress, poster frame), then upload/ack wiring, then playback and "Video expired" UI.
+
 ## Distribution and later
 
 **Distribution**
