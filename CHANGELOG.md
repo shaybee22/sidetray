@@ -3,7 +3,10 @@
 All notable changes to Side Tray. Versions follow [Semantic Versioning](https://semver.org/);
 the app, the Rust crates and the relay share one version number.
 
-## [Unreleased]
+## [0.3.1] - 2026-11-07
+
+A relay change for people who join later, and a fix for missing photos in
+direct messages.
 
 ### Relay
 
@@ -227,6 +230,7 @@ The first release: everything in [SPEC.md](SPEC.md) through Phase 7.
 - Clicking an old notification in the Windows notification centre doesn't
   open the post it was about (one still on screen does).
 
+[0.3.1]: https://github.com/shaybee22/sidetray/releases/tag/v0.3.1
 [0.3.0]: https://github.com/shaybee22/sidetray/releases/tag/v0.3.0
 [0.2.0]: https://github.com/shaybee22/sidetray/releases/tag/v0.2.0
 [0.1.1]: https://github.com/shaybee22/sidetray/releases/tag/v0.1.1
