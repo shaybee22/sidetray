@@ -3,6 +3,28 @@
 All notable changes to Side Tray. Versions follow [Semantic Versioning](https://semver.org/);
 the app, the Rust crates and the relay share one version number.
 
+## [Unreleased]
+
+### App
+
+- **Short videos in posts and direct messages** (Windows for now). The Video
+  button prepares a clip on your computer: at most a minute (a longer one can
+  go as its first 60 seconds), 720p or 480p, under 10 MB, with location and
+  other details removed. Videos download in the background and play in the
+  feed or chat. Once a video has left the server you see "Video expired" and
+  can ask the person to send it again in a message.
+- The app tells the relay which photos and videos it has downloaded, so the
+  relay can let them go.
+
+### Relay
+
+- **Video files are kept only briefly:** until every device has downloaded
+  them, 14 days at most, and within 2 GB per group and 5 GB per server
+  (`SIDETRAY_VIDEO_TTL_DAYS`, `SIDETRAY_VIDEO_GROUP_CAP_GB`,
+  `SIDETRAY_VIDEO_CAP_GB`). A deleted video answers 410 with the reason.
+- Feed photos stay until every updated device has downloaded them, also with
+  `SIDETRAY_HISTORY_DAYS=0`.
+
 ## [0.3.1] - 2026-11-07
 
 A relay change for people who join later, and a fix for missing photos in

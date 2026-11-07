@@ -990,8 +990,23 @@ fn dm_recipients(app: Active) -> Res<Vec<dm::Recipient>> {
 }
 
 #[tauri::command]
-async fn send_dm(app: Active, member_id: String, text: String, photos: Vec<String>, video: Option<String>) -> Res<()> {
-    dm::send(&app, &member_id, &text, &photos, video.as_deref()).await.map_err(err)
+async fn send_dm(
+    app: Active,
+    member_id: String,
+    text: String,
+    photos: Vec<String>,
+    video: Option<String>,
+    video_request: Option<video::VideoRequest>,
+) -> Res<()> {
+    dm::send(&app, &member_id, &text, &photos, video.as_deref(), video_request.as_ref()).await.map_err(err)
+}
+
+/// Stage a copy of a video this device has (one's own, to send it again in a message).
+#[tauri::command]
+fn stage_local_video(app: Active, id: String) -> Res<StagedVideoView> {
+    app.require_active().map_err(err)?;
+    let (staged_id, v) = video::stage_local(&app, &id).map_err(err)?;
+    Ok(staged_video_view(&staged_id, &v))
 }
 
 /// The conversation was looked at: clear its unread count (and the badge).
@@ -1352,6 +1367,7 @@ pub fn run() {
             unstage_video,
             staged_video,
             read_video,
+            stage_local_video,
             check_server,
             trust_server,
             probe_group,

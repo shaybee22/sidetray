@@ -173,6 +173,8 @@ pub fn open(path: &Path) -> Result<Connection> {
     // 0.1.1: photos on comments. `post_id` stays the post (so the photos go
     // with it); `comment_id` is the comment, NULL for the post's own photos.
     add_column(&conn, "media", "comment_id", "TEXT")?;
+    // Phase 9: a message asking for a video ({"post_id", "video_id"} as JSON).
+    add_column(&conn, "dm_messages", "video_request", "TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS media_comment ON media(comment_id, idx)")?;
     // Phase 9: photos this device has told the relay it no longer needs
     // (downloaded, or given up on), and ids of a deleted post's photos to tell it.

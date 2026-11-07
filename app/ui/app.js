@@ -1019,7 +1019,12 @@ function renderPost(p) {
   const n = p.photos.length;
   photos.classList.add(n === 1 ? "n1" : n === 2 ? "n2" : n === 4 ? "n4" : "many");
   for (const ph of p.photos) photos.append(renderPhoto(ph, n === 1));
-  if (p.video) photos.after(renderVideo(p.video));
+  if (p.video) {
+    const ctx = { mine: p.mine, authorId: p.author_id, authorName: p.author, canMessage: p.author_can_message, at: p.created_at, postId: p.id };
+    const v = renderVideo(p.video, ctx);
+    photos.after(v);
+    if (p.mine && p.video.state === "ready") v.after(videoActions(p.video));
+  }
 
   renderReactions($(".reactions", el), p);
 
@@ -1569,11 +1574,45 @@ listen("upload-progress", (ev) => {
   s.render();
 });
 
-/** A post's or message's video: the poster frame and what can be done with it. */
-function renderVideo(v) {
+/** Videos being watched (id -> <video>), kept across feed and chat redraws. */
+const playing = new Map();
+
+async function playVideo(id, box) {
+  let el = playing.get(id);
+  if (!el) {
+    // The decrypted file, played from memory: nothing is served from disk.
+    const buf = await invoke("read_video", { id });
+    el = document.createElement("video");
+    el.controls = true;
+    el.playsInline = true;
+    el.src = URL.createObjectURL(new Blob([buf], { type: "video/mp4" }));
+    playing.set(id, el);
+    // Keep a few; let go of the oldest that isn't on screen.
+    for (const [old, v] of playing) {
+      if (playing.size <= 3) break;
+      if (old !== id && !v.isConnected) {
+        URL.revokeObjectURL(v.src);
+        playing.delete(old);
+      }
+    }
+  }
+  box.replaceChildren(el);
+  el.play().catch(() => {});
+}
+
+/**
+ * A post's or message's video: the poster frame and what can be done with
+ * it. `ctx`: {mine, authorId, authorName, canMessage, at, postId} (who to ask
+ * for an expired video, and whether it's one's own).
+ */
+function renderVideo(v, ctx = {}) {
   const box = document.createElement("div");
   box.className = "video " + v.state;
   box.dataset.video = v.id;
+  if (v.state === "ready" && playing.has(v.id)) {
+    box.append(playing.get(v.id));
+    return box;
+  }
   const poster = document.createElement("img");
   poster.className = "poster" + (v.thumb ? "" : " none");
   if (v.thumb) poster.src = v.thumb;
@@ -1587,7 +1626,13 @@ function renderVideo(v) {
   const status = document.createElement("div");
   status.className = "video-status";
   if (v.state === "ready") {
-    box.append(tag);
+    const play = document.createElement("button");
+    play.type = "button";
+    play.className = "play";
+    play.textContent = "▶";
+    play.setAttribute("aria-label", `Play video (${fmtDuration(v.duration_ms)})`);
+    play.addEventListener("click", () => playVideo(v.id, box).catch((e) => notice("Can't play this video", String(e))));
+    box.append(play, tag);
   } else if (v.state === "downloading") {
     const p = videoProgress.get(v.id);
     status.textContent = p ? `Downloading video… ${fmtMB(p)} of ${fmtMB(v.size)}` : "Downloading video…";
@@ -1599,10 +1644,105 @@ function renderVideo(v) {
     status.textContent = "The video couldn't be downloaded.";
     box.append(status);
   } else if (v.state === "expired") {
-    status.textContent = "Video expired";
+    const label = document.createElement("span");
+    label.textContent = "Video expired";
+    status.append(label);
+    if (!ctx.mine && ctx.authorId) {
+      const ask = document.createElement("button");
+      ask.type = "button";
+      ask.className = "ghost small";
+      ask.textContent = "Request";
+      if (ctx.canMessage === false) {
+        ask.disabled = true;
+        ask.title = `${ctx.authorName || "They"} can't get messages now (not a verified member any more).`;
+      } else {
+        ask.title = `Ask ${ctx.authorName || "them"} to send it to you in a message`;
+        ask.addEventListener("click", () => requestVideo(v, ctx));
+      }
+      status.append(ask);
+    }
     box.append(status);
   }
   return box;
+}
+
+/** Below one's own video in the feed: send it to someone in a message. */
+function videoActions(v) {
+  const row = document.createElement("div");
+  row.className = "video-actions";
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "link small";
+  b.textContent = "Send in a message…";
+  b.addEventListener("click", () => {
+    selectTab("messages");
+    openPicker(async (p) => {
+      await openChat(p.member_id);
+      try {
+        dmVideo.v = await invoke("stage_local_video", { id: v.id });
+        dmVideo.render();
+      } catch (e) {
+        showError($("#dm-err"), e);
+      }
+    });
+  });
+  row.append(b);
+  return row;
+}
+
+/** The DM composer's pending request for an expired video, sent with the next message. */
+let dmRequest = null;
+
+function setDmRequest(r) {
+  dmRequest = r;
+  const note = $("#dm-request");
+  note.hidden = !r;
+  if (r) $("span", note).textContent = "Asking for the video. They can send it with one tap if it's still on their device.";
+}
+$("#dm-request-x").addEventListener("click", () => setDmRequest(null));
+
+async function requestVideo(v, ctx) {
+  selectTab("messages");
+  await openChat(ctx.authorId);
+  const date = new Date((ctx.at || 0) * 1000).toLocaleDateString(undefined, { month: "long", day: "numeric" });
+  $("#dm-text").value = `Could you send me your video from ${date}?`;
+  setDmRequest({ post_id: ctx.postId, video_id: v.id });
+  $("#dm-text").focus();
+}
+
+/** In a chat: someone asked for one of my videos. */
+function renderVideoRequest(m) {
+  const q = m.video_request;
+  const row = document.createElement("div");
+  row.className = "video-request";
+  if (m.mine) {
+    row.textContent = "You asked for a video.";
+    row.classList.add("muted");
+    return row;
+  }
+  if (!q.here) {
+    row.textContent = "This video isn't on this device.";
+    row.classList.add("muted");
+    return row;
+  }
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "primary small";
+  b.textContent = "Send it";
+  b.addEventListener("click", () => busy(b, async () => {
+    b.textContent = "Sending…";
+    const member = chatWith;
+    try {
+      const staged = await invoke("stage_local_video", { id: q.video_id });
+      uploadingSlot = null;
+      await invoke("send_dm", { memberId: member, text: "", photos: [], video: staged.id });
+      if (chatWith === member) await loadChat(true);
+    } catch (e) {
+      showError($("#dm-err"), e);
+    }
+  }));
+  row.append(b);
+  return row;
 }
 
 /** Bytes received so far, per video id, while downloading. */
@@ -2775,6 +2915,7 @@ async function openChat(memberId) {
     draftFor = memberId;
     dmTray.clear();
     dmVideo.clear();
+    setDmRequest(null);
     $("#dm-text").value = "";
     hideError($("#dm-err"));
   }
@@ -2843,7 +2984,7 @@ async function loadChat(scrollToEnd) {
       sep.textContent = new Date(m.created_at * 1000).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
       items.push(sep);
     }
-    items.push(renderBubble(m));
+    items.push(renderBubble(m, c));
   }
   if (!items.length) {
     const empty = document.createElement("p");
@@ -2861,7 +3002,7 @@ async function loadChat(scrollToEnd) {
   markChatRead();
 }
 
-function renderBubble(m) {
+function renderBubble(m, c) {
   const row = document.createElement("div");
   row.className = "bubble-row" + (m.mine ? " mine" : "");
   const b = document.createElement("div");
@@ -2873,7 +3014,9 @@ function renderBubble(m) {
     for (const ph of m.photos) photos.append(renderPhoto(ph, n === 1));
     b.append(photos);
   }
-  if (m.video) b.append(renderVideo(m.video));
+  if (m.video) {
+    b.append(renderVideo(m.video, { mine: m.mine, authorId: c.member_id, authorName: c.name, canMessage: c.can_message, at: m.created_at, postId: m.id }));
+  }
   const text = document.createElement("div");
   text.className = "text";
   text.textContent = m.text;
@@ -2882,12 +3025,15 @@ function renderBubble(m) {
   t.textContent = new Date(m.created_at * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
   t.title = new Date(m.created_at * 1000).toLocaleString();
   b.append(text, t);
+  if (m.video_request) t.before(renderVideoRequest(m));
   row.append(b);
   return row;
 }
 
 // New message: pick someone from the verified roster.
-$("#dm-new").addEventListener("click", async () => {
+$("#dm-new").addEventListener("click", () => openPicker((p) => openChat(p.member_id)));
+
+async function openPicker(onPick) {
   const err = $("#dm-list-err");
   hideError(err);
   let people;
@@ -2907,12 +3053,12 @@ $("#dm-new").addEventListener("click", async () => {
     const name = document.createElement("span");
     name.textContent = p.name;
     b.append(face, name);
-    b.addEventListener("click", () => { $("#dm-picker").hidden = true; openChat(p.member_id); });
+    b.addEventListener("click", () => { $("#dm-picker").hidden = true; onPick(p); });
     return b;
   }));
   $("#dm-picker-empty").hidden = people.length > 0;
   $("#dm-picker").hidden = false;
-});
+}
 $("#dm-picker-cancel").addEventListener("click", () => { $("#dm-picker").hidden = true; });
 
 // The same pipeline as posts: resized, re-encoded as WebP, EXIF (GPS included) dropped.
@@ -2939,11 +3085,12 @@ $("#dm-composer").addEventListener("submit", async (ev) => {
     $("#dm-send").textContent = photos.length || video ? "Uploading…" : "Sending…";
     uploadingSlot = video ? dmVideo : null;
     try {
-      await invoke("send_dm", { memberId: member, text, photos, video });
+      await invoke("send_dm", { memberId: member, text, photos, video, videoRequest: dmRequest });
       if (chatWith === member) {
         $("#dm-text").value = "";
         dmTray.sent();
         dmVideo.sent();
+        setDmRequest(null);
         await loadChat(true);
       }
     } catch (e) {

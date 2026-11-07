@@ -47,6 +47,9 @@ struct DmBody {
     photos: Vec<PhotoRef>,
     #[serde(default)]
     video: Option<crate::video::VideoRef>,
+    /// Asking for an expired video to be sent again.
+    #[serde(default)]
+    video_request: Option<crate::video::VideoRequest>,
 }
 
 /// Who may send: verified devices now, and former ones for messages up to
@@ -204,6 +207,9 @@ fn apply(conn: &Connection, id: &Identity, s: &Secrets, me: &DeviceKeys, authors
     }
     if let Some(v) = &body.video {
         crate::video::store_ref(conn, crate::video::Owner::Message { message_id: &msg_id }, v, false)?;
+    }
+    if let Some(req) = body.video_request.as_ref().filter(|r| r.valid()) {
+        conn.execute("UPDATE dm_messages SET video_request = ?1 WHERE id = ?2", params![serde_json::to_string(req)?, msg_id])?;
     }
     let text = snippet(&body.text, body.photos.len(), body.video.is_some());
     record(conn, &conv, &other, m.seq, m.created_at, &text, from_me, !from_me)?;
@@ -388,7 +394,14 @@ struct SeqResp {
 
 /// Send a message to `member_id` with text and photos already staged (and
 /// resized, EXIF stripped) by `stage_photo`, or a video staged by `stage_video`.
-pub async fn send(app: &App, member_id: &str, text: &str, staged: &[String], video: Option<&str>) -> Result<()> {
+pub async fn send(
+    app: &App,
+    member_id: &str,
+    text: &str,
+    staged: &[String],
+    video: Option<&str>,
+    request: Option<&crate::video::VideoRequest>,
+) -> Result<()> {
     let id = app.require_active()?;
     let text = text.trim();
     if text.len() > MAX_TEXT {
@@ -411,10 +424,13 @@ pub async fn send(app: &App, member_id: &str, text: &str, staged: &[String], vid
     if text.is_empty() && photos.is_empty() && prepared.is_none() {
         bail!("write something or add a photo");
     }
-    let sent = match send_once(app, &id, member_id, text, &photos, prepared.as_ref()).await {
+    if request.is_some_and(|r| !r.valid()) {
+        bail!("that video request isn't valid");
+    }
+    let sent = match send_once(app, &id, member_id, text, &photos, prepared.as_ref(), request).await {
         // Someone's devices changed between our roster refresh and the send: once more.
         Err(e) if is_status(&e, 422) && format!("{e:#}").contains("sealed to exactly") => {
-            send_once(app, &id, member_id, text, &photos, prepared.as_ref()).await?
+            send_once(app, &id, member_id, text, &photos, prepared.as_ref(), request).await?
         }
         r => r?,
     };
@@ -437,6 +453,7 @@ async fn send_once(
     text: &str,
     photos: &[crate::photo::Processed],
     video: Option<&crate::video::Prepared>,
+    request: Option<&crate::video::VideoRequest>,
 ) -> Result<Option<(String, crate::video::VideoRef)>> {
     let api = app.api(id)?;
     let s = app.secrets(id)?;
@@ -462,6 +479,9 @@ async fn send_once(
     let mut body = serde_json::json!({ "text": text });
     if !refs.is_empty() {
         body["photos"] = serde_json::to_value(&refs)?;
+    }
+    if let Some(r) = request {
+        body["video_request"] = serde_json::to_value(r)?;
     }
     let mut media_ids: Vec<String> = refs.iter().flat_map(|r| [r.full.clone(), r.thumb.clone()]).collect();
     let video_ref = match video {
@@ -498,6 +518,9 @@ async fn send_once(
     let conn = app.db();
     let tx = conn.unchecked_transaction()?;
     store(&tx, &s, &msg_id, resp.seq, &conv, &id.member_id, &id.device_id, text, crate::now(), &key)?;
+    if let Some(r) = request {
+        tx.execute("UPDATE dm_messages SET video_request = ?1 WHERE id = ?2", params![serde_json::to_string(r)?, msg_id])?;
+    }
     for (i, (r, (fd, td))) in refs.iter().zip(&digests).enumerate() {
         tx.execute(
             "INSERT OR IGNORE INTO dm_photos (id, message_id, idx, width, height, full_digest, thumb_id, thumb_digest, local_path, thumb_path)
@@ -567,6 +590,15 @@ pub struct MessageView {
     pub created_at: i64,
     pub photos: Vec<PhotoView>,
     pub video: Option<crate::video::VideoView>,
+    pub video_request: Option<VideoRequestView>,
+}
+
+/// A message asking for a video: `here` when this device can send it again.
+#[derive(Serialize)]
+pub struct VideoRequestView {
+    pub post_id: String,
+    pub video_id: String,
+    pub here: bool,
 }
 
 /// The conversation with one member, oldest first (it may not have started yet).
@@ -580,14 +612,27 @@ pub fn chat(conn: &Connection, id: &Identity, member_id: &str) -> Result<ChatVie
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let mut st = conn.prepare(
-        "SELECT id, seq, sender_member_id, body, created_at FROM
+        "SELECT id, seq, sender_member_id, body, created_at, video_request FROM
            (SELECT * FROM dm_messages WHERE conversation_id = ?1 ORDER BY seq DESC LIMIT ?2)
          ORDER BY seq",
     )?;
     let mut messages: Vec<MessageView> = st
         .query_map(params![conv, CHAT_LIMIT], |r| {
             let sender: String = r.get(2)?;
-            Ok(MessageView { id: r.get(0)?, seq: r.get(1)?, mine: sender == id.member_id, text: r.get(3)?, created_at: r.get(4)?, photos: vec![], video: None })
+            let request = r
+                .get::<_, Option<String>>(5)?
+                .and_then(|j| serde_json::from_str::<crate::video::VideoRequest>(&j).ok())
+                .map(|q| VideoRequestView { post_id: q.post_id, video_id: q.video_id, here: false });
+            Ok(MessageView {
+                id: r.get(0)?,
+                seq: r.get(1)?,
+                mine: sender == id.member_id,
+                text: r.get(3)?,
+                created_at: r.get(4)?,
+                photos: vec![],
+                video: None,
+                video_request: request,
+            })
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut photos = conn.prepare("SELECT thumb_path, local_path, width, height FROM dm_photos WHERE message_id = ?1 ORDER BY idx")?;
@@ -603,6 +648,9 @@ pub fn chat(conn: &Connection, id: &Identity, member_id: &str) -> Result<ChatVie
             })?
             .collect::<rusqlite::Result<_>>()?;
         m.video = crate::video::view(conn, "message_id", &m.id)?;
+        if let Some(q) = &mut m.video_request {
+            q.here = crate::video::can_resend(conn, &id.member_id, &q.video_id);
+        }
     }
     Ok(ChatView { member_id: member_id.to_string(), name, avatar: avatar.as_deref().map(media_url), can_message, messages })
 }
@@ -870,6 +918,34 @@ mod tests {
         assert_eq!(ackable_seq(&f.conn).unwrap(), 1);
         let v = crate::video::view(&f.conn, "message_id", &m_id(&m)).unwrap().unwrap();
         assert_eq!((v.state.as_str(), v.duration_ms, v.mine), ("pending", 42_000, false));
+    }
+
+    #[test]
+    fn video_requests_show_send_it_only_for_my_own_video_on_this_device() {
+        let mut f = fixture();
+        let (ana, me) = (f.ana.clone_keys(), f.me.clone_keys());
+        let req = |vid: &str| serde_json::json!({ "post_id": "p_mine", "video_id": vid });
+        for body in [
+            serde_json::json!({ "text": "Could you send me your video?", "video_request": req("v_mine") }),
+            serde_json::json!({ "text": "And this one?", "video_request": req("v_theirs") }),
+            serde_json::json!({ "text": "bad", "video_request": req("../x") }),
+        ] {
+            let m = f.dm(("d_ana", &ana, "m_ana"), "m_me", &[("d_me", &me)], body);
+            f.apply(&m).unwrap();
+        }
+        f.conn.execute("INSERT INTO posts (id, seq, author_id, author_device_id, body, created_at) VALUES ('p_mine', 1, 'm_me', 'd_me', '', 1)", []).unwrap();
+        f.conn.execute("INSERT INTO posts (id, seq, author_id, author_device_id, body, created_at) VALUES ('p_ana', 2, 'm_ana', 'd_ana', '', 1)", []).unwrap();
+        for (vid, post) in [("v_mine", "p_mine"), ("v_theirs", "p_ana")] {
+            f.conn.execute(
+                "INSERT INTO videos (id, post_id, digest, thumb_id, thumb_digest, width, height, duration_ms, size, state, local_path)
+                 VALUES (?1, ?2, x'00', 't', x'00', 1, 1, 1000, 1, 'ready', ?1 || '.mp4')",
+                params![vid, post],
+            ).unwrap();
+        }
+        let chat = chat(&f.conn, &f.id, "m_ana").unwrap();
+        let reqs: Vec<_> = chat.messages.iter().map(|m| m.video_request.as_ref().map(|q| (q.video_id.as_str(), q.here))).collect();
+        // Mine and here: Send it. Someone else's video I happen to have: no. An unsafe id: dropped.
+        assert_eq!(reqs, vec![Some(("v_mine", true)), Some(("v_theirs", false)), None]);
     }
 
     fn m_id(m: &crate::api::Dm) -> String {

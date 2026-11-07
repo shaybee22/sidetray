@@ -1051,15 +1051,17 @@ it without breaking the signature.
 
 | kind | payload |
 | --- | --- |
-| post | `{"text", "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}]}`, with media ids, and digests as base64 `blob_digest` of each encrypted blob |
+| post | `{"text", "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}], "video"?: {"id", "digest", "thumb", "thumb_digest", "width", "height", "duration_ms", "size"}}`, with media ids, and digests as base64 `blob_digest` of each encrypted blob. A video (Phase 9, at most one, never with photos) is an MP4 encrypted like a photo and uploaded with `?kind=video`; `thumb` is its poster frame, an ordinary photo |
 | comment | `{"post": event_id, "text", "photos"?: [...]}`. Photo references as in posts (0.1.1, at most 4); with photos the text may be empty |
 | reaction | `{"post": event_id, "emoji"}`. The latest one per member wins; `""` removes it |
 | edit | `{"post": event_id, "text"}`. Only the post's author |
 | delete | `{"post": event_id}`. Only the post's author |
 | profile | `{"display_name"?, "avatar": {"id", "digest"} \| null}`: the author's whole profile; the latest one wins. No `display_name` means the certified name. The avatar is a 256x256 WebP encrypted like a photo, `digest` its `blob_digest` |
 
-A post's or comment's photo media ids (and a profile's avatar id) also go in the event's
-clear `media_ids` field, so the server can prune them with the event.
+A post's or comment's photo media ids (and a profile's avatar id, and a video's file and
+poster ids) also go in the event's clear `media_ids` field, so the server can prune them
+with the event. Video files leave the relay earlier: once every device has acked them
+(`POST /media/acks`), after 14 days, or oldest first over the caps (SPEC.md Phase 9).
 
 ## Direct messages (Phase 5b)
 
@@ -1067,7 +1069,9 @@ Only the two people's devices can read a conversation: not other members,
 not Key Masters, not the relay.
 
 - **Sending.** A fresh 32-byte message key encrypts the payload
-  `{"text", "photos"?: [...]}` (photo references as in posts) with AD
+  `{"text", "photos"?: [...], "video"?: {...}, "video_request"?: {"post_id", "video_id"}}`
+  (photo and video references as in posts; `video_request` asks for an expired
+  video to be sent again) with AD
   `protocol::dm_ad(group, conversation)`, and each photo and thumbnail with AD
   `protocol::dm_media_ad(group, conversation)`. The key is sealed
   (`crypto_box_seal`) to every device of the recipient and every other device

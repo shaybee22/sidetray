@@ -464,6 +464,56 @@ pub fn view(conn: &rusqlite::Connection, owner_column: &str, owner_id: &str) -> 
         .optional()?)
 }
 
+/// A message asking the poster to send a video again (SPEC "Expired"):
+/// `post_id` is the post's (or message's) id, `video_id` the expired file.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct VideoRequest {
+    pub post_id: String,
+    pub video_id: String,
+}
+
+impl VideoRequest {
+    pub fn valid(&self) -> bool {
+        crate::feed::safe_media_id(&self.video_id) && (1..=128).contains(&self.post_id.len())
+    }
+}
+
+/// Whether this device can answer a request for `video_id`: it has the file,
+/// and it's this member's own video (a post or message they sent).
+pub fn can_resend(conn: &rusqlite::Connection, my_member_id: &str, video_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM videos v LEFT JOIN posts p ON p.id = v.post_id LEFT JOIN dm_messages m ON m.id = v.message_id
+         WHERE v.id = ?1 AND v.state = 'ready' AND v.local_path IS NOT NULL
+           AND (p.author_id = ?2 OR m.sender_member_id = ?2)",
+        rusqlite::params![video_id, my_member_id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Stage a copy of a video already on this device (to send it again as a new
+/// direct message: a new file, new key, nothing reused).
+pub fn stage_local(app: &crate::state::App, video_id: &str) -> Result<(String, Prepared)> {
+    let (local, thumb, width, height, duration_ms): (Option<String>, Option<String>, u32, u32, i64) = app.db().query_row(
+        "SELECT local_path, thumb_path, width, height, duration_ms FROM videos WHERE id = ?1 AND state = 'ready'",
+        [video_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ).map_err(|_| anyhow::anyhow!("This video isn't on this device."))?;
+    let (Some(local), Some(thumb)) = (local, thumb) else { bail!("This video isn't on this device.") };
+    let mut idb = [0u8; 9];
+    getrandom::getrandom(&mut idb).map_err(|e| anyhow::anyhow!("random number generator: {e}"))?;
+    let id: String = idb.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = app.dir.join(STAGING_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{id}.mp4"));
+    std::fs::copy(app.media_dir.join(&local), &path).context("copying the video")?;
+    let thumb = std::fs::read(app.media_dir.join(thumb)).context("reading the poster frame")?;
+    let size = std::fs::metadata(&path)?.len();
+    let p = Prepared { path, thumb, width, height, duration_ms: duration_ms as u64, size };
+    app.staged_videos.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), p.clone());
+    Ok((id, p))
+}
+
 /// The decrypted MP4 of a downloaded (or sent) video, for playback.
 pub fn read(app: &crate::state::App, video_id: &str) -> Result<Vec<u8>> {
     use rusqlite::OptionalExtension;

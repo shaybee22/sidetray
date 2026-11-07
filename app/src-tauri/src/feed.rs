@@ -797,6 +797,9 @@ pub async fn delete_post(app: &App, post_id: &str) -> Result<()> {
 pub struct PostView {
     pub id: String,
     pub seq: i64,
+    pub author_id: String,
+    /// The author has a verified device, so a message (say, asking for an expired video) can reach them.
+    pub author_can_message: bool,
     pub author: String,
     pub author_avatar: Option<String>,
     pub author_keymaster: bool,
@@ -856,7 +859,8 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
     let mut st = conn.prepare(
         "SELECT p.id, p.seq, p.author_id, COALESCE(m.display_name, ?1), COALESCE(m.role, 'member'), p.body,
                 p.created_at, p.edited_at IS NOT NULL, pr.avatar_path,
-                CASE WHEN pr.display_name IS NOT m.display_name THEN pr.display_name END
+                CASE WHEN pr.display_name IS NOT m.display_name THEN pr.display_name END,
+                EXISTS (SELECT 1 FROM member_devices d WHERE d.member_id = p.author_id AND d.verified = 1)
          FROM posts p LEFT JOIN members m ON m.id = p.author_id LEFT JOIN profiles pr ON pr.member_id = p.author_id
          WHERE p.deleted = 0 AND p.seq < ?2 ORDER BY p.seq DESC LIMIT ?3",
     )?;
@@ -866,7 +870,9 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
         Ok(PostView {
             id: r.get(0)?,
             seq: r.get(1)?,
+            author_can_message: r.get(10)?,
             mine: author_id == me,
+            author_id: author_id.clone(),
             author: r.get(3)?,
             author_avatar: r.get::<_, Option<String>>(8)?.as_deref().map(media_url),
             author_keymaster: role == Role::Keymaster.as_str(),
