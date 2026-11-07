@@ -433,6 +433,85 @@ App: *Leave this group* at the bottom of *Device* (and *Delete these saved posts
 - The old *Start over* (`reset`) is gone: cancelling a join, starting over after a denial and *Delete these saved posts* after a removal all delete the profile the same way as leaving (without the relay call).
 - Tested with a local relay and two desktop copies: an install with its data at the top of the folder (and most of it still in the WAL after an unclean exit) moved into `groups/<local_id>/` with its posts and keys working; a second group founded from *Join another group*; a post in the hidden group gave a toast "Rosa posted in Alpha" and a dot on the menu, and its notification target switched groups; a restart came back in the last group; the only Key Master was refused (409); a member leaving landed in the wizard with folder and keychain entry gone, and the Key Master's app rotated the key. Android compiles (`aarch64-linux-android`) but the per-group push instances haven't been tried on a phone yet.
 
+## Phase 9: Short videos (planned, not built)
+
+Short video clips in feed posts and direct messages. A video is transcoded on the sender's device, encrypted like a photo and uploaded through the same `POST /media`. The relay holds the video file only briefly: until every device it's for has downloaded it, two weeks at most, and within a 5 GB cap per server. The post text and the poster frame (an ordinary encrypted thumbnail) follow normal post retention. Once the video file is gone, people see the poster frame, the text, "Video expired" and a *Request* button.
+
+**Limits**
+
+- At most **one video per post or message**. It can't be mixed with photos (keeps the composer, the UI and the retention rules simple). Not in comments: a video-only comment would be an empty comment to apps before this phase, and they refuse those (`feed.rs` `RefBody` check).
+- At most **60 s**. Longer clips are refused with "Videos can be up to a minute long" (trimming is for later).
+- The encrypted file is at most **10 MB** (`SIDETRAY_MAX_MEDIA_BYTES`, already the limit; Caddy allows 12 MB). The encoder aims for a 9.5 MB MP4 so the nonce, tag and container overhead always fit.
+
+**Transcoding (before encryption, on the sender's device)**
+
+- Output: MP4 (H.264 High or Main, AAC-LC 96 kb/s stereo, or mono if the source is mono), `+faststart`, 30 fps at most, metadata stripped (`-map_metadata -1`: no GPS or device model, like photos).
+- Bitrate: `video_kbps = (9.5 MB × 8 / duration_s) − 96`, capped at 2,500 kb/s. **720p** (longest side 1280) when that gives at least 1,500 kb/s, otherwise **480p** (longest side 854). With a 9.5 MB budget, 720p holds up to about 48 s and longer clips drop to 480p (at 60 s about 1,170 kb/s, which is watchable at 480p). Below 400 kb/s the clip is refused; that can't happen at 60 s, it's only a guard.
+- One pass with a capped rate (`-b:v`, `-maxrate` 1.5×, `-bufsize` 2×). If the file still comes out over 9.5 MB, encode again at 85% of the bitrate, once. Hardware encoders don't do two-pass, so verify and retry rather than rely on two-pass.
+- **Poster frame**: the frame at 1 s (or the first frame for shorter clips). It goes through the existing photo steps (`photo::fit` to 400 px, `encode_webp`), so it's an ordinary WebP thumbnail. Width, height and duration come from the transcode.
+- **Desktop: bundled ffmpeg sidecar** (Tauri `bundle.externalBin`, one binary per target triple, run through `tauri-plugin-shell`). Progress comes from `-progress pipe:1` (`out_time_ms` / duration).
+  - *Licensing:* the app is MIT/Apache, so ship an **LGPL** ffmpeg build with no GPL parts, which means no libx264. The H.264 encoder is the operating system's: `h264_mf` (Media Foundation) on Windows and `h264_videotoolbox` on macOS. On Linux it's `libopenh264` (BSD; Cisco's patent cover only applies to their binary downloaded at runtime, so decide on that before shipping Linux). AAC is ffmpeg's built-in `aac`. Windows "N" editions lack Media Foundation until the Media Feature Pack is installed: detect that and say so.
+  - *Size:* a trimmed build (only the demuxers and decoders needed for common phone and camera formats, the encoders above, and the mp4 muxer) is roughly 15–25 MB per platform. The installer and each updater download grow by that much.
+- **Android: Media3 Transformer** (`androidx.media3:media3-transformer`, `-effect`, `-common`) on the platform's hardware `MediaCodec` encoder. It adds about 1–2 MB to the APK versus about 20–30 MB per ABI for ffmpeg (ffmpeg-kit, the usual Android build, was retired in 2025). `Presentation.createForHeight(720 or 480)` scales, `VideoEncoderSettings.setBitrate` sets the bitrate, and the same verify-and-retry rule applies, because hardware bitrate control is loose. The poster frame comes from `MediaMetadataRetriever.getFrameAtTime` and goes into the existing `android::decode_image` path. Called from Rust through new `SideTrayAndroid` JNI functions, like `decode_image` today. Media3 works from API 21 and the app's `minSdk` is 24.
+- Both platforms take the source file by path, never the whole file through IPC. On Android the file comes from the picker or share intent (`content://` URI), copied to the cache folder.
+
+**Format on the wire**
+
+- Feed `post` body gains `"video"?: {"id", "digest", "thumb", "thumb_digest", "width", "height", "duration_ms", "size"}`. The DM body gains the same field. `digest` covers the encrypted file, as for photos, so the relay can't swap it.
+- The video and poster frame are encrypted exactly like photos (feed: group key with `media_ad`; DM: the message key with `dm_media_ad`, one `crypto::encrypt` over the whole file). That's fine at 10 MB, and playback waits for the whole download anyway.
+- `POST /media?kind=video` marks the upload as a video file. The relay can't check that (it's encrypted), but mislabelling a video as a photo only gets it photo retention under the same 10 MB limit, which is possible today anyway.
+- Apps before this phase ignore the unknown `video` field (no `deny_unknown_fields`). They show the text alone, or an empty post for a video with no text. Acceptable; the release notes tell people to update.
+
+**Delivery acks for video files (relay)**
+
+- New tables: `video_blobs (media_id PK, group_id, dm_message_id NULL, size_bytes, created_at, expired_at NULL, expired_reason NULL)` and `video_acks (media_id, device_id, acked_at, PK (media_id, device_id))`.
+- `POST /media/{id}/ack`, sent by a device only after it has downloaded the file, checked the digest and decrypted it. Only devices allowed to `GET` it may ack, and repeated acks are harmless.
+- **Who has to have it, feed:** every active device of an active member that already existed when the file was uploaded (`devices.created_at ≤ video_blobs.created_at`). A device approved later doesn't hold the file back, but can still fetch it while it's there. **DM:** the devices in that message's `dm_keys`, as for DM pruning today, minus revoked devices.
+- **Deleted when any of these is true** (hourly in `prune()`, and the cap also at upload time):
+  1. everyone above has acked it (`expired_reason = 'delivered'`);
+  2. it's older than `SIDETRAY_VIDEO_TTL_DAYS` (default 14), whatever the acks (`'ttl'`);
+  3. all video files on the server together exceed `SIDETRAY_VIDEO_CAP_GB` (default 5): oldest first, across every group, until under the cap (`'cap'`). At upload time the relay evicts first, then accepts. Files uploaded in the last hour that no post or message refers to yet are skipped. If the new file still doesn't fit, the upload gets `507` "video storage on this server is full, try again later".
+- The `media` row and the file go, but the `video_blobs` row stays (with `expired_at`) for the TTL plus a week. `GET /media/{id}` then answers **410 Gone** with `{"reason"}` instead of 404, so apps can tell "expired" from "broken".
+- The poster frame is an ordinary `media` row and follows the post's normal retention.
+
+**App: sending**
+
+- The composer (post and DM) gets a video button and takes videos from share intents. It runs: pick → probe (duration over 60 s is refused) → transcode with a progress bar ("Preparing video… 42%", with Cancel) → stage it (poster frame shown like a staged photo, with the duration).
+- When you send, upload progress comes from a streamed request body (`reqwest::Body::wrap_stream`, counting bytes), and the post appears after the upload. The 300 s upload timeout stays; 10 MB over a slow phone link fits.
+- The sender's plaintext MP4 stays in the profile's `media/` (`<id>.mp4`), like the sender's photos today (`feed.rs` "keep the plaintext photos locally", `dm.rs` "Keep our own copy"). That's the copy for re-sending.
+
+**App: receiving and playback**
+
+- Sync records the video reference with a state: `pending → downloading → ready | expired | failed`.
+- Download is automatic in the background after the poster frame, newest first, one at a time, so a device acks soon and the file can leave the server. After the digest check and decryption, it saves `<id>.mp4` and calls `POST /media/{id}/ack`. A 410 sets `expired`; other errors count toward the existing attempts limit.
+- The feed or chat shows the poster frame with a play badge and the duration. While downloading it shows "Downloading video… 3.1 / 8.7 MB"; once `ready`, tapping plays in a `<video controls>` element, inline or in the lightbox.
+- **Expired:** the poster frame (greyed), the post text, "Video expired" and a **Request** button. Request opens the DM with the poster and pre-fills "Could you send me your video from <date>?", plus a structured `"video_request": {"post_id", "video_id"}` in the DM body. Request is hidden on your own posts and greyed out with the reason when the poster has left or either side has no verified device (`dm::recipients` rules).
+- **Re-send:** on the poster's devices that have the local file, an incoming `video_request` shows a **Send it** button in the chat. Your own video in the feed also has *Send in a message…*. Both re-upload the local MP4 as a new DM video (new `media_id` and message key; nothing reused). A request for a video this device doesn't have shows "This video isn't on this device".
+
+**Conflicts with the current code (to resolve in this phase)**
+
+1. **Acks are event cursors, not delivery receipts.** `POST /ack` and `POST /dms/ack` move a per-device sequence number. The feed ack goes out at sync (`feed.rs` ~201), *before* `download_media` runs. The DM ack now waits for photos (item 2), but it's still one cursor per device, so one missing file holds back everything after it. "Every device has acked" therefore means "has seen the event" (or, for DMs, "has everything up to here"), not "has this file". Video needs the new per-file `POST /media/{id}/ack` above.
+2. **Same cause, photos:** a DM photo could be deleted before the recipient fetched it, because the ack went out before the photo download. *Fixed for DMs* (before this phase): `dm::sync` now acks only up to just before the first message whose photos are still to fetch (`ackable_seq`), and a photo that has used up its 5 attempts stops holding the ack back. Feed photos still have the problem with `SIDETRAY_HISTORY_DAYS=0` (the default 14 days hides it).
+3. **A DM file can't outlive its message's access check.** `GET /media/{id}` limits DM media to the message's devices only while a `dm_media` row exists. Without one it falls back to "anyone in the group". Today that's safe because the message, its `dm_media` row and the file are deleted together. If a DM video file outlived its message row, every group member could download it (still encrypted, but it breaks the "participants only" rule). Either keep the DM message until its video file is gone, or move the device check onto `video_blobs.dm_message_id` plus a copied device list. Recommended: keep the message.
+4. **Media lifetime follows the event.** `prune()` deletes a file when its event goes (history and retention), and "not referenced by a live event" files after 24 h. Video adds an earlier, independent deletion; the existing rules still apply on top, which is fine. `media` has no kind column, so prune needs `video_blobs` to tell the two apart.
+5. **The cap is per server, the data is per group.** Eviction "oldest first across the server" means one busy group can push out another group's videos. Accepted for now (the 14-day TTL bounds it); a per-group fair share is for later.
+6. **History for new members.** Feed events stay 14 days for people who join later, but the video file usually leaves as soon as existing devices have it. New members mostly see "Video expired", and the Request flow is the answer.
+7. **404 vs expired.** The app treats any download failure the same and gives up silently after `MAX_MEDIA_ATTEMPTS` (5). Video needs 410 handling and the visible states above.
+8. **Local media serving is photo-only.** `serve_media` (`lib.rs`) accepts only `<id>.webp`, reads the whole file and sends `image/webp`, with no `Range` support. The CSP has `img-src` but no `media-src`. `<video>` needs `.mp4` with `video/mp4`, 206 partial responses for seeking, and `media-src 'self' http://media.localhost media:`. Range handling through Android's WebView request interception is known to be unreliable: test it on the razr first, with a blob-URL fallback (read the decrypted file through a command) if seeking fails.
+9. **Photo-only names in the model.** `PhotoRef`, `snippet()` ("shared a photo") and notifications assume photos. Add the "shared a video" wording.
+10. **Upload is one in-memory request with no progress.** `Api::upload_media(Vec<u8>)` / `download_media` return when done. Both need streamed versions that report progress.
+11. **Rate limit:** 50 MB/hour of media per device allows about five videos an hour. Probably fine; note it in the composer's error text when it's hit.
+
+**Files to touch**
+
+- Relay: `server/app/main.py` (tables, `kind=video` on upload, cap eviction, `POST /media/{id}/ack`, 410 tombstones, `prune()` video rules, settings), `install.sh` (ask for/keep `SIDETRAY_VIDEO_TTL_DAYS`, `SIDETRAY_VIDEO_CAP_GB`), `server/app/admin.py` (show video storage use), new `server/tests/test_video.py` (all-devices ack deletes, late-joining device doesn't hold back, TTL, cap eviction order and 507, DM video only for `dm_keys` devices, 410 after expiry), and `test_prune.py` / `test_dms.py` for conflicts 2–3.
+- App, Rust: new `app/src-tauri/src/video.rs` (probe, bitrate maths, ffmpeg sidecar or Android bridge, poster frame, progress events); `feed.rs` and `dm.rs` (`video` field, states, download + ack, re-send, `video_request`); `db.rs` (migration: video columns or a `videos` table per profile); `api.rs` (streamed upload/download with progress, `ack_media`, 410); `lib.rs` (commands `stage_video`, `cancel_transcode`, `resend_video`, `serve_media` mp4 + Range); `photo.rs` (reuse `fit`/`encode_webp` for the poster frame); `android.rs` (JNI for transcode and frame grab); `alerts.rs` (notification wording).
+- App, config and Android: `app/src-tauri/tauri.conf.json` (`externalBin`, CSP `media-src`), `app/src-tauri/Cargo.toml` (`tauri-plugin-shell`), `app/src-tauri/capabilities/*` (sidecar permission), `app/src-tauri/binaries/` (ffmpeg per target; a script to fetch or build the LGPL builds), `.github/workflows/*` (put the sidecar in place before `tauri build`), `gen/android/app/build.gradle.kts` (Media3), `SideTrayAndroid.kt` (transcode, frame grab, video picker MIME types and share intent filter in `AndroidManifest.xml`).
+- App, UI: `app/ui/app.js` (video button, transcode/upload progress, staged video, player, expired state, Request, Send it), `app/ui/index.html`, `app/ui/style.css`.
+- Docs: `README.md` (ffmpeg licence notice and where the source is, as LGPL asks), `CHANGELOG.md`, this file's Data model, API and Media sections.
+
+**Done when** a 45 s phone clip posts at 720p and a 60 s one at 480p, each under 10 MB with a working poster frame and no metadata. Every device of the group plays it after download, and the relay deletes the file once the last device acks (the post and poster frame stay). A video nobody fetched is gone after 14 days; with the cap set low, the oldest go first and an upload that can't fit gets a clear error. A DM video works the same for just the two people's devices, and a third member gets 404. A member whose copy expired taps Request, and the poster taps Send it and the requester plays it. Desktop (Windows) and the razr both transcode, show progress and seek during playback.
+
 ## Distribution and later
 
 **Distribution**
