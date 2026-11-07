@@ -891,14 +891,17 @@ At least one output file must be specified";
         assert!(a.contains("+faststart"), "{a}");
     }
 
-    /// An ffmpeg for the tests that run it: SIDETRAY_FFMPEG, which must also
-    /// have the lavfi test sources (any full build does) to make the inputs.
+    /// An ffmpeg for the tests that run it: SIDETRAY_FFMPEG (the bundled build
+    /// or any other).
     fn test_ffmpeg() -> Option<PathBuf> {
         std::env::var_os("SIDETRAY_FFMPEG").map(PathBuf::from)
     }
 
+    /// Making the test inputs needs the lavfi sources, which the bundled build
+    /// leaves out: SIDETRAY_TEST_SOURCE_FFMPEG names a full ffmpeg for that.
     async fn make_source(ffmpeg: &std::path::Path, out: &std::path::Path, secs: u32, size: &str) {
-        let st = command(ffmpeg)
+        let full = std::env::var_os("SIDETRAY_TEST_SOURCE_FFMPEG").map(PathBuf::from);
+        let st = command(full.as_deref().unwrap_or(ffmpeg))
             .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
             .arg(format!("testsrc2=size={size}:rate=60"))
             .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
