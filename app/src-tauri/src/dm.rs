@@ -112,15 +112,36 @@ pub async fn sync(app: &App, id: &Identity, s: &Secrets, api: &Api, authors: &Au
             tx.execute("UPDATE sync_state SET rejected = rejected + ?1 WHERE id = 1", params![rejected as i64])?;
             tx.commit()?;
         }
-        if page.last_seq > after {
-            let _: serde_json::Value = api.post("/dms/ack", &serde_json::json!({ "seq": page.last_seq })).await?;
-        }
         if !page.has_more {
             break;
         }
     }
     download_photos(app, id, s, api).await;
+    // Ack only after the photos: the relay deletes a message's photos once
+    // every device it's for has acked the message.
+    let ack = ackable_seq(&app.db())?;
+    let acked = db::kv_get(&app.db(), DM_ACKED_KEY)?.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    if ack > acked {
+        let _: serde_json::Value = api.post("/dms/ack", &serde_json::json!({ "seq": ack })).await?;
+        db::kv_set(&app.db(), DM_ACKED_KEY, Some(&ack.to_string()))?;
+    }
     Ok(report)
+}
+
+/// The last direct message seq this device acked to the relay.
+const DM_ACKED_KEY: &str = "dm_acked_seq";
+
+/// How far this device may ack: everything it has synced, except from the
+/// first message with photos it still has to fetch (and hasn't given up on).
+fn ackable_seq(conn: &Connection) -> Result<i64> {
+    let last = db::dm_last_seq(conn)?;
+    let waiting: Option<i64> = conn.query_row(
+        "SELECT MIN(m.seq) FROM dm_messages m JOIN dm_photos p ON p.message_id = m.id
+         WHERE (p.local_path IS NULL OR p.thumb_path IS NULL) AND p.attempts < ?1 AND m.seq <= ?2",
+        params![MAX_PHOTO_ATTEMPTS, last],
+        |r| r.get(0),
+    )?;
+    Ok(waiting.map_or(last, |seq| (seq - 1).min(last)))
 }
 
 /// Verify, decrypt and store one message. Returns whether it was new, and a
@@ -253,6 +274,8 @@ async fn download_photos(app: &App, id: &Identity, s: &Secrets, api: &Api) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("message photo {photo}: {e:#}");
+                // Counts as a failed try, so it can't hold the ack back forever.
+                let _ = app.db().execute("UPDATE dm_photos SET attempts = attempts + 1 WHERE id = ?1", params![photo]);
                 continue;
             }
         };
@@ -747,6 +770,36 @@ mod tests {
             f.conn.query_row("SELECT id, key_wrapped FROM dm_messages", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert!(f.s.unwrap_message_key(&id, &wrapped).is_ok());
         assert!(f.s.unwrap_message_key("another", &wrapped).is_err());
+    }
+
+    #[test]
+    fn the_ack_waits_for_message_photos() {
+        let mut f = fixture();
+        let (ana, me) = (f.ana.clone_keys(), f.me.clone_keys());
+        let d = B64.encode([7u8; 32]);
+        let photo = serde_json::json!([{ "full": "p_full", "full_digest": d, "thumb": "p_thumb", "thumb_digest": d, "width": 10, "height": 10 }]);
+        for body in [
+            serde_json::json!({ "text": "one" }),
+            serde_json::json!({ "text": "two", "photos": photo }),
+            serde_json::json!({ "text": "three" }),
+        ] {
+            let m = f.dm(("d_ana", &ana, "m_ana"), "m_me", &[("d_me", &me)], body);
+            f.apply(&m).unwrap();
+        }
+        db::set_dm_last_seq(&f.conn, 3).unwrap();
+        // The photo of #2 isn't here yet: ack #1 only, so the relay keeps it.
+        assert_eq!(ackable_seq(&f.conn).unwrap(), 1);
+        // Only the thumbnail: still waiting for the full photo.
+        f.conn.execute("UPDATE dm_photos SET thumb_path = 't.webp'", []).unwrap();
+        assert_eq!(ackable_seq(&f.conn).unwrap(), 1);
+        f.conn.execute("UPDATE dm_photos SET local_path = 'f.webp'", []).unwrap();
+        assert_eq!(ackable_seq(&f.conn).unwrap(), 3);
+        // A photo the app gave up on doesn't hold the ack back.
+        f.conn.execute("UPDATE dm_photos SET local_path = NULL, attempts = ?1", params![MAX_PHOTO_ATTEMPTS]).unwrap();
+        assert_eq!(ackable_seq(&f.conn).unwrap(), 3);
+        // Nothing synced past the cursor is acked.
+        f.conn.execute("UPDATE sync_state SET dm_last_seq = 2", []).unwrap();
+        assert_eq!(ackable_seq(&f.conn).unwrap(), 2);
     }
 
     #[test]

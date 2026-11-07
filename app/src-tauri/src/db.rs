@@ -294,7 +294,6 @@ pub fn kv_get(conn: &Connection, key: &str) -> Result<Option<String>> {
 }
 
 /// `None` deletes the key.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn kv_set(conn: &Connection, key: &str, value: Option<&str>) -> Result<()> {
     match value {
         Some(v) => conn.execute("INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2", params![key, v])?,

@@ -18,6 +18,14 @@ the app, the Rust crates and the relay share one version number.
   read that history after a key rotation.
 - Update with `git pull && sudo ./install.sh`; it adds the setting to `.env`.
 
+### App
+
+- **Photos in direct messages no longer go missing.** The app told the relay
+  it had a message before it had downloaded the message's photos, so the
+  relay could delete a photo first (for example when the download was
+  interrupted) and it never arrived. The app now confirms a message only
+  once its photos are saved, or after it has given up on them (5 tries).
+
 ## [0.3.0] - 2026-11-04
 
 One app, several groups. Highlights:
