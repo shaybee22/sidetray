@@ -361,6 +361,413 @@ async fn poster_frame(ffmpeg: &std::path::Path, mp4: &std::path::Path, duration_
     Ok(out.stdout)
 }
 
+// --- in posts and messages ------------------------------------------------------------
+
+/// The `video` field of a post or direct message (SPEC "Format on the wire").
+/// `digest` covers the encrypted file, so the relay can't swap it.
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+pub struct VideoRef {
+    pub id: String,
+    pub digest: String,
+    pub thumb: String,
+    pub thumb_digest: String,
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u64,
+    pub size: u64,
+}
+
+/// What a video belongs to, which also says how it's encrypted.
+#[derive(Clone, Copy)]
+pub enum Owner<'a> {
+    /// A feed post: the group key of that version.
+    Post { post_id: &'a str, key_version: u32 },
+    /// A direct message: its message key.
+    Message { message_id: &'a str },
+}
+
+/// Allow a little over the limits for another app's rounding.
+const MAX_REF_DURATION_MS: u64 = MAX_DURATION_MS + 5_000;
+const MAX_REF_BYTES: u64 = 11 * 1024 * 1024;
+
+/// Record a received (or, with `mine`, just sent) video. An unusable
+/// reference is skipped, like a bad photo reference: the text still shows.
+pub fn store_ref(conn: &rusqlite::Connection, owner: Owner, v: &VideoRef, mine: bool) -> Result<bool> {
+    use crate::account::decode32;
+    let (Ok(d), Ok(td)) = (decode32(&v.digest), decode32(&v.thumb_digest)) else { return Ok(false) };
+    let ok = crate::feed::safe_media_id(&v.id)
+        && crate::feed::safe_media_id(&v.thumb)
+        && v.width > 0
+        && v.height > 0
+        && (1..=MAX_REF_DURATION_MS).contains(&v.duration_ms)
+        && (1..=MAX_REF_BYTES).contains(&v.size);
+    if !ok {
+        return Ok(false);
+    }
+    let (post_id, message_id, key_version) = match owner {
+        Owner::Post { post_id, key_version } => (Some(post_id), None, key_version),
+        Owner::Message { message_id } => (None, Some(message_id), 0),
+    };
+    let (state, local, thumb) = if mine {
+        ("ready", Some(format!("{}.mp4", v.id)), Some(format!("{}.webp", v.thumb)))
+    } else {
+        ("pending", None, None)
+    };
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO videos (id, post_id, message_id, key_version, digest, thumb_id, thumb_digest, width, height,
+                                       duration_ms, size, state, local_path, thumb_path, acked, thumb_acked, mine)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?15)",
+        rusqlite::params![
+            v.id, post_id, message_id, key_version, &d[..], v.thumb, &td[..], v.width, v.height,
+            v.duration_ms as i64, v.size as i64, state, local, thumb, mine
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+/// What the feed or a chat shows for a video.
+#[derive(Serialize, Clone, Debug)]
+pub struct VideoView {
+    pub id: String,
+    /// The poster frame, once downloaded.
+    pub thumb: Option<String>,
+    /// pending, downloading, ready, expired or failed.
+    pub state: String,
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u64,
+    pub size: u64,
+    pub mine: bool,
+}
+
+/// The video of a post (`post`) or message, if it has one.
+pub fn view(conn: &rusqlite::Connection, owner_column: &str, owner_id: &str) -> Result<Option<VideoView>> {
+    use rusqlite::OptionalExtension;
+    let column = if owner_column == "post_id" { "post_id" } else { "message_id" };
+    Ok(conn
+        .query_row(
+            &format!("SELECT id, thumb_path, state, width, height, duration_ms, size, mine FROM videos WHERE {column} = ?1 LIMIT 1"),
+            [owner_id],
+            |r| {
+                Ok(VideoView {
+                    id: r.get(0)?,
+                    thumb: r.get::<_, Option<String>>(1)?.as_deref().map(crate::feed::media_url),
+                    state: r.get(2)?,
+                    width: r.get(3)?,
+                    height: r.get(4)?,
+                    duration_ms: r.get::<_, i64>(5)? as u64,
+                    size: r.get::<_, i64>(6)? as u64,
+                    mine: r.get(7)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// The decrypted MP4 of a downloaded (or sent) video, for playback.
+pub fn read(app: &crate::state::App, video_id: &str) -> Result<Vec<u8>> {
+    use rusqlite::OptionalExtension;
+    let path: Option<String> = app
+        .db()
+        .query_row("SELECT local_path FROM videos WHERE id = ?1 AND state = 'ready'", [video_id], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let name = path.context("that video isn't on this device")?;
+    std::fs::read(app.media_dir.join(name)).context("reading the video file")
+}
+
+const MAX_ATTEMPTS: i64 = 5;
+
+/// How a video's files are decrypted.
+enum Key {
+    Group(sidetray_crypto::GroupKey),
+    Message(sidetray_crypto::dm::MessageKey),
+}
+
+impl Key {
+    fn decrypt(&self, blob: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Key::Group(gk) => sidetray_crypto::decrypt(gk, blob, ad).context("can't decrypt"),
+            Key::Message(k) => k.decrypt(blob, ad).context("can't decrypt"),
+        }
+    }
+}
+
+/// One row to fetch something for.
+struct Todo {
+    id: String,
+    thumb_id: String,
+    post_id: Option<String>,
+    message_id: Option<String>,
+    key_version: u32,
+    digest: Vec<u8>,
+    thumb_digest: Vec<u8>,
+    size: u64,
+}
+
+fn todo(conn: &rusqlite::Connection, filter: &str) -> Result<Vec<Todo>> {
+    // Newest first: posts by their seq, messages by theirs.
+    let sql = format!(
+        "SELECT v.id, v.thumb_id, v.post_id, v.message_id, v.key_version, v.digest, v.thumb_digest, v.size
+         FROM videos v LEFT JOIN posts p ON p.id = v.post_id LEFT JOIN dm_messages m ON m.id = v.message_id
+         WHERE (p.deleted = 0 OR m.id IS NOT NULL) AND {filter}
+         ORDER BY COALESCE(p.seq, m.seq) DESC"
+    );
+    let mut st = conn.prepare(&sql)?;
+    let rows = st.query_map(rusqlite::params![MAX_ATTEMPTS], |r| {
+        Ok(Todo {
+            id: r.get(0)?,
+            thumb_id: r.get(1)?,
+            post_id: r.get(2)?,
+            message_id: r.get(3)?,
+            key_version: r.get(4)?,
+            digest: r.get(5)?,
+            thumb_digest: r.get(6)?,
+            size: r.get::<_, i64>(7)? as u64,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The key and associated data for a row's files.
+fn key_for(app: &crate::state::App, id: &crate::db::Identity, s: &crate::secrets::Secrets, t: &Todo) -> Result<(Key, Vec<u8>)> {
+    use sidetray_crypto::protocol;
+    if t.post_id.is_some() {
+        let gk = crate::secrets::group_key(&app.db(), s, t.key_version)?.with_context(|| format!("no group key v{}", t.key_version))?;
+        return Ok((Key::Group(gk), protocol::media_ad(&id.group_id)));
+    }
+    let msg = t.message_id.as_deref().context("a video with no post or message")?;
+    let (wrapped, conv): (Vec<u8>, String) = app.db().query_row(
+        "SELECT key_wrapped, conversation_id FROM dm_messages WHERE id = ?1",
+        [msg],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((Key::Message(s.unwrap_message_key(msg, &wrapped)?), protocol::dm_media_ad(&id.group_id, &conv)))
+}
+
+/// Tell the window a video changed (state or download progress).
+fn emit(app: &crate::state::App, video_id: &str, received: Option<u64>, total: u64) {
+    use tauri::Emitter;
+    if let Some(h) = crate::state::handle() {
+        let _ = h.emit(
+            "video-state",
+            serde_json::json!({ "profile": app.profile_id, "id": video_id, "received": received, "total": total }),
+        );
+    }
+}
+
+/// Fetch the poster frames that aren't here yet (before the DM ack, which
+/// lets the relay drop a message's photos).
+pub async fn fetch_thumbs(app: &crate::state::App, id: &crate::db::Identity, s: &crate::secrets::Secrets, api: &crate::api::Api) {
+    let rows = match todo(&app.db(), "v.thumb_path IS NULL AND v.thumb_attempts < ?1") {
+        Ok(r) => r,
+        Err(e) => return eprintln!("video poster frames: {e:#}"),
+    };
+    for t in rows {
+        let result: Result<()> = async {
+            let (key, ad) = key_for(app, id, s, &t)?;
+            let blob = api.download_media(&t.thumb_id).await?;
+            if sidetray_crypto::blob_digest(&blob)[..] != t.thumb_digest[..] {
+                bail!("doesn't match the digest it was sent with");
+            }
+            let plain = key.decrypt(&blob, &ad)?;
+            let name = format!("{}.webp", t.thumb_id);
+            crate::feed::write_file(&app.media_dir.join(&name), &plain)?;
+            app.db().execute("UPDATE videos SET thumb_path = ?1 WHERE id = ?2", rusqlite::params![name, t.id])?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            eprintln!("video poster frame {}: {e:#}", t.thumb_id);
+            let _ = app.db().execute("UPDATE videos SET thumb_attempts = thumb_attempts + 1 WHERE id = ?1", [&t.id]);
+        }
+        emit(app, &t.id, None, t.size);
+    }
+}
+
+/// Download the videos not here yet, newest first, one at a time, so this
+/// device acks soon and the relay can let them go. A 410 means the relay
+/// already did (delivered to everyone else, too old, or over its cap).
+pub async fn fetch_videos(app: &crate::state::App, id: &crate::db::Identity, s: &crate::secrets::Secrets, api: &crate::api::Api) {
+    if let Err(e) = remove_deleted(app) {
+        eprintln!("cleaning up deleted videos: {e:#}");
+    }
+    let rows = match todo(&app.db(), "v.state IN ('pending', 'downloading') AND v.attempts < ?1") {
+        Ok(r) => r,
+        Err(e) => return eprintln!("videos: {e:#}"),
+    };
+    for t in rows {
+        let _ = app.db().execute("UPDATE videos SET state = 'downloading' WHERE id = ?1", [&t.id]);
+        emit(app, &t.id, Some(0), t.size);
+        let result: Result<()> = async {
+            let (key, ad) = key_for(app, id, s, &t)?;
+            let blob = api.download_media_progress(&t.id, |n| emit(app, &t.id, Some(n), t.size)).await?;
+            if sidetray_crypto::blob_digest(&blob)[..] != t.digest[..] {
+                bail!("doesn't match the digest it was sent with");
+            }
+            let plain = key.decrypt(&blob, &ad)?;
+            let name = format!("{}.mp4", t.id);
+            crate::feed::write_file(&app.media_dir.join(&name), &plain)?;
+            app.db().execute("UPDATE videos SET local_path = ?1, state = 'ready' WHERE id = ?2", rusqlite::params![name, t.id])?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {}
+            Err(e) if crate::api::is_status(&e, 410) => {
+                let _ = app.db().execute("UPDATE videos SET state = 'expired' WHERE id = ?1", [&t.id]);
+            }
+            Err(e) => {
+                eprintln!("video {}: {e:#}", t.id);
+                let _ = app.db().execute(
+                    "UPDATE videos SET attempts = attempts + 1,
+                            state = CASE WHEN attempts + 1 >= ?2 THEN 'failed' ELSE 'pending' END WHERE id = ?1",
+                    rusqlite::params![t.id, MAX_ATTEMPTS],
+                );
+            }
+        }
+        emit(app, &t.id, None, t.size);
+    }
+}
+
+/// A deleted post's video: remove the files, and tell the relay this device
+/// won't fetch them.
+fn remove_deleted(app: &crate::state::App) -> Result<()> {
+    let conn = app.db();
+    let mut st = conn.prepare(
+        "SELECT v.id, v.thumb_id, v.local_path, v.thumb_path, v.acked, v.thumb_acked FROM videos v
+         JOIN posts p ON p.id = v.post_id WHERE p.deleted = 1",
+    )?;
+    type Row = (String, String, Option<String>, Option<String>, bool, bool);
+    let rows: Vec<Row> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (vid, thumb_id, file, thumb, acked, thumb_acked) in rows {
+        for f in [file, thumb].into_iter().flatten() {
+            let _ = std::fs::remove_file(app.media_dir.join(f));
+        }
+        for (id, done) in [(&vid, acked), (&thumb_id, thumb_acked)] {
+            if !done {
+                conn.execute("INSERT OR IGNORE INTO media_acks_pending (id) VALUES (?1)", [id])?;
+            }
+        }
+        conn.execute("DELETE FROM videos WHERE id = ?1", [&vid])?;
+    }
+    Ok(())
+}
+
+/// Ack the video files and poster frames this device is done with (fetched,
+/// expired, or given up on). Runs after `feed::ack_media`, which already told
+/// the relay this device acks files.
+pub async fn ack(app: &crate::state::App, api: &crate::api::Api) {
+    const BATCH: i64 = 200;
+    loop {
+        let (videos, thumbs): (Vec<String>, Vec<String>) = {
+            let conn = app.db();
+            let ids = |sql: &str| -> Vec<String> {
+                conn.prepare(sql)
+                    .and_then(|mut st| st.query_map(rusqlite::params![MAX_ATTEMPTS, BATCH], |r| r.get(0))?.collect())
+                    .unwrap_or_default()
+            };
+            (
+                ids("SELECT id FROM videos WHERE acked = 0 AND (state IN ('ready', 'expired', 'failed') OR attempts >= ?1) LIMIT ?2"),
+                ids("SELECT thumb_id FROM videos WHERE thumb_acked = 0 AND (thumb_path IS NOT NULL OR thumb_attempts >= ?1) LIMIT ?2"),
+            )
+        };
+        if videos.is_empty() && thumbs.is_empty() {
+            return;
+        }
+        let ids: Vec<&String> = videos.iter().chain(&thumbs).collect();
+        if let Err(e) = api.post::<_, serde_json::Value>("/media/acks", &serde_json::json!({ "ids": ids })).await {
+            if !(crate::api::is_status(&e, 404) || crate::api::is_status(&e, 405)) {
+                eprintln!("acking videos: {e:#}");
+            }
+            return;
+        }
+        let conn = app.db();
+        for v in &videos {
+            let _ = conn.execute("UPDATE videos SET acked = 1 WHERE id = ?1", [v]);
+        }
+        for t in &thumbs {
+            let _ = conn.execute("UPDATE videos SET thumb_acked = 1 WHERE thumb_id = ?1", [t]);
+        }
+        if (videos.len() as i64) < BATCH && (thumbs.len() as i64) < BATCH {
+            return;
+        }
+    }
+}
+
+// --- sending ---------------------------------------------------------------------
+
+/// A staged video, still staged (it's removed only once it's sent).
+pub fn staged(app: &crate::state::App, staged_id: &str) -> Result<Prepared> {
+    app.staged_videos
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(staged_id)
+        .cloned()
+        .context("the video is no longer attached; add it again")
+}
+
+/// Encrypt and upload a prepared video and its poster frame, reporting the
+/// upload as `upload-progress` events. Returns the reference to put in the post or message.
+pub async fn upload(
+    app: &crate::state::App,
+    api: &crate::api::Api,
+    v: &Prepared,
+    encrypt: impl Fn(&[u8]) -> Vec<u8>,
+) -> Result<VideoRef> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use tauri::Emitter;
+    let plain = tokio::fs::read(&v.path).await.context("reading the prepared video")?;
+    let (enc, enc_thumb) = (encrypt(&plain), encrypt(&v.thumb));
+    let (d, td) = (sidetray_crypto::blob_digest(&enc), sidetray_crypto::blob_digest(&enc_thumb));
+    let profile = app.profile_id.clone();
+    let id = api
+        .upload_media_as(enc, "video", move |sent, total| {
+            if let Some(h) = crate::state::handle() {
+                let _ = h.emit("upload-progress", serde_json::json!({ "profile": profile, "sent": sent, "total": total }));
+            }
+        })
+        .await
+        .map_err(|e| {
+            if crate::api::is_status(&e, 507) {
+                e.context("The server's video storage is full right now. Try again later.")
+            } else if crate::api::is_status(&e, 429) {
+                e.context("You've sent a lot of media in the last hour (the server allows about 50 MB). Try again later.")
+            } else {
+                e
+            }
+        })?;
+    let thumb = api.upload_media_as(enc_thumb, "image", |_, _| {}).await?;
+    if !crate::feed::safe_media_id(&id) || !crate::feed::safe_media_id(&thumb) {
+        bail!("the server returned an unusable media id");
+    }
+    Ok(VideoRef {
+        id,
+        digest: B64.encode(d),
+        thumb,
+        thumb_digest: B64.encode(td),
+        width: v.width,
+        height: v.height,
+        duration_ms: v.duration_ms,
+        size: plain.len() as u64,
+    })
+}
+
+/// After sending: keep the plaintext MP4 and poster frame as this device's
+/// copy (for playback and re-sending), and let go of the staged video.
+pub fn keep_sent(app: &crate::state::App, staged_id: &str, v: &Prepared, r: &VideoRef) -> Result<()> {
+    let dest = app.media_dir.join(format!("{}.mp4", r.id));
+    if std::fs::rename(&v.path, &dest).is_err() {
+        std::fs::copy(&v.path, &dest).context("keeping the sent video")?;
+        let _ = std::fs::remove_file(&v.path);
+    }
+    crate::feed::write_file(&app.media_dir.join(format!("{}.webp", r.thumb)), &v.thumb)?;
+    app.staged_videos.lock().unwrap_or_else(|e| e.into_inner()).remove(staged_id);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

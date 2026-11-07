@@ -1019,6 +1019,7 @@ function renderPost(p) {
   const n = p.photos.length;
   photos.classList.add(n === 1 ? "n1" : n === 2 ? "n2" : n === 4 ? "n4" : "many");
   for (const ph of p.photos) photos.append(renderPhoto(ph, n === 1));
+  if (p.video) photos.after(renderVideo(p.video));
 
   renderReactions($(".reactions", el), p);
 
@@ -1312,6 +1313,9 @@ class Attachments {
 
   async add(sources) {
     if (this.err) hideError(this.err);
+    if (this.video && this.video.busy && sources.length) {
+      return this.fail("A video goes on its own. Remove it to add photos, or send them separately.");
+    }
     for (const src of sources) {
       if (this.items.length >= this.max) {
         this.fail(`At most ${this.max} photos per ${this.noun}.`);
@@ -1400,6 +1404,227 @@ class Attachments {
     this.hint.hidden = !parts.length;
   }
 }
+
+// --- attaching a video (Phase 9) -------------------------------------------------------
+
+let videoSupport = null;
+async function getVideoSupport() {
+  if (!videoSupport) {
+    try { videoSupport = await invoke("video_support"); } catch (e) { videoSupport = { can_send: false, reason: String(e) }; }
+  }
+  return videoSupport;
+}
+
+function fmtDuration(ms) {
+  const s = Math.max(1, Math.round(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function fmtMB(bytes) { return `${(bytes / 1e6).toFixed(1)} MB`; }
+
+let preparingSlot = null; // the composer whose video is being prepared (one at a time)
+let uploadingSlot = null; // ... or uploaded
+
+/**
+ * One video for a post or message: picked with the system's file dialog,
+ * prepared by the app (resized, re-encoded, at most 60 s, metadata stripped)
+ * with a progress bar and Cancel, then shown as its poster with its length.
+ * A video can't go with photos.
+ */
+class VideoSlot {
+  constructor(box, err, tray) {
+    this.box = box;
+    this.err = err;
+    this.tray = tray;
+    tray.video = this;
+    this.v = null;      // the staged video
+    this.prep = null;   // {fraction} while preparing
+    this.upload = null; // {sent, total} while uploading
+  }
+
+  get id() { return this.v ? this.v.id : null; }
+  get busy() { return !!(this.v || this.prep); }
+  get preparing() { return !!this.prep; }
+
+  async pick() {
+    hideError(this.err);
+    const sup = await getVideoSupport();
+    if (!sup.can_send) return showError(this.err, sup.reason);
+    if (this.tray.items.length) return showError(this.err, "A video goes on its own. Remove the photos first, or send them separately.");
+    if (this.prep) return;
+    let path;
+    try { path = await invoke("pick_video"); } catch (e) { return showError(this.err, e); }
+    if (path) await this.stage(path, false);
+  }
+
+  async stage(path, trim) {
+    hideError(this.err);
+    this.clear();
+    this.prep = { fraction: 0 };
+    preparingSlot = this;
+    this.render();
+    let again = false;
+    try {
+      const r = await invoke("stage_video", { path, trim });
+      if (r.needs_trim) {
+        this.prep = null;
+        this.render();
+        again = await askConfirm({
+          title: "Use the first 60 seconds?",
+          body: `This video is ${fmtDuration(r.needs_trim)} long. Videos can be up to a minute, so Side Tray can send its first 60 seconds.`,
+          ok: "Use the first 60 seconds",
+          cancelLabel: "Don't add it",
+        });
+      } else if (!this.prep) {
+        invoke("unstage_video", { id: r.video.id }); // cancelled or removed meanwhile
+      } else {
+        this.v = r.video;
+      }
+    } catch (e) {
+      if (String(e) !== "cancelled") showError(this.err, e);
+    } finally {
+      if (preparingSlot === this) preparingSlot = null;
+      this.prep = null;
+      this.render();
+    }
+    if (again) await this.stage(path, true);
+  }
+
+  progress(fraction) {
+    if (!this.prep) return;
+    this.prep.fraction = fraction;
+    this.render();
+  }
+
+  cancel() {
+    invoke("cancel_transcode").catch(() => {});
+    this.prep = null;
+    this.render();
+  }
+
+  clear() {
+    if (this.v) invoke("unstage_video", { id: this.v.id }).catch(() => {});
+    this.v = null;
+    this.render();
+  }
+
+  /** After sending: the app has moved the file into its media folder. */
+  sent() {
+    this.v = null;
+    this.upload = null;
+    this.render();
+  }
+
+  render() {
+    const box = this.box;
+    box.hidden = !this.prep && !this.v;
+    if (this.prep) {
+      const wrap = document.createElement("div");
+      wrap.className = "video-prep";
+      const label = document.createElement("span");
+      label.className = "muted small";
+      label.textContent = `Preparing video… ${Math.round(this.prep.fraction * 100)}%`;
+      const bar = document.createElement("progress");
+      bar.max = 1;
+      bar.value = this.prep.fraction;
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "ghost small";
+      stop.textContent = "Cancel";
+      stop.addEventListener("click", () => this.cancel());
+      wrap.append(label, bar, stop);
+      box.replaceChildren(wrap);
+      return;
+    }
+    if (!this.v) return box.replaceChildren();
+    const item = document.createElement("div");
+    item.className = "staged-item";
+    const img = document.createElement("img");
+    img.src = this.v.preview;
+    img.alt = "";
+    img.draggable = false;
+    const tag = document.createElement("span");
+    tag.className = "duration-tag";
+    tag.textContent = fmtDuration(this.v.duration_ms);
+    const x = document.createElement("button");
+    x.type = "button";
+    x.textContent = "×";
+    x.setAttribute("aria-label", "Remove video");
+    x.addEventListener("click", () => this.clear());
+    item.append(img, tag, x);
+    const note = document.createElement("span");
+    note.className = "muted small";
+    note.textContent = this.upload
+      ? `Uploading video… ${fmtMB(this.upload.sent)} of ${fmtMB(this.upload.total)}`
+      : `Video, ${fmtMB(this.v.bytes)}, ${this.v.width}×${this.v.height}, location and other details removed`;
+    box.replaceChildren(item, note);
+  }
+}
+
+listen("video-progress", (ev) => { if (preparingSlot) preparingSlot.progress(ev.payload.fraction); });
+listen("upload-progress", (ev) => {
+  const s = uploadingSlot;
+  if (!s || !s.v) return;
+  s.upload = { sent: ev.payload.sent, total: ev.payload.total };
+  s.render();
+});
+
+/** A post's or message's video: the poster frame and what can be done with it. */
+function renderVideo(v) {
+  const box = document.createElement("div");
+  box.className = "video " + v.state;
+  box.dataset.video = v.id;
+  const poster = document.createElement("img");
+  poster.className = "poster" + (v.thumb ? "" : " none");
+  if (v.thumb) poster.src = v.thumb;
+  poster.alt = "";
+  poster.loading = "lazy";
+  if (v.width && v.height && !v.thumb) poster.style.aspectRatio = `${v.width} / ${v.height}`;
+  box.append(poster);
+  const tag = document.createElement("span");
+  tag.className = "duration-tag";
+  tag.textContent = fmtDuration(v.duration_ms);
+  const status = document.createElement("div");
+  status.className = "video-status";
+  if (v.state === "ready") {
+    box.append(tag);
+  } else if (v.state === "downloading") {
+    const p = videoProgress.get(v.id);
+    status.textContent = p ? `Downloading video… ${fmtMB(p)} of ${fmtMB(v.size)}` : "Downloading video…";
+    box.append(status);
+  } else if (v.state === "pending") {
+    status.textContent = `Video (${fmtDuration(v.duration_ms)}, ${fmtMB(v.size)}): waiting to download`;
+    box.append(status);
+  } else if (v.state === "failed") {
+    status.textContent = "The video couldn't be downloaded.";
+    box.append(status);
+  } else if (v.state === "expired") {
+    status.textContent = "Video expired";
+    box.append(status);
+  }
+  return box;
+}
+
+/** Bytes received so far, per video id, while downloading. */
+const videoProgress = new Map();
+let videoRefresh = null;
+listen("video-state", (ev) => {
+  const { id, received } = ev.payload;
+  if (received == null) videoProgress.delete(id); else videoProgress.set(id, received);
+  const el = $(`.video[data-video="${CSS.escape(id)}"] .video-status`);
+  if (el && received != null) {
+    const total = ev.payload.total;
+    el.textContent = `Downloading video… ${fmtMB(received)} of ${fmtMB(total)}`;
+  }
+  if (received == null) {
+    // Finished (or expired, or failed): redraw what shows it, soon.
+    clearTimeout(videoRefresh);
+    videoRefresh = setTimeout(() => {
+      if (!$("#dm-chat-view").hidden && chatWith) loadChat(false);
+      loadFeed();
+    }, 300);
+  }
+});
 
 /**
  * A photo input feeding a tray. The camera (Android) saves each shot as a
@@ -1521,24 +1746,34 @@ postTray.attach($("#cp-photos"), $("#cp-hint"), $("#cp-err"));
 
 onPicked($("#cp-file"), postTray);
 onPicked($("#cp-camera"), postTray);
+const postVideo = new VideoSlot($("#cp-video"), $("#cp-err"), postTray);
+$("#cp-video-btn").addEventListener("click", () => postVideo.pick());
 
 $("#composer").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const err = $("#cp-err");
   hideError(err);
   if (postTray.preparing) return showError(err, "Wait for the photos to finish preparing.");
+  if (postVideo.preparing) return showError(err, "Wait for the video to finish preparing.");
   const text = $("#cp-text").value;
   const photos = postTray.ids;
-  if (!text.trim() && !photos.length) return;
+  const video = postVideo.id;
+  if (!text.trim() && !photos.length && !video) return;
   await busy($("#cp-post"), async () => {
-    $("#cp-post").textContent = photos.length ? "Uploading…" : "Posting…";
+    $("#cp-post").textContent = photos.length || video ? "Uploading…" : "Posting…";
+    uploadingSlot = video ? postVideo : null;
     try {
-      await invoke("create_post", { text, photos });
+      await invoke("create_post", { text, photos, video });
       $("#cp-text").value = "";
       postTray.sent();
+      postVideo.sent();
       await loadFeed();
     } catch (e) {
+      postVideo.upload = null;
+      postVideo.render();
       showError(err, e);
+    } finally {
+      uploadingSlot = null;
     }
   });
 });
@@ -1785,6 +2020,8 @@ async function letGoOfDrafts() {
   $("#cp-text").value = "";
   postTray.clear();
   dmTray.clear();
+  postVideo.clear();
+  dmVideo.clear();
   $("#dm-text").value = "";
   for (const t of commentTrays.values()) t.clear();
   commentTrays.clear();
@@ -2537,6 +2774,7 @@ async function openChat(memberId) {
   if (draftFor !== memberId) {
     draftFor = memberId;
     dmTray.clear();
+    dmVideo.clear();
     $("#dm-text").value = "";
     hideError($("#dm-err"));
   }
@@ -2635,6 +2873,7 @@ function renderBubble(m) {
     for (const ph of m.photos) photos.append(renderPhoto(ph, n === 1));
     b.append(photos);
   }
+  if (m.video) b.append(renderVideo(m.video));
   const text = document.createElement("div");
   text.className = "text";
   text.textContent = m.text;
@@ -2682,27 +2921,37 @@ dmTray.attach($("#dm-photos"), $("#dm-hint"), $("#dm-err"));
 
 onPicked($("#dm-file"), dmTray);
 onPicked($("#dm-camera"), dmTray);
+const dmVideo = new VideoSlot($("#dm-video"), $("#dm-err"), dmTray);
+$("#dm-video-btn").addEventListener("click", () => dmVideo.pick());
 
 $("#dm-composer").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const err = $("#dm-err");
   hideError(err);
   if (dmTray.preparing) return showError(err, "Wait for the photos to finish preparing.");
+  if (dmVideo.preparing) return showError(err, "Wait for the video to finish preparing.");
   const text = $("#dm-text").value;
   const photos = dmTray.ids;
-  if (!text.trim() && !photos.length) return;
+  const video = dmVideo.id;
+  if (!text.trim() && !photos.length && !video) return;
   const member = chatWith;
   await busy($("#dm-send"), async () => {
-    $("#dm-send").textContent = photos.length ? "Uploading…" : "Sending…";
+    $("#dm-send").textContent = photos.length || video ? "Uploading…" : "Sending…";
+    uploadingSlot = video ? dmVideo : null;
     try {
-      await invoke("send_dm", { memberId: member, text, photos });
+      await invoke("send_dm", { memberId: member, text, photos, video });
       if (chatWith === member) {
         $("#dm-text").value = "";
         dmTray.sent();
+        dmVideo.sent();
         await loadChat(true);
       }
     } catch (e) {
+      dmVideo.upload = null;
+      dmVideo.render();
       showError(err, e);
+    } finally {
+      uploadingSlot = null;
     }
   });
   $("#dm-text").focus();

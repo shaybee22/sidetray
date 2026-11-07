@@ -240,6 +240,43 @@ impl Api {
         Ok(r.id)
     }
 
+    /// Upload an encrypted blob as `kind` ("image" or "video"), reporting
+    /// (bytes sent, total) as the request body is read. Returns its media id.
+    pub async fn upload_media_as(&self, blob: Vec<u8>, kind: &str, progress: impl Fn(u64, u64) + Send + Sync + 'static) -> Result<String> {
+        use futures_util::StreamExt;
+        const CHUNK: usize = 64 * 1024;
+        let total = blob.len() as u64;
+        let chunks: Vec<Vec<u8>> = blob.chunks(CHUNK).map(<[u8]>::to_vec).collect();
+        let mut sent = 0u64;
+        let body = futures_util::stream::iter(chunks).map(move |c| {
+            sent += c.len() as u64;
+            progress(sent, total);
+            Ok::<_, std::io::Error>(c)
+        });
+        let req = self
+            .http
+            .post(format!("{}/media", self.base))
+            .query(&[("kind", kind)])
+            .header("content-type", "application/octet-stream")
+            .header("content-length", total)
+            .timeout(Duration::from_secs(300))
+            .body(reqwest::Body::wrap_stream(body));
+        let r: MediaResp = self.json(self.auth(req)).await?;
+        Ok(r.id)
+    }
+
+    /// Like `download_media`, reporting the bytes received so far.
+    pub async fn download_media_progress(&self, id: &str, progress: impl Fn(u64)) -> Result<Vec<u8>> {
+        let req = self.http.get(format!("{}/media/{id}", self.base)).timeout(Duration::from_secs(300));
+        let mut resp = self.checked(self.auth(req)).await?;
+        let mut out = Vec::with_capacity(resp.content_length().unwrap_or(0).min(16 << 20) as usize);
+        while let Some(chunk) = resp.chunk().await.context("downloading media")? {
+            out.extend_from_slice(&chunk);
+            progress(out.len() as u64);
+        }
+        Ok(out)
+    }
+
     pub async fn download_media(&self, id: &str) -> Result<Vec<u8>> {
         let req = self.http.get(format!("{}/media/{id}", self.base)).timeout(Duration::from_secs(300));
         let resp = self.checked(self.auth(req)).await?;

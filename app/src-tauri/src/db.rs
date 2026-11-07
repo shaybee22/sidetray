@@ -178,6 +178,32 @@ pub fn open(path: &Path) -> Result<Connection> {
     // (downloaded, or given up on), and ids of a deleted post's photos to tell it.
     add_column(&conn, "media", "server_acked", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS media_acks_pending (id TEXT PRIMARY KEY)")?;
+    // Phase 9: one video per post (post_id) or direct message (message_id).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS videos (
+            id             TEXT PRIMARY KEY,         -- media id of the video file
+            post_id        TEXT,
+            message_id     TEXT,
+            key_version    INTEGER NOT NULL DEFAULT 0, -- group key (posts)
+            digest         BLOB NOT NULL,
+            thumb_id       TEXT NOT NULL,            -- the poster frame, an ordinary photo
+            thumb_digest   BLOB NOT NULL,
+            width          INTEGER NOT NULL,
+            height         INTEGER NOT NULL,
+            duration_ms    INTEGER NOT NULL,
+            size           INTEGER NOT NULL,
+            state          TEXT NOT NULL DEFAULT 'pending', -- pending, downloading, ready, expired, failed
+            local_path     TEXT,
+            thumb_path     TEXT,
+            attempts       INTEGER NOT NULL DEFAULT 0,
+            thumb_attempts INTEGER NOT NULL DEFAULT 0,
+            acked          INTEGER NOT NULL DEFAULT 0, -- told the relay (POST /media/acks)
+            thumb_acked    INTEGER NOT NULL DEFAULT 0,
+            mine           INTEGER NOT NULL DEFAULT 0  -- sent from this device
+        );
+        CREATE INDEX IF NOT EXISTS videos_post ON videos(post_id);
+        CREATE INDEX IF NOT EXISTS videos_message ON videos(message_id);",
+    )?;
     Ok(conn)
 }
 

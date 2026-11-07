@@ -36,7 +36,7 @@ base64 = "0.22"
 getrandom = "0.2"
 zeroize = { version = "1.8", features = ["derive"] }
 # rustls only, so the app trusts exactly the roots we give it (no OS store, no OpenSSL).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "process", "io-util", "fs", "rt"] }
 # Photos: decode common formats, apply EXIF orientation, resize; libwebp for lossy WebP.

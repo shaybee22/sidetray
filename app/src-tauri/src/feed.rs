@@ -4,7 +4,7 @@
 //!
 //! | kind     | payload |
 //! | -------- | ------- |
-//! | post     | `{"text": str, "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}]}` |
+//! | post     | `{"text": str, "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}], "video"?: {"id", "digest", "thumb", "thumb_digest", "width", "height", "duration_ms", "size"}}` |
 //! | comment  | `{"post": event_id, "text": str}` |
 //! | reaction | `{"post": event_id, "emoji": str}` (empty emoji removes yours) |
 //! | edit     | `{"post": event_id, "text": str}` |
@@ -50,6 +50,9 @@ struct PostBody {
     text: String,
     #[serde(default)]
     photos: Vec<PhotoRef>,
+    /// Phase 9: at most one, never with photos (apps before it ignore the field).
+    #[serde(default)]
+    video: Option<crate::video::VideoRef>,
 }
 
 #[derive(Deserialize)]
@@ -215,7 +218,11 @@ pub async fn sync_once(app: &App) -> Result<SyncReport> {
         Err(e) => eprintln!("syncing direct messages: {e:#}"),
     }
     download_media(app, &id, &s, &api).await;
+    crate::video::fetch_thumbs(app, &id, &s, &api).await;
     ack_media(app, &api).await;
+    // Videos last: they're the big downloads.
+    crate::video::fetch_videos(app, &id, &s, &api).await;
+    crate::video::ack(app, &api).await;
     report.avatars = crate::profile::download(app, &id, &s, &api).await;
     if let Some(keys) = &km_keys {
         match manage::rotate_if_pending(app, keys).await {
@@ -303,10 +310,17 @@ fn apply_event(
                 params![event_id, e.seq, member, e.author_device_id, body.text, e.created_at],
             )?;
             store_photo_refs(conn, &event_id, None, e.key_version, &body.photos)?;
+            if let Some(v) = &body.video {
+                crate::video::store_ref(conn, crate::video::Owner::Post { post_id: &event_id, key_version: e.key_version }, v, false)?;
+            }
+            let text = match (&body.video, snippet(&body.text, body.photos.len())) {
+                (Some(_), t) if t.is_empty() => "shared a video".to_string(),
+                (_, t) => t,
+            };
             Ok((inserted > 0 && by_other).then(|| Notice {
                 post_id: event_id.clone(),
                 author: author_name(),
-                text: snippet(&body.text, body.photos.len()),
+                text,
                 comment: false,
                 notify: true,
             }))
@@ -598,10 +612,17 @@ pub fn latest_key(app: &App, id: &Identity) -> Result<GroupKey> {
 
 /// What `publish_once` returns: the event id, the key it used, its photo
 /// references and the digests of the encrypted blobs.
-type Posted = (String, GroupKey, Vec<PhotoRef>, Vec<([u8; 32], [u8; 32])>);
+type Posted = (String, GroupKey, Vec<PhotoRef>, Vec<([u8; 32], [u8; 32])>, Option<crate::video::VideoRef>);
 
 /// Upload the photos, then send a post or comment carrying them, under the latest key.
-async fn publish_once(app: &App, id: &Identity, kind: &str, body: &serde_json::Value, photos: &[crate::photo::Processed]) -> Result<Posted> {
+async fn publish_once(
+    app: &App,
+    id: &Identity,
+    kind: &str,
+    body: &serde_json::Value,
+    photos: &[crate::photo::Processed],
+    video: Option<&crate::video::Prepared>,
+) -> Result<Posted> {
     let gk = latest_key(app, id)?;
     let api = app.api(id)?;
     let ad = protocol::media_ad(&id.group_id);
@@ -630,9 +651,18 @@ async fn publish_once(app: &App, id: &Identity, kind: &str, body: &serde_json::V
     if !refs.is_empty() {
         body["photos"] = serde_json::to_value(&refs)?;
     }
-    let media_ids = refs.iter().flat_map(|r| [r.full.clone(), r.thumb.clone()]).collect();
+    let mut media_ids: Vec<String> = refs.iter().flat_map(|r| [r.full.clone(), r.thumb.clone()]).collect();
+    let video_ref = match video {
+        Some(v) => {
+            let r = crate::video::upload(app, &api, v, |plain| crypto::encrypt(&gk, plain, &ad)).await?;
+            body["video"] = serde_json::to_value(&r)?;
+            media_ids.extend([r.id.clone(), r.thumb.clone()]);
+            Some(r)
+        }
+        None => None,
+    };
     let event_id = send_event(app, kind, &body, &gk, media_ids).await?;
-    Ok((event_id, gk, refs, local))
+    Ok((event_id, gk, refs, local, video_ref))
 }
 
 /// Send a comment, reaction or delete under the latest key. If the relay says
@@ -659,18 +689,23 @@ fn take_staged(app: &App, staged: &[String]) -> Result<Vec<crate::photo::Process
 
 /// Send a post (`post_id` None) or a comment on `post_id` with staged photos,
 /// keep the plaintext photos locally, and sync.
-async fn publish(app: &App, kind: &str, body: serde_json::Value, staged: &[String], post_id: Option<&str>) -> Result<()> {
+async fn publish(app: &App, kind: &str, body: serde_json::Value, staged: &[String], post_id: Option<&str>, video: Option<&str>) -> Result<()> {
     let id = app.require_active()?;
     let photos = take_staged(app, staged)?;
-    let (event_id, gk, refs, local) = match publish_once(app, &id, kind, &body, &photos).await {
+    let prepared = video.map(|v| crate::video::staged(app, v)).transpose()?;
+    let (event_id, gk, refs, local, video_ref) = match publish_once(app, &id, kind, &body, &photos, prepared.as_ref()).await {
         // A rotation we hadn't picked up: get the new key and redo it (the
         // first uploads become orphans, which the relay prunes after a day).
         Err(e) if is_stale_key(&e) => {
             manage::refresh_keys_now(app).await?;
-            publish_once(app, &id, kind, &body, &photos).await?
+            publish_once(app, &id, kind, &body, &photos, prepared.as_ref()).await?
         }
         r => r?,
     };
+    if let (Some(staged_id), Some(v), Some(r)) = (video, &prepared, &video_ref) {
+        crate::video::keep_sent(app, staged_id, v, r)?;
+        crate::video::store_ref(&app.db(), crate::video::Owner::Post { post_id: &event_id, key_version: gk.version() }, r, true)?;
+    }
     let (owner, comment_id) = match post_id {
         Some(post) => (post, Some(event_id.as_str())),
         None => (event_id.as_str(), None),
@@ -698,7 +733,7 @@ async fn publish(app: &App, kind: &str, body: serde_json::Value, staged: &[Strin
     Ok(())
 }
 
-pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()> {
+pub async fn create_post(app: &App, text: &str, staged: &[String], video: Option<&str>) -> Result<()> {
     let text = text.trim();
     if text.len() > MAX_TEXT {
         bail!("that post is too long");
@@ -706,10 +741,13 @@ pub async fn create_post(app: &App, text: &str, staged: &[String]) -> Result<()>
     if staged.len() > MAX_PHOTOS {
         bail!("at most {MAX_PHOTOS} photos per post");
     }
-    if text.is_empty() && staged.is_empty() {
+    if video.is_some() && !staged.is_empty() {
+        bail!("a video goes on its own: post the photos separately");
+    }
+    if text.is_empty() && staged.is_empty() && video.is_none() {
         bail!("write something or add a photo");
     }
-    publish(app, "post", serde_json::json!({ "text": text }), staged, None).await
+    publish(app, "post", serde_json::json!({ "text": text }), staged, None, video).await
 }
 
 fn require_post(app: &App, post_id: &str) -> Result<String> {
@@ -729,7 +767,7 @@ pub async fn add_comment(app: &App, post_id: &str, text: &str, staged: &[String]
         bail!("at most {MAX_COMMENT_PHOTOS} photos per comment");
     }
     require_post(app, post_id)?;
-    publish(app, "comment", serde_json::json!({ "post": post_id, "text": text }), staged, Some(post_id)).await
+    publish(app, "comment", serde_json::json!({ "post": post_id, "text": text }), staged, Some(post_id), None).await
 }
 
 pub async fn set_reaction(app: &App, post_id: &str, emoji: &str) -> Result<()> {
@@ -769,6 +807,7 @@ pub struct PostView {
     pub created_at: i64,
     pub edited: bool,
     pub photos: Vec<PhotoView>,
+    pub video: Option<crate::video::VideoView>,
     pub comments: Vec<CommentView>,
     pub reactions: Vec<ReactionView>,
 }
@@ -836,6 +875,7 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
             created_at: r.get(6)?,
             edited: r.get(7)?,
             photos: vec![],
+            video: None,
             comments: vec![],
             reactions: vec![],
         })
@@ -868,6 +908,7 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
     )?;
     for p in &mut posts {
         p.photos = photos.query_map(params![p.id], photo_view)?.collect::<rusqlite::Result<_>>()?;
+        p.video = crate::video::view(conn, "post_id", &p.id)?;
         p.comments = comments
             .query_map(params![p.id, UNKNOWN], |r| {
                 let author_id: String = r.get(1)?;
@@ -1076,6 +1117,30 @@ mod tests {
         let (p, _) = f.event("post", serde_json::json!({ "text": "", "photos": [photo] }));
         assert_eq!(f.apply(&p).unwrap().unwrap().text, "shared a photo");
         assert_eq!(snippet(&"x".repeat(200), 0).chars().count(), 141);
+    }
+
+    #[test]
+    fn video_posts_are_stored_pending_and_bad_refs_skipped() {
+        let mut f = fixture();
+        let d = B64.encode([7u8; 32]);
+        let video = |id: &str, secs: u64| serde_json::json!({ "id": id, "digest": d, "thumb": format!("{id}_t"), "thumb_digest": d,
+                                                     "width": 1280, "height": 720, "duration_ms": secs * 1000, "size": 9_000_000 });
+        let (p, pid) = f.event("post", serde_json::json!({ "text": "", "video": video("vid_1", 45) }));
+        assert_eq!(f.apply(&p).unwrap().unwrap().text, "shared a video");
+        let posts = feed(&f.conn, "m_me", false, None, 10).unwrap();
+        let v = posts[0].video.as_ref().unwrap();
+        assert_eq!((v.id.as_str(), v.state.as_str(), v.thumb.is_none()), ("vid_1", "pending", true));
+        // Unsafe ids, or far over the length limit: the post shows without its video.
+        for bad in [video("../evil", 10), video("vid_2", 600)] {
+            let (p, _) = f.event("post", serde_json::json!({ "text": "x", "video": bad }));
+            f.apply(&p).unwrap();
+        }
+        let n: i64 = f.conn.query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        // An app before Phase 9 sees only the text: the field is extra, not required.
+        let (old, _) = f.event("post", serde_json::json!({ "text": "plain" }));
+        assert!(f.apply(&old).unwrap().is_some());
+        let _ = pid;
     }
 
     #[test]

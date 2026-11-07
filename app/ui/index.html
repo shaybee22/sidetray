@@ -203,9 +203,11 @@
     <form id="composer" class="card composer" novalidate>
       <textarea id="cp-text" rows="3" maxlength="20000" placeholder="Share something with the group…"></textarea>
       <div class="staged" id="cp-photos"></div>
+      <div class="staged-video" id="cp-video" hidden></div>
       <div class="composer-bar">
         <label class="button ghost" title="Or paste or drop pictures here"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16.5l-4.5-4.5-7.5 7"/></svg><span class="desktop-only">Add photos</span><span class="mobile-only">Photos</span><input id="cp-file" type="file" accept="image/*" multiple hidden></label>
         <label class="button ghost mobile-only"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8.5h3.2l1.8-2.6h6l1.8 2.6H20V19H4z"/><circle cx="12" cy="13.3" r="3.4"/></svg>Camera<input id="cp-camera" type="file" accept="image/*" capture="environment" hidden></label>
+        <button type="button" class="ghost desktop-only" id="cp-video-btn" title="Add a video (up to 60 seconds)"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10.5l5-3v9l-5-3z"/></svg>Video</button>
         <span class="muted small" id="cp-hint"></span>
         <button class="primary" id="cp-post">Post</button>
       </div>
@@ -243,9 +245,11 @@
       <p class="note chat-gone" id="dm-gone" hidden></p>
       <form id="dm-composer" class="chat-composer" novalidate>
         <div class="staged" id="dm-photos"></div>
+        <div class="staged-video" id="dm-video" hidden></div>
         <div class="chat-input-row">
           <label class="button ghost icon-on-phone" title="Add photos" aria-label="Add photos"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 16.5l-4.5-4.5-7.5 7"/></svg><span class="desktop-only">Photo</span><input id="dm-file" type="file" accept="image/*" multiple hidden></label>
           <label class="button ghost icon-on-phone mobile-only" title="Take a photo" aria-label="Take a photo"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8.5h3.2l1.8-2.6h6l1.8 2.6H20V19H4z"/><circle cx="12" cy="13.3" r="3.4"/></svg><input id="dm-camera" type="file" accept="image/*" capture="environment" hidden></label>
+          <button type="button" class="ghost icon-on-phone desktop-only" id="dm-video-btn" title="Add a video (up to 60 seconds)" aria-label="Add a video"><svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10.5l5-3v9l-5-3z"/></svg><span class="desktop-only">Video</span></button>
           <textarea id="dm-text" rows="2" maxlength="20000" placeholder="Write a message…"></textarea>
           <button class="primary" id="dm-send">Send</button>
         </div>

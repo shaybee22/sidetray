@@ -16,7 +16,8 @@
 //! Payload (JSON, encrypted with the message key, AD `protocol::dm_ad`):
 //! `{"text", "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}]}`,
 //! the same photo references as posts, but the blobs are encrypted with the
-//! message key (AD `protocol::dm_media_ad`).
+//! message key (AD `protocol::dm_media_ad`). Phase 9 adds `"video"?`, the same
+//! reference as a post's (`video::VideoRef`), encrypted the same way.
 
 use crate::account::{self, CheckedRoster};
 use crate::api::*;
@@ -44,6 +45,8 @@ struct DmBody {
     text: String,
     #[serde(default)]
     photos: Vec<PhotoRef>,
+    #[serde(default)]
+    video: Option<crate::video::VideoRef>,
 }
 
 /// Who may send: verified devices now, and former ones for messages up to
@@ -117,6 +120,8 @@ pub async fn sync(app: &App, id: &Identity, s: &Secrets, api: &Api, authors: &Au
         }
     }
     download_photos(app, id, s, api).await;
+    // A video's poster frame is a photo of the message too.
+    crate::video::fetch_thumbs(app, id, s, api).await;
     // Ack only after the photos: the relay deletes a message's photos once
     // every device it's for has acked the message.
     let ack = ackable_seq(&app.db())?;
@@ -135,9 +140,15 @@ const DM_ACKED_KEY: &str = "dm_acked_seq";
 /// first message with photos it still has to fetch (and hasn't given up on).
 fn ackable_seq(conn: &Connection) -> Result<i64> {
     let last = db::dm_last_seq(conn)?;
+    // Video files don't hold it back: the relay keeps a message while its
+    // video is there, and acks for those go per file.
     let waiting: Option<i64> = conn.query_row(
-        "SELECT MIN(m.seq) FROM dm_messages m JOIN dm_photos p ON p.message_id = m.id
-         WHERE (p.local_path IS NULL OR p.thumb_path IS NULL) AND p.attempts < ?1 AND m.seq <= ?2",
+        "SELECT MIN(seq) FROM (
+           SELECT m.seq FROM dm_messages m JOIN dm_photos p ON p.message_id = m.id
+           WHERE (p.local_path IS NULL OR p.thumb_path IS NULL) AND p.attempts < ?1 AND m.seq <= ?2
+           UNION ALL
+           SELECT m.seq FROM dm_messages m JOIN videos v ON v.message_id = m.id
+           WHERE v.thumb_path IS NULL AND v.thumb_attempts < ?1 AND m.seq <= ?2)",
         params![MAX_PHOTO_ATTEMPTS, last],
         |r| r.get(0),
     )?;
@@ -169,7 +180,10 @@ fn apply(conn: &Connection, id: &Identity, s: &Secrets, me: &DeviceKeys, authors
     let (key, plain) = cdm::open_dm(me, &id.device_id, &id.group_id, &conv, &m.sender_device_id, &sender.sign_pk, &ct, &keys, &sig)
         .context("signature, recipient list or encryption doesn't check out")?;
     let body: DmBody = serde_json::from_slice(&plain).context("bad message payload")?;
-    if body.text.len() > MAX_TEXT || body.photos.len() > MAX_PHOTOS || (body.text.trim().is_empty() && body.photos.is_empty()) {
+    if body.text.len() > MAX_TEXT
+        || body.photos.len() > MAX_PHOTOS
+        || (body.text.trim().is_empty() && body.photos.is_empty() && body.video.is_none())
+    {
         bail!("empty or oversized message");
     }
     let msg_id = crypto::event_id(&ct);
@@ -188,7 +202,10 @@ fn apply(conn: &Connection, id: &Identity, s: &Secrets, me: &DeviceKeys, authors
             params![p.full, msg_id, i as i64, p.width, p.height, &fd[..], p.thumb, &td[..]],
         )?;
     }
-    let text = snippet(&body.text, body.photos.len());
+    if let Some(v) = &body.video {
+        crate::video::store_ref(conn, crate::video::Owner::Message { message_id: &msg_id }, v, false)?;
+    }
+    let text = snippet(&body.text, body.photos.len(), body.video.is_some());
     record(conn, &conv, &other, m.seq, m.created_at, &text, from_me, !from_me)?;
     Ok((true, (!from_me).then(|| DmNotice { member_id: other, author: sender.display_name.clone(), text })))
 }
@@ -232,10 +249,13 @@ fn record(conn: &Connection, conv: &str, other: &str, seq: i64, at: i64, text: &
 }
 
 /// One line for the conversation list and notifications.
-fn snippet(text: &str, photos: usize) -> String {
+fn snippet(text: &str, photos: usize, video: bool) -> String {
     let t = feed::snippet(text, 0);
     if !t.is_empty() {
         return t;
+    }
+    if video {
+        return "Video".into();
     }
     match photos {
         1 => "Photo".into(),
@@ -367,8 +387,8 @@ struct SeqResp {
 }
 
 /// Send a message to `member_id` with text and photos already staged (and
-/// resized, EXIF stripped) by `stage_photo`.
-pub async fn send(app: &App, member_id: &str, text: &str, staged: &[String]) -> Result<()> {
+/// resized, EXIF stripped) by `stage_photo`, or a video staged by `stage_video`.
+pub async fn send(app: &App, member_id: &str, text: &str, staged: &[String], video: Option<&str>) -> Result<()> {
     let id = app.require_active()?;
     let text = text.trim();
     if text.len() > MAX_TEXT {
@@ -384,15 +404,23 @@ pub async fn send(app: &App, member_id: &str, text: &str, staged: &[String]) -> 
         }
         staged.iter().map(|k| map.get(k).expect("checked").clone()).collect()
     };
-    if text.is_empty() && photos.is_empty() {
+    if video.is_some() && !photos.is_empty() {
+        bail!("a video goes on its own: send the photos separately");
+    }
+    let prepared = video.map(|v| crate::video::staged(app, v)).transpose()?;
+    if text.is_empty() && photos.is_empty() && prepared.is_none() {
         bail!("write something or add a photo");
     }
-    match send_once(app, &id, member_id, text, &photos).await {
+    let sent = match send_once(app, &id, member_id, text, &photos, prepared.as_ref()).await {
         // Someone's devices changed between our roster refresh and the send: once more.
         Err(e) if is_status(&e, 422) && format!("{e:#}").contains("sealed to exactly") => {
-            send_once(app, &id, member_id, text, &photos).await?
+            send_once(app, &id, member_id, text, &photos, prepared.as_ref()).await?
         }
         r => r?,
+    };
+    if let (Some(staged_id), Some(v), Some((msg_id, r))) = (video, &prepared, &sent) {
+        crate::video::keep_sent(app, staged_id, v, r)?;
+        crate::video::store_ref(&app.db(), crate::video::Owner::Message { message_id: msg_id }, r, true)?;
     }
     let mut map = app.staged.lock().unwrap_or_else(|e| e.into_inner());
     for k in staged {
@@ -401,7 +429,15 @@ pub async fn send(app: &App, member_id: &str, text: &str, staged: &[String]) -> 
     Ok(())
 }
 
-async fn send_once(app: &App, id: &Identity, member_id: &str, text: &str, photos: &[crate::photo::Processed]) -> Result<()> {
+/// Returns the message id and the video's reference, if it had one.
+async fn send_once(
+    app: &App,
+    id: &Identity,
+    member_id: &str,
+    text: &str,
+    photos: &[crate::photo::Processed],
+    video: Option<&crate::video::Prepared>,
+) -> Result<Option<(String, crate::video::VideoRef)>> {
     let api = app.api(id)?;
     let s = app.secrets(id)?;
     let me = s.device_keys()?;
@@ -427,6 +463,16 @@ async fn send_once(app: &App, id: &Identity, member_id: &str, text: &str, photos
     if !refs.is_empty() {
         body["photos"] = serde_json::to_value(&refs)?;
     }
+    let mut media_ids: Vec<String> = refs.iter().flat_map(|r| [r.full.clone(), r.thumb.clone()]).collect();
+    let video_ref = match video {
+        Some(v) => {
+            let r = crate::video::upload(app, &api, v, |plain| key.encrypt(plain, &ad)).await?;
+            body["video"] = serde_json::to_value(&r)?;
+            media_ids.extend([r.id.clone(), r.thumb.clone()]);
+            Some(r)
+        }
+        None => None,
+    };
     let plain = serde_json::to_vec(&body)?;
     let sealed = cdm::seal_dm(&me, &id.group_id, &conv, &id.device_id, &key, &plain, &recipients)?;
     let resp: SeqResp = api
@@ -437,7 +483,7 @@ async fn send_once(app: &App, id: &Identity, member_id: &str, text: &str, photos
                 recipient_member_id: member_id,
                 ciphertext: B64.encode(&sealed.ciphertext),
                 signature: B64.encode(sealed.signature),
-                media_ids: refs.iter().flat_map(|r| [r.full.clone(), r.thumb.clone()]).collect(),
+                media_ids,
                 sealed_keys: sealed.sealed_keys.iter().map(|(d, k)| DmKey { device_id: d.clone(), sealed_key: B64.encode(k) }).collect(),
             },
         )
@@ -459,9 +505,9 @@ async fn send_once(app: &App, id: &Identity, member_id: &str, text: &str, photos
             params![r.full, msg_id, i as i64, r.width, r.height, &fd[..], r.thumb, &td[..], format!("{}.webp", r.full), format!("{}.webp", r.thumb)],
         )?;
     }
-    record(&tx, &conv, member_id, resp.seq, crate::now(), &snippet(text, photos.len()), true, false)?;
+    record(&tx, &conv, member_id, resp.seq, crate::now(), &snippet(text, photos.len(), video_ref.is_some()), true, false)?;
     tx.commit()?;
-    Ok(())
+    Ok(video_ref.map(|r| (msg_id, r)))
 }
 
 // --- reading -------------------------------------------------------------------------
@@ -520,6 +566,7 @@ pub struct MessageView {
     pub text: String,
     pub created_at: i64,
     pub photos: Vec<PhotoView>,
+    pub video: Option<crate::video::VideoView>,
 }
 
 /// The conversation with one member, oldest first (it may not have started yet).
@@ -540,7 +587,7 @@ pub fn chat(conn: &Connection, id: &Identity, member_id: &str) -> Result<ChatVie
     let mut messages: Vec<MessageView> = st
         .query_map(params![conv, CHAT_LIMIT], |r| {
             let sender: String = r.get(2)?;
-            Ok(MessageView { id: r.get(0)?, seq: r.get(1)?, mine: sender == id.member_id, text: r.get(3)?, created_at: r.get(4)?, photos: vec![] })
+            Ok(MessageView { id: r.get(0)?, seq: r.get(1)?, mine: sender == id.member_id, text: r.get(3)?, created_at: r.get(4)?, photos: vec![], video: None })
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut photos = conn.prepare("SELECT thumb_path, local_path, width, height FROM dm_photos WHERE message_id = ?1 ORDER BY idx")?;
@@ -555,6 +602,7 @@ pub fn chat(conn: &Connection, id: &Identity, member_id: &str) -> Result<ChatVie
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
+        m.video = crate::video::view(conn, "message_id", &m.id)?;
     }
     Ok(ChatView { member_id: member_id.to_string(), name, avatar: avatar.as_deref().map(media_url), can_message, messages })
 }
@@ -800,6 +848,32 @@ mod tests {
         // Nothing synced past the cursor is acked.
         f.conn.execute("UPDATE sync_state SET dm_last_seq = 2", []).unwrap();
         assert_eq!(ackable_seq(&f.conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn video_messages_are_stored_and_wait_only_for_the_poster_frame() {
+        let mut f = fixture();
+        let (ana, me) = (f.ana.clone_keys(), f.me.clone_keys());
+        let d = B64.encode([7u8; 32]);
+        let video = serde_json::json!({ "id": "v_1", "digest": d, "thumb": "v_thumb", "thumb_digest": d,
+                                        "width": 854, "height": 480, "duration_ms": 42_000, "size": 8_000_000 });
+        // Video only, no text: allowed (a video-only message isn't empty).
+        let m = f.dm(("d_ana", &ana, "m_ana"), "m_me", &[("d_me", &me)], serde_json::json!({ "text": "", "video": video }));
+        let (inserted, notice) = f.apply(&m).unwrap();
+        assert!(inserted);
+        assert_eq!(notice.unwrap().text, "Video");
+        db::set_dm_last_seq(&f.conn, 1).unwrap();
+        // The poster frame isn't here: hold the ack (the relay drops a message's photos with it).
+        assert_eq!(ackable_seq(&f.conn).unwrap(), 0);
+        f.conn.execute("UPDATE videos SET thumb_path = 'v_thumb.webp'", []).unwrap();
+        // The video file itself doesn't hold it: it's acked per file.
+        assert_eq!(ackable_seq(&f.conn).unwrap(), 1);
+        let v = crate::video::view(&f.conn, "message_id", &m_id(&m)).unwrap().unwrap();
+        assert_eq!((v.state.as_str(), v.duration_ms, v.mine), ("pending", 42_000, false));
+    }
+
+    fn m_id(m: &crate::api::Dm) -> String {
+        crypto::event_id(&B64.decode(&m.ciphertext).unwrap())
     }
 
     #[test]

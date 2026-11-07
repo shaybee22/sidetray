@@ -935,8 +935,15 @@ fn staged_video(app: Active, id: String) -> Option<StagedVideoView> {
 }
 
 #[tauri::command]
-async fn create_post(app: Active, text: String, photos: Vec<String>) -> Res<()> {
-    feed::create_post(&app, &text, &photos).await.map_err(err)
+async fn create_post(app: Active, text: String, photos: Vec<String>, video: Option<String>) -> Res<()> {
+    feed::create_post(&app, &text, &photos, video.as_deref()).await.map_err(err)
+}
+
+/// A downloaded (or sent) video's MP4, as raw bytes for a blob: URL.
+#[tauri::command]
+fn read_video(app: Active, id: String) -> Res<tauri::ipc::Response> {
+    app.require_archive().map_err(err)?;
+    video::read(&app, &id).map(tauri::ipc::Response::new).map_err(err)
 }
 
 #[tauri::command]
@@ -983,8 +990,8 @@ fn dm_recipients(app: Active) -> Res<Vec<dm::Recipient>> {
 }
 
 #[tauri::command]
-async fn send_dm(app: Active, member_id: String, text: String, photos: Vec<String>) -> Res<()> {
-    dm::send(&app, &member_id, &text, &photos).await.map_err(err)
+async fn send_dm(app: Active, member_id: String, text: String, photos: Vec<String>, video: Option<String>) -> Res<()> {
+    dm::send(&app, &member_id, &text, &photos, video.as_deref()).await.map_err(err)
 }
 
 /// The conversation was looked at: clear its unread count (and the badge).
@@ -1344,6 +1351,7 @@ pub fn run() {
             cancel_transcode,
             unstage_video,
             staged_video,
+            read_video,
             check_server,
             trust_server,
             probe_group,
