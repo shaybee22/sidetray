@@ -37,6 +37,7 @@ cd "ffmpeg-$VERSION"
     --disable-autodetect --disable-everything --disable-debug --disable-doc \
     --disable-network --disable-programs --enable-ffmpeg \
     --enable-w32threads --enable-mediafoundation \
+    --enable-d3d11va \
     --enable-protocol=file,pipe \
     --enable-demuxer=mov,matroska,avi,mpegts,mpegps,flv,h264,hevc,m4v,ogg,wav \
     --enable-decoder=h264,hevc,vp8,vp9,mpeg4,mpeg2video,mpeg1video,mjpeg,h263,msmpeg4v3,prores,dvvideo \
