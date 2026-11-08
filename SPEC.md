@@ -638,7 +638,13 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
   - Two videos and a picture → "a video" with "One video at a time, and not with photos: using the first video." → the first video staged (its post then hit the relay's 50 MB/hour upload limit after the day's tests: the error showed and the staged video stayed).
   - A picture alone still shares as before.
   - `am start … SEND --eu EXTRA_STREAM content://media/…` from adb fails (`setDataSource failed`): the shell can't grant MediaStore reads. Real shares (Files) carry their grant.
-- Next: 9c checkpoint 6 (the full "Done when" on the razr and desktop, release build check, CHANGELOG/README).
+- **9c checkpoint 6 (in progress).** Done so far:
+  - Release build without the switch (`SIDETRAY_WEBVIEW_DEBUG` unset): 14,694,474 bytes, no `assets/webview-debug`, signed with the release key (`c2c4fcd1…`, the workflow's `CERT_SHA256`). On the razr, driven by taps: a shared clip prepared (Media3 under R8, "Video, 6.8 MB, 720×1280, location and other details removed") and a video played. (All the test builds were R8 release builds too; they only differed by the switch.)
+  - CHANGELOG and README: Android videos, Media3 and its licence, the metadata strip, streamed playback, the mobile-data setting, the debug switch.
+  - Relay: the phone's five videos were acked by every device (Vid Tester, the CLI member, by hand) and the hourly prune (run once by hand) deleted them as `delivered`; `GET` then answers 410 `{"reason": "delivered"}` and the post's poster frame still answers 200. The phone's DM video to Alex had already gone as `delivered` with just their two devices.
+  - Four older videos wait for the phone, which stored their posts as text while it ran 0.3.1 and will never fetch them: they go at the 14-day TTL (as decided in 9a).
+  - Request on the phone: an Alex video held on the phone (metered + setting off), deleted on the relay (stand-in ack for the phone), then unmetered: the phone showed it greyed with "Video expired" and Request; a real tap opened the chat with Alex pre-filled ("Could you send me your video from November 7?") and the request note; sent; Alex's copy showed "Send it", which re-sent the 45 s video as a new message; the phone played it (real tap).
+- Next: the rest of checkpoint 6 (Send it on the phone, a third member's 404 on a DM video), once the phone's hourly upload window has room.
 
 ## Distribution and later
 
