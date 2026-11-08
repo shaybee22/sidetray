@@ -871,7 +871,25 @@ async fn pick_video(handle: AppHandle) -> Option<String> {
             });
         rx.await.ok().flatten().and_then(|f| f.into_path().ok()).map(|p| p.display().to_string())
     }
-    #[cfg(not(desktop))]
+    #[cfg(target_os = "android")]
+    {
+        let _ = handle;
+        if let Err(e) = tauri::async_runtime::spawn_blocking(android::pick_video).await.map_err(anyhow::Error::from).and_then(|r| r) {
+            eprintln!("video picker: {e:#}");
+            return None;
+        }
+        // The picker is another activity: wait for its answer (no time limit:
+        // someone may browse their gallery for a while).
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            match tauri::async_runtime::spawn_blocking(android::take_picked_video).await {
+                Ok(Ok(None)) => continue,
+                Ok(Ok(Some(uri))) => return uri,
+                _ => return None,
+            }
+        }
+    }
+    #[cfg(all(not(desktop), not(target_os = "android")))]
     {
         let _ = handle;
         None
@@ -882,11 +900,9 @@ async fn pick_video(handle: AppHandle) -> Option<String> {
 /// progress as `video-progress` events, and keep it until it's posted.
 #[tauri::command]
 async fn stage_video(handle: AppHandle, app: Active, path: String, trim: Option<bool>) -> Res<StageVideoResult> {
-    let ffmpeg = video::ffmpeg_path().ok_or("This copy of Side Tray can't prepare videos.")?;
-    let source = std::path::PathBuf::from(&path);
-    let info = video::probe(&ffmpeg, &source).await.map_err(err)?;
-    if info.duration_ms > video::MAX_DURATION_MS + video::TRIM_SLACK_MS && trim != Some(true) {
-        return Ok(StageVideoResult { needs_trim: Some(info.duration_ms), video: None });
+    let duration_ms = video::source_duration_ms(&path).await.map_err(err)?;
+    if duration_ms > video::MAX_DURATION_MS + video::TRIM_SLACK_MS && trim != Some(true) {
+        return Ok(StageVideoResult { needs_trim: Some(duration_ms), video: None });
     }
     let cancel = video::Cancel::default();
     if let Some(old) = app.transcode.lock().unwrap_or_else(|e| e.into_inner()).replace(cancel.clone()) {
@@ -899,7 +915,7 @@ async fn stage_video(handle: AppHandle, app: Active, path: String, trim: Option<
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let out = dir.join(format!("{id}.mp4"));
     let (h, profile) = (handle.clone(), app.profile_id.clone());
-    let result = video::prepare(&ffmpeg, &source, &out, &cancel, move |fraction| {
+    let result = video::prepare_source(&path, &out, &cancel, move |fraction| {
         let _ = h.emit("video-progress", serde_json::json!({ "profile": profile, "fraction": fraction }));
     })
     .await;
@@ -1000,23 +1016,6 @@ async fn send_dm(
     video_request: Option<video::VideoRequest>,
 ) -> Res<()> {
     dm::send(&app, &member_id, &text, &photos, video.as_deref(), video_request.as_ref()).await.map_err(err)
-}
-
-/// Phase 9c checkpoint 1 only (the Media3 spike; see `video::spike`).
-#[tauri::command]
-async fn video_spike(name: String, trim: bool, cbr: Option<bool>, scaled_retry: Option<bool>) -> Res<serde_json::Value> {
-    #[cfg(target_os = "android")]
-    {
-        tauri::async_runtime::spawn_blocking(move || video::spike(&name, trim, cbr.unwrap_or(false), scaled_retry.unwrap_or(false)))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(err)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = (name, trim, cbr, scaled_retry);
-        Err("Android only".into())
-    }
 }
 
 /// Stage a copy of a video this device has (one's own, to send it again in a message).
@@ -1474,7 +1473,6 @@ pub fn run() {
             staged_video,
             read_video,
             stage_local_video,
-            video_spike,
             check_server,
             trust_server,
             probe_group,

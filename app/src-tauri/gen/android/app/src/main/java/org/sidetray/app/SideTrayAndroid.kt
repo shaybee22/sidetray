@@ -227,6 +227,41 @@ object SideTrayAndroid {
     if (Build.VERSION.SDK_INT >= 33) intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
     else intent.getParcelableArrayListExtra<Parcelable>(Intent.EXTRA_STREAM)?.mapNotNull { it as? Uri }
 
+  // --- the video picker (Phase 9c) ---
+
+  /** Opens the photo picker for one video (set by MainActivity, which owns the launcher). */
+  var videoPicker: (() -> Unit)? = null
+  /** null: no pick going on; "waiting"; "" (nothing picked); or the picked URI. */
+  private var picked: String? = null
+
+  /** Open the picker; null when it's opening, else why it can't. */
+  @JvmStatic
+  fun pickVideo(): String? {
+    val a = activity?.get() ?: return "Side Tray isn't on screen"
+    val open = videoPicker ?: return "the video picker isn't ready"
+    synchronized(lock) { picked = "waiting" }
+    a.runOnUiThread {
+      try {
+        open()
+      } catch (e: Exception) {
+        Log.w(TAG, "video picker", e)
+        synchronized(lock) { picked = "" }
+      }
+    }
+    return null
+  }
+
+  /** The picker's answer (MainActivity's launcher callback). */
+  fun pickedVideo(uri: Uri?) = synchronized(lock) { picked = uri?.toString() ?: "" }
+
+  /** "waiting", "" (nothing picked) or the URI; taken once it's an answer. */
+  @JvmStatic
+  fun takePickedVideo(): String? = synchronized(lock) {
+    val p = picked
+    if (p != "waiting") picked = null
+    p
+  }
+
   /** What was shared: null (nothing), "copying" (ask again shortly), or JSON (taken: asking again gives null). */
   @JvmStatic
   fun takeShare(): String? = synchronized(lock) {

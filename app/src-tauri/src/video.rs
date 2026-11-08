@@ -51,9 +51,20 @@ fn media_foundation_missing() -> bool {
 
 pub async fn support() -> Support {
     let no = |reason: &str| Support { can_send: false, reason: Some(reason.to_string()) };
-    if cfg!(any(target_os = "android", target_os = "ios")) {
+    #[cfg(target_os = "android")]
+    {
+        return match tauri::async_runtime::spawn_blocking(crate::android::can_encode_video).await {
+            Ok(Ok(true)) => Support { can_send: true, reason: None },
+            Ok(Ok(false)) => no("This phone has no H.264 and AAC encoder, so it can't prepare videos. You can still watch them."),
+            Ok(Err(e)) => no(&format!("Couldn't check this phone's video encoder: {e:#}")),
+            Err(e) => no(&format!("Couldn't check this phone's video encoder: {e}")),
+        };
+    }
+    #[cfg(target_os = "ios")]
+    {
         return no("Sending videos from this phone isn't ready yet.");
     }
+    #[allow(unreachable_code)]
     let Some(ffmpeg) = ffmpeg_path() else {
         return no("This copy of Side Tray can't prepare videos (it has no video encoder). You can still watch them.");
     };
@@ -187,8 +198,13 @@ pub struct Plan {
 /// SPEC "Transcoding": the bitrate that fills `TARGET_BYTES` over `duration_ms`
 /// (after trimming), at 720p when that's at least 1,500 kb/s and 480p otherwise.
 pub fn plan(duration_ms: u64, has_audio: bool) -> Result<Plan> {
+    plan_for(TARGET_BYTES, duration_ms, has_audio)
+}
+
+/// `plan` for a file of `target` bytes.
+pub fn plan_for(target: u64, duration_ms: u64, has_audio: bool) -> Result<Plan> {
     let secs = (duration_ms.max(1) as f64) / 1000.0;
-    let total_kbps = (TARGET_BYTES as f64 * 8.0 / 1000.0 / secs) as u64;
+    let total_kbps = (target as f64 * 8.0 / 1000.0 / secs) as u64;
     let audio = if has_audio { AUDIO_KBPS } else { 0 };
     let video_kbps = total_kbps.saturating_sub(audio).min(MAX_VIDEO_KBPS);
     if video_kbps < MIN_VIDEO_KBPS {
@@ -254,6 +270,7 @@ pub async fn prepare(
         let _ = std::fs::remove_file(out);
         bail!("the prepared video came out too large to send ({:.1} MB)", size as f64 / 1e6);
     }
+    strip_mp4_metadata(out).context("removing the video's details")?;
     let made = probe(ffmpeg, out).await.context("checking the prepared video")?;
     let frame = poster_frame(ffmpeg, out, made.duration_ms).await?;
     let thumb = tauri::async_runtime::spawn_blocking(move || crate::photo::poster(&frame)).await??;
@@ -847,74 +864,196 @@ pub fn keep_sent(app: &crate::state::App, staged_id: &str, v: &Prepared, r: &Vid
     Ok(())
 }
 
-/// Phase 9c checkpoint 1, the Media3 spike: transcode `<spike dir>/in/<name>`
-/// into `<spike dir>/out/` the way the app will (probe, `plan()`, size check and
-/// one retry at 85%, poster frame) and report the numbers. Test only; it goes
-/// once the Android encoder is wired into `prepare` (checkpoint 4).
+
+// --- Android (Phase 9c): Media3 Transformer on the hardware encoder ------------------
+
+/// The muxer reserves about this much at the front of the file for the `moov`
+/// (checkpoint 1: every output's `mdat` started at 400 KB), so the Android plan
+/// aims that much lower.
 #[cfg(target_os = "android")]
-pub fn spike(name: &str, trim: bool, cbr: bool, scaled_retry: bool) -> Result<serde_json::Value> {
+const MOOV_RESERVE: u64 = 400_000;
+
+/// How long the source at `path` (a `content://` URI or a file) is.
+pub async fn source_duration_ms(path: &str) -> Result<u64> {
+    #[cfg(target_os = "android")]
+    {
+        let p = path.to_string();
+        let probe = tauri::async_runtime::spawn_blocking(move || crate::android::probe_video(&p)).await??;
+        Ok(probe.duration_ms)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let ffmpeg = ffmpeg_path().context("This copy of Side Tray can't prepare videos.")?;
+        Ok(probe(&ffmpeg, std::path::Path::new(path)).await?.duration_ms)
+    }
+}
+
+/// Prepare the source at `path` into `out` on whatever this platform has:
+/// the bundled ffmpeg on a computer, Media3 on Android.
+pub async fn prepare_source(path: &str, out: &std::path::Path, cancel: &Cancel, progress: impl Fn(f64)) -> Result<Prepared> {
+    #[cfg(target_os = "android")]
+    {
+        prepare_android(path, out, cancel, progress).await
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let ffmpeg = ffmpeg_path().context("This copy of Side Tray can't prepare videos.")?;
+        prepare(&ffmpeg, std::path::Path::new(path), out, cancel, progress).await
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn prepare_android(path: &str, out: &std::path::Path, cancel: &Cancel, progress: impl Fn(f64)) -> Result<Prepared> {
     use crate::android;
-    let dir = android::video_spike_dir()?;
-    let src = dir.join("in").join(name);
-    anyhow::ensure!(src.is_file(), "no {}", src.display());
-    let src = src.to_string_lossy().to_string();
-    let out_dir = dir.join("out");
-    std::fs::create_dir_all(&out_dir)?;
-    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
-    let out = out_dir.join(format!("{stem}.mp4"));
-    let probe = android::probe_video(&src)?;
-    let long = probe.duration_ms > MAX_DURATION_MS + TRIM_SLACK_MS;
-    anyhow::ensure!(!long || trim, "needs_trim ({} ms)", probe.duration_ms);
-    let duration = if long { MAX_DURATION_MS } else { probe.duration_ms };
-    let p = plan(duration, probe.audio_channels > 0)?;
+    let blocking = |f: Box<dyn FnOnce() -> Result<()> + Send>| tauri::async_runtime::spawn_blocking(f);
+    let src = path.to_string();
+    let probe = {
+        let s = src.clone();
+        tauri::async_runtime::spawn_blocking(move || android::probe_video(&s)).await??
+    };
+    anyhow::ensure!(probe.video && probe.width > 0 && probe.height > 0, "That file has no video in it.");
+    if probe.hdr && !probe.can_tone_map {
+        bail!("This is an HDR video, and this phone's Android is too old to convert it (it needs Android 10).");
+    }
+    let duration_ms = probe.duration_ms.min(MAX_DURATION_MS);
+    let trim = probe.duration_ms > MAX_DURATION_MS + TRIM_SLACK_MS;
+    let has_audio = probe.audio_channels > 0;
+    let p = plan_for(TARGET_BYTES - MOOV_RESERVE, duration_ms, has_audio)?;
     let (width, height) = out_size(probe.width, probe.height, p.max_side);
-    let mut attempts = vec![];
     let mut kbps = p.video_kbps;
-    for _ in 0..2 {
-        android::transcode_video(&android::Transcode {
-            src: &src,
-            out: &out,
-            width,
-            height,
-            video_bps: (kbps * 1000) as u32,
-            audio_bps: (AUDIO_KBPS * 1000) as u32,
-            end_ms: if long { MAX_DURATION_MS } else { 0 },
-            cbr,
-        })?;
-        let st = loop {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let st = android::transcode_state()?;
-            if st.state != "running" {
-                break st;
+    let mut size = 0;
+    for attempt in 0..2 {
+        let (s, o) = (src.clone(), out.to_path_buf());
+        blocking(Box::new(move || {
+            android::transcode_video(&android::Transcode {
+                src: &s,
+                out: &o,
+                width,
+                height,
+                video_bps: (kbps * 1000) as u32,
+                audio_bps: (AUDIO_KBPS * 1000) as u32,
+                end_ms: if trim { MAX_DURATION_MS } else { 0 },
+                cbr: true,
+            })
+        }))
+        .await??;
+        loop {
+            tokio::select! {
+                _ = cancel.notified() => {
+                    let _ = blocking(Box::new(android::cancel_transcode)).await;
+                    // Wait until it's stopped (it deletes its half-made file).
+                    for _ in 0..40 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if tauri::async_runtime::spawn_blocking(android::transcode_state).await?.is_ok_and(|s| s.state != "running") {
+                            break;
+                        }
+                    }
+                    let _ = std::fs::remove_file(out);
+                    bail!("{CANCELLED}");
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             }
-        };
-        anyhow::ensure!(st.state == "done", "transcode {}: {:?}", st.state, st.error);
-        let size = std::fs::metadata(&out)?.len();
-        attempts.push(serde_json::json!({"video_kbps": kbps, "bytes": size, "ms": st.elapsed_ms}));
-        if size <= TARGET_BYTES {
+            let st = tauri::async_runtime::spawn_blocking(android::transcode_state).await??;
+            match st.state.as_str() {
+                "running" => progress((st.progress.min(100) as f64 / 100.0) * 0.95),
+                "done" => break,
+                "cancelled" => bail!("{CANCELLED}"),
+                _ => bail!("Android couldn't prepare this video ({})", st.error.unwrap_or_default()),
+            }
+        }
+        size = std::fs::metadata(out).context("reading the prepared video")?.len();
+        if size <= TARGET_BYTES || attempt == 1 {
             break;
         }
-        kbps = if scaled_retry {
-            // Rescale by how far the video stream overshot (the audio is on target).
-            let secs = duration as f64 / 1000.0;
-            let audio = if probe.audio_channels > 0 { AUDIO_KBPS as f64 * 1000.0 / 8.0 * secs } else { 0.0 };
-            let got = (size as f64 - audio) * 8.0 / 1000.0 / secs;
-            let want = (TARGET_BYTES as f64 - audio) * 8.0 / 1000.0 / secs;
-            ((kbps as f64) * (want / got) * 0.95) as u64
-        } else {
-            kbps * 85 / 100
-        };
+        // Over the target: rescale by how far the video stream overshot (the
+        // audio is on target), with a margin.
+        kbps = rescaled_kbps(kbps, size, duration_ms, has_audio);
     }
-    let out_s = out.to_string_lossy().to_string();
-    let result = android::probe_video(&out_s)?;
-    let at = if result.duration_ms > 1500 { 1000 } else { 0 };
-    let frame = android::video_frame(&out_s, at)?;
-    let poster = crate::photo::poster(&frame)?;
-    std::fs::write(out_dir.join(format!("{stem}.webp")), &poster)?;
-    Ok(serde_json::json!({
-        "source": probe, "plan": {"video_kbps": p.video_kbps, "width": width, "height": height, "trimmed": long},
-        "attempts": attempts, "cbr": cbr, "scaled_retry": scaled_retry, "result": result, "poster_bytes": poster.len(), "out": out_s,
-    }))
+    if size > MAX_BYTES {
+        let _ = std::fs::remove_file(out);
+        bail!("the prepared video came out too large to send ({:.1} MB)", size as f64 / 1e6);
+    }
+    // Media3 copies the source's location (`©xyz` in `udta`) into its output.
+    strip_mp4_metadata(out).context("removing the video's details")?;
+    let o = out.to_string_lossy().to_string();
+    let (made, frame) = tauri::async_runtime::spawn_blocking(move || -> Result<_> {
+        let made = android::probe_video(&o)?;
+        let frame = android::video_frame(&o, if made.duration_ms > 1500 { 1000 } else { 0 })?;
+        Ok((made, frame))
+    })
+    .await??;
+    let thumb = tauri::async_runtime::spawn_blocking(move || crate::photo::poster(&frame)).await??;
+    progress(1.0);
+    Ok(Prepared { path: out.to_path_buf(), thumb, width: made.width, height: made.height, duration_ms: made.duration_ms, size })
+}
+
+/// The retry's bitrate: `kbps` scaled by how far the video stream overshot
+/// (the file is `size` bytes; the audio is on target), with a 5% margin.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn rescaled_kbps(kbps: u64, size: u64, duration_ms: u64, has_audio: bool) -> u64 {
+    let secs = (duration_ms.max(1)) as f64 / 1000.0;
+    let audio = if has_audio { AUDIO_KBPS as f64 * 1000.0 / 8.0 * secs } else { 0.0 };
+    let got = ((size as f64 - audio).max(1.0)) * 8.0 / 1000.0 / secs;
+    let want = (TARGET_BYTES as f64 - audio) * 8.0 / 1000.0 / secs;
+    ((kbps as f64) * (want / got) * 0.95).max(MIN_VIDEO_KBPS as f64) as u64
+}
+
+/// Turn every `udta` and `meta` box (top level, and inside `moov` and `trak`)
+/// into zeroed `free` padding of the same size, and zero the creation and
+/// modification times in `mvhd`, `tkhd` and `mdhd`: the file stays valid, and
+/// its location, device model, other tags and recording time are gone. Returns how many it hid.
+pub fn strip_mp4_metadata(path: &std::path::Path) -> Result<usize> {
+    let mut buf = std::fs::read(path)?;
+    let n = hide_metadata_boxes(&mut buf);
+    if n > 0 {
+        crate::feed::write_file(path, &buf)?;
+    }
+    Ok(n)
+}
+
+fn hide_metadata_boxes(buf: &mut [u8]) -> usize {
+    fn walk(buf: &mut [u8], start: usize, end: usize, count: &mut usize) {
+        let mut i = start;
+        while i + 8 <= end {
+            let size32 = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap()) as u64;
+            let (size, header) = match size32 {
+                0 => ((end - i) as u64, 8),
+                1 if i + 16 <= end => (u64::from_be_bytes(buf[i + 8..i + 16].try_into().unwrap()), 16),
+                1 => return,
+                s => (s, 8),
+            };
+            if size < header as u64 || i as u64 + size > end as u64 {
+                return;
+            }
+            let size = size as usize;
+            match &buf[i + 4..i + 8] {
+                b"udta" | b"meta" => {
+                    // Padding of the same size, and its contents wiped: a
+                    // renamed box would still carry the location's bytes.
+                    buf[i + 4..i + 8].copy_from_slice(b"free");
+                    buf[i + header..i + size].fill(0);
+                    *count += 1;
+                }
+                b"moov" | b"trak" | b"mdia" => walk(buf, i + header, i + size, count),
+                // The recording time (Media3 copies it from the source): zero
+                // the creation and modification times (version 0: 2 × 4
+                // bytes; version 1: 2 × 8) after the version and flags.
+                b"mvhd" | b"tkhd" | b"mdhd" if size >= header + 4 => {
+                    let at = i + header + 4;
+                    let n = if buf[i + header] == 1 { 16 } else { 8 };
+                    if at + n <= i + size {
+                        buf[at..at + n].fill(0);
+                    }
+                }
+                _ => {}
+            }
+            i += size;
+        }
+    }
+    let mut count = 0;
+    let len = buf.len();
+    walk(buf, 0, len, &mut count);
+    count
 }
 
 #[cfg(test)]
@@ -960,6 +1099,57 @@ At least one output file must be specified";
         assert_eq!(out_size(3840, 2160, 854), (854, 480));
         assert_eq!(out_size(640, 360, 1280), (640, 360));
         assert_eq!(out_size(1001, 563, 854), (854, 480));
+    }
+
+    fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn metadata_boxes_become_padding() {
+        let xyz = mp4_box(b"\xa9xyz", b"+51.5074-000.1278/");
+        let udta = mp4_box(b"udta", &xyz);
+        // Version 0 headers: version/flags, then creation and modification time.
+        let times = |v: u8| [vec![v, 0, 0, 0], vec![0xAA; if v == 1 { 16 } else { 8 }], vec![0x11; 8]].concat();
+        let mdia = mp4_box(b"mdia", &mp4_box(b"mdhd", &times(1)));
+        let trak = mp4_box(b"trak", &[mp4_box(b"tkhd", &times(0)), mp4_box(b"udta", b"x"), mdia].concat());
+        let moov = mp4_box(b"moov", &[mp4_box(b"mvhd", &times(0)), trak, udta, mp4_box(b"meta", b"model")].concat());
+        let mut file = [mp4_box(b"ftyp", b"isom"), moov, mp4_box(b"mdat", b"udta inside the data stays")].concat();
+        let before = file.clone();
+        assert_eq!(hide_metadata_boxes(&mut file), 3);
+        assert_eq!(file.len(), before.len());
+        let text = String::from_utf8_lossy(&file);
+        assert_eq!(text.matches("udta").count(), 1, "only the one inside mdat is left");
+        assert!(!text.contains("meta"));
+        assert_eq!(text.matches("free").count(), 3);
+        assert!(!text.contains("51.5074") && !text.contains("model"), "the contents are wiped too");
+        assert!(!file.contains(&0xAA), "creation and modification times are zeroed");
+        assert_eq!(file.iter().filter(|&&b| b == 0x11).count(), 24, "the fields after them are untouched");
+        // Nothing else moved.
+        assert!(text.contains("tkhd") && text.contains("mvhd") && text.contains("mdia"));
+        // A broken size stops the walk instead of panicking.
+        let mut bad = mp4_box(b"moov", &[0, 0, 0, 200, b'u', b'd', b't', b'a']);
+        assert_eq!(hide_metadata_boxes(&mut bad), 0);
+    }
+
+    #[test]
+    fn the_retry_rescales_by_the_overshoot() {
+        // Checkpoint 1: asked 1,170 kb/s for 60 s, got 12.07 MB (VBR).
+        let k = rescaled_kbps(1170, 12_074_598, 60_000, true);
+        assert!((850..=880).contains(&k), "{k}");
+        // On target already: about the same, less the margin.
+        let k = rescaled_kbps(1170, TARGET_BYTES, 60_000, true);
+        assert!((1100..=1115).contains(&k), "{k}");
+    }
+
+    #[test]
+    fn plan_for_a_smaller_target() {
+        let p = plan_for(TARGET_BYTES - 400_000, 60_000, true).unwrap();
+        assert!(p.video_kbps < plan(60_000, true).unwrap().video_kbps);
+        assert_eq!(p.max_side, 854);
     }
 
     #[test]

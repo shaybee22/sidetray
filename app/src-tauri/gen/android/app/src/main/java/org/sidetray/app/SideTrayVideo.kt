@@ -118,7 +118,8 @@ object SideTrayVideo {
     } finally {
       ex.release()
     }
-    out.put("audio_channels", channels).put("hdr", hdr).toString()
+    out.put("audio_channels", channels).put("hdr", hdr)
+      .put("can_tone_map", android.os.Build.VERSION.SDK_INT >= 29).toString()
   } catch (e: Exception) {
     Log.w(TAG, "probe failed", e)
     JSONObject().put("error", e.message ?: e.javaClass.simpleName).toString()
@@ -267,7 +268,4 @@ object SideTrayVideo {
     }
   }
 
-  /** Test-only spot for the spike's files: readable with adb on a release build. */
-  @JvmStatic
-  fun spikeDir(): String? = context().getExternalFilesDir("video-spike")?.also { it.mkdirs() }?.absolutePath
 }

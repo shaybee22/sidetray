@@ -7,17 +7,28 @@ import android.view.ViewGroup
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 
 // A density change (a flip phone moving the app between its inner and outer
 // screens) recreates this activity and so reloads the page: the WebView can't
 // switch scale in place. The page keeps its drafts and view across that (app.js).
 class MainActivity : TauriActivity() {
+  // The photo picker for videos (Phase 9c). Registered with every activity, so
+  // an answer that arrives after the window was rebuilt still lands.
+  private val videoPicker = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+    SideTrayAndroid.pickedVideo(uri)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     // Local test builds only (SIDETRAY_WEBVIEW_DEBUG, see build.gradle.kts).
     if (BuildConfig.WEBVIEW_DEBUG) WebView.setWebContentsDebuggingEnabled(true)
     super.onCreate(savedInstanceState)
     SideTrayAndroid.attach(this, savedInstanceState == null)
+    SideTrayAndroid.videoPicker = {
+      videoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly))
+    }
     // Started by "Share → Side Tray" (a recreated activity has already handled it).
     if (savedInstanceState == null) SideTrayAndroid.receive(this, intent)
     // Back goes to the page (close the viewer, a dialog, a chat, ask about an

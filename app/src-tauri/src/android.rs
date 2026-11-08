@@ -229,8 +229,31 @@ pub struct VideoProbe {
     pub hdr: bool,
     #[serde(default)]
     pub video: bool,
+    /// Android 10+: HDR can be tone-mapped to SDR.
+    #[serde(default)]
+    pub can_tone_map: bool,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// Open Android's photo picker for one video. The answer comes from
+/// `take_picked_video`.
+pub fn pick_video() -> Result<()> {
+    let err = call_string("pickVideo", &[])?;
+    if let Some(e) = err {
+        bail!("{e}");
+    }
+    Ok(())
+}
+
+/// The picker's answer: `None` while it's open, `Some(None)` if nothing was
+/// picked, `Some(Some(uri))` otherwise.
+pub fn take_picked_video() -> Result<Option<Option<String>>> {
+    Ok(match call_string("takePickedVideo", &[])?.as_deref() {
+        Some("waiting") => None,
+        Some("") | None => Some(None),
+        Some(uri) => Some(Some(uri.to_string())),
+    })
 }
 
 /// Whether Android calls the current network metered (mobile data, a hotspot,
@@ -352,17 +375,6 @@ pub fn video_frame(src: &str, at_ms: u64) -> Result<Vec<u8>> {
         }
         Ok(env.convert_byte_array(JByteArray::from(r))?)
     })
-}
-
-/// The Media3 spike's folder (external app storage, readable with adb). Test only.
-pub fn video_spike_dir() -> Result<PathBuf> {
-    let s = with_env(|env| {
-        let class = video_class(env)?;
-        let s = env.call_static_method(&class, "spikeDir", "()Ljava/lang/String;", &[])?.l()?;
-        opt_string(env, s)
-    })?
-    .context("no external storage")?;
-    Ok(PathBuf::from(s))
 }
 
 // --- notifications (A3) -----------------------------------------------------------
