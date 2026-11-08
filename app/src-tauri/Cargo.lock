@@ -4132,7 +4132,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sidetray-app"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4171,7 +4171,7 @@ dependencies = [
 
 [[package]]
 name = "sidetray-crypto"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "blake2",
  "chacha20poly1305",

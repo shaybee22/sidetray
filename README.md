@@ -2,10 +2,10 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: 0.3.1** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 app for
+**Status: 0.4.0** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 app for
 Windows, Linux and Android (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
-comments and reactions. It keeps a local SQLite archive and syncs the moment the
+comments, reactions and short videos. It keeps a local SQLite archive and syncs the moment the
 relay pushes a change over a WebSocket (polling every 30 seconds only while the
 socket is down). It lives in the system tray with an unread badge and shows
 native notifications. Devices join with their public keys, compare safety codes
