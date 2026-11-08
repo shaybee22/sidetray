@@ -433,7 +433,7 @@ App: *Leave this group* at the bottom of *Device* (and *Delete these saved posts
 - The old *Start over* (`reset`) is gone: cancelling a join, starting over after a denial and *Delete these saved posts* after a removal all delete the profile the same way as leaving (without the relay call).
 - Tested with a local relay and two desktop copies: an install with its data at the top of the folder (and most of it still in the WAL after an unclean exit) moved into `groups/<local_id>/` with its posts and keys working; a second group founded from *Join another group*; a post in the hidden group gave a toast "Rosa posted in Alpha" and a dot on the menu, and its notification target switched groups; a restart came back in the last group; the only Key Master was refused (409); a member leaving landed in the wizard with folder and keychain entry gone, and the Key Master's app rotated the key. Android compiles (`aarch64-linux-android`) but the per-group push instances haven't been tried on a phone yet.
 
-## Phase 9: Short videos (in progress)
+## Phase 9: Short videos (done on the phase-9-video branch, not merged)
 
 Short video clips in feed posts and direct messages. A video is transcoded on the sender's device, encrypted like a photo and uploaded through the same `POST /media`. The relay holds the video file only briefly: until every device it's for has downloaded it, two weeks at most, and within a 2 GB cap per group and 5 GB per server. The post text and the poster frame (an ordinary encrypted thumbnail) follow normal post retention. Once the video file is gone, people see the poster frame, the text, "Video expired" and a *Request* button.
 
@@ -631,6 +631,7 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
 - **Issues found in 9c, for after 9c** (not fixed):
   - Flip/unfold re-creates the activity and reloads the page (Signal carries over without a reload). Drafts (post and DM), the tab and the open chat are restored; the chat reopens scrolled to the top (oldest messages) and the feed's scroll position is lost; a playing video stops.
   - Android's own fullscreen button shows greyed out in the video controls.
+  - "You asked for a video." under one's own request is hard to read in the sender's (teal) bubble.
   - The relay's 429 message reads awkwardly in the composer ("…Try again later.: server said 429: too many uploads…; try again in 1345 seconds").
 - **9c checkpoint 5 done (Share → Side Tray with videos), waiting for the go-ahead.** `video/*` in the `SEND` and `SEND_MULTIPLE` filters; `SideTrayAndroid.receive` passes the first video's URI (not copied) as `video` and counts what it leaves out (`left_out`: other videos and pictures); `ShareView::Ready` carries both; the share dialog says "a video" and, once a destination is chosen, the post or DM composer stages it with the usual flow. Also: the phone composer's Photos, Camera and Video buttons are icon-only (`icon-on-phone`), so Post stays on their line; the share dialog's notes are shown after the pictures load (loading them cleared the error line, so "One video at a time…" and the existing "wasn't a picture" note never showed); a share with no text no longer adds blank lines to a draft. Tested on the razr with the Files app (a test folder, deleted afterwards):
   - One video → "a video", to Alex → the DM composer staged it (720×1280, 20 s, 6.8 MB) and it was sent; Alex played it.
@@ -638,13 +639,26 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
   - Two videos and a picture → "a video" with "One video at a time, and not with photos: using the first video." → the first video staged (its post then hit the relay's 50 MB/hour upload limit after the day's tests: the error showed and the staged video stayed).
   - A picture alone still shares as before.
   - `am start … SEND --eu EXTRA_STREAM content://media/…` from adb fails (`setDataSource failed`): the shell can't grant MediaStore reads. Real shares (Files) carry their grant.
-- **9c checkpoint 6 (in progress).** Done so far:
+- **9c checkpoint 6 done; 9c is done** (not merged or released). Steps:
   - Release build without the switch (`SIDETRAY_WEBVIEW_DEBUG` unset): 14,694,474 bytes, no `assets/webview-debug`, signed with the release key (`c2c4fcd1…`, the workflow's `CERT_SHA256`). On the razr, driven by taps: a shared clip prepared (Media3 under R8, "Video, 6.8 MB, 720×1280, location and other details removed") and a video played. (All the test builds were R8 release builds too; they only differed by the switch.)
   - CHANGELOG and README: Android videos, Media3 and its licence, the metadata strip, streamed playback, the mobile-data setting, the debug switch.
   - Relay: the phone's five videos were acked by every device (Vid Tester, the CLI member, by hand) and the hourly prune (run once by hand) deleted them as `delivered`; `GET` then answers 410 `{"reason": "delivered"}` and the post's poster frame still answers 200. The phone's DM video to Alex had already gone as `delivered` with just their two devices.
   - Four older videos wait for the phone, which stored their posts as text while it ran 0.3.1 and will never fetch them: they go at the 14-day TTL (as decided in 9a).
   - Request on the phone: an Alex video held on the phone (metered + setting off), deleted on the relay (stand-in ack for the phone), then unmetered: the phone showed it greyed with "Video expired" and Request; a real tap opened the chat with Alex pre-filled ("Could you send me your video from November 7?") and the request note; sent; Alex's copy showed "Send it", which re-sent the 45 s video as a new message; the phone played it (real tap).
-- Next: the rest of checkpoint 6 (Send it on the phone, a third member's 404 on a DM video), once the phone's hourly upload window has room.
+  - A DM video from the phone to Alex (Alex's copy closed): Vid Tester, a third member, gets 404 for it; Alex's device gets 200. Acked as Alex and pruned → 410 `delivered`. Alex's copy, restarted, showed "Video expired" with Request and sent it; the phone showed **Send it** (real tap), which re-sent the clip; Alex played it (720×1280, seek).
+- **"Done when", status at the end of 9c:**
+  - 45 s → 720p, 60 s → 480p, under 10 MB, poster, no metadata; 90 s → its first 60 s after the question: on the razr (checkpoints 4–5) and Windows (9b).
+  - Every device plays after download; the relay deletes the file once the last device acks, and the post and poster frame stay: yes (above).
+  - TTL, caps (oldest first) and the 507: 9a, relay unchanged since.
+  - DM video for just the two people's devices, a third member gets 404: yes (above).
+  - *Download videos on mobile data* off: held until unmetered: checkpoint 3 (Wi-Fi marked metered, as tst-svr is LAN-only).
+  - Request and Send it: both ways between the razr and desktop (above).
+  - Desktop and razr both transcode, show progress and seek: yes.
+  - `SIDETRAY_HISTORY_DAYS=0` and feed photos: 9a.
+  - Not checked: tone-mapping of a real HDR recording (only a synthetic HLG clip).
+- The razr is left on the local test build (`SIDETRAY_WEBVIEW_DEBUG` on, phase-9-video, signed with the release key), with its settings restored.
+- **Upload limit** (`SIDETRAY_MEDIA_MB_PER_HOUR`, 50): per device, a sliding 60-minute window over the encrypted bytes of every upload (photos, posters, videos, avatars), in memory (a relay restart clears it). A video is up to about 9.5 MB, so 50 MB is about five videos an hour from one phone, which the checkpoint 5 tests hit. Proposed (not changed): 150 MB per hour per device, about 15 full-size clips or 10 clips and a few dozen photos. Abuse protection stays: 10 MB per file, the 2 GB per group and 5 GB per server video caps with the 507, and one device needs over 13 hours to fill a group's 2 GB. Possibly later: a per-group hourly ceiling (new code) if several devices in one group are a concern.
+- Next: the user's review; then merge and release are the user's call. After 9c: the issues listed above.
 
 ## Distribution and later
 
