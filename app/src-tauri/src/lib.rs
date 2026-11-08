@@ -1001,6 +1001,23 @@ async fn send_dm(
     dm::send(&app, &member_id, &text, &photos, video.as_deref(), video_request.as_ref()).await.map_err(err)
 }
 
+/// Phase 9c checkpoint 1 only (the Media3 spike; see `video::spike`).
+#[tauri::command]
+async fn video_spike(name: String, trim: bool, cbr: Option<bool>, scaled_retry: Option<bool>) -> Res<serde_json::Value> {
+    #[cfg(target_os = "android")]
+    {
+        tauri::async_runtime::spawn_blocking(move || video::spike(&name, trim, cbr.unwrap_or(false), scaled_retry.unwrap_or(false)))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(err)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (name, trim, cbr, scaled_retry);
+        Err("Android only".into())
+    }
+}
+
 /// Stage a copy of a video this device has (one's own, to send it again in a message).
 #[tauri::command]
 fn stage_local_video(app: Active, id: String) -> Res<StagedVideoView> {
@@ -1368,6 +1385,7 @@ pub fn run() {
             staged_video,
             read_video,
             stage_local_video,
+            video_spike,
             check_server,
             trust_server,
             probe_group,

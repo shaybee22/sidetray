@@ -197,6 +197,16 @@ pub fn plan(duration_ms: u64, has_audio: bool) -> Result<Plan> {
     Ok(Plan { video_kbps, max_side: if video_kbps >= MIN_720P_KBPS { 1280 } else { 854 } })
 }
 
+/// The output size for a `width`×`height` (as displayed) source: the longest
+/// side at most `max_side`, never enlarged, both even (H.264 needs that).
+#[cfg_attr(not(target_os = "android"), allow(dead_code))] // desktop sizes through ffmpeg
+pub fn out_size(width: u32, height: u32, max_side: u32) -> (u32, u32) {
+    let (w, h) = (width.max(2) as f64, height.max(2) as f64);
+    let scale = (max_side as f64 / w.max(h)).min(1.0);
+    let even = |x: f64| (((x * scale) / 2.0).round() as u32 * 2).max(2);
+    (even(w), even(h))
+}
+
 // --- transcoding -------------------------------------------------------------------
 
 /// A prepared clip, ready to encrypt and send.
@@ -818,6 +828,76 @@ pub fn keep_sent(app: &crate::state::App, staged_id: &str, v: &Prepared, r: &Vid
     Ok(())
 }
 
+/// Phase 9c checkpoint 1, the Media3 spike: transcode `<spike dir>/in/<name>`
+/// into `<spike dir>/out/` the way the app will (probe, `plan()`, size check and
+/// one retry at 85%, poster frame) and report the numbers. Test only; it goes
+/// once the Android encoder is wired into `prepare` (checkpoint 4).
+#[cfg(target_os = "android")]
+pub fn spike(name: &str, trim: bool, cbr: bool, scaled_retry: bool) -> Result<serde_json::Value> {
+    use crate::android;
+    let dir = android::video_spike_dir()?;
+    let src = dir.join("in").join(name);
+    anyhow::ensure!(src.is_file(), "no {}", src.display());
+    let src = src.to_string_lossy().to_string();
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir)?;
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let out = out_dir.join(format!("{stem}.mp4"));
+    let probe = android::probe_video(&src)?;
+    let long = probe.duration_ms > MAX_DURATION_MS + TRIM_SLACK_MS;
+    anyhow::ensure!(!long || trim, "needs_trim ({} ms)", probe.duration_ms);
+    let duration = if long { MAX_DURATION_MS } else { probe.duration_ms };
+    let p = plan(duration, probe.audio_channels > 0)?;
+    let (width, height) = out_size(probe.width, probe.height, p.max_side);
+    let mut attempts = vec![];
+    let mut kbps = p.video_kbps;
+    for _ in 0..2 {
+        android::transcode_video(&android::Transcode {
+            src: &src,
+            out: &out,
+            width,
+            height,
+            video_bps: (kbps * 1000) as u32,
+            audio_bps: (AUDIO_KBPS * 1000) as u32,
+            end_ms: if long { MAX_DURATION_MS } else { 0 },
+            cbr,
+        })?;
+        let st = loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let st = android::transcode_state()?;
+            if st.state != "running" {
+                break st;
+            }
+        };
+        anyhow::ensure!(st.state == "done", "transcode {}: {:?}", st.state, st.error);
+        let size = std::fs::metadata(&out)?.len();
+        attempts.push(serde_json::json!({"video_kbps": kbps, "bytes": size, "ms": st.elapsed_ms}));
+        if size <= TARGET_BYTES {
+            break;
+        }
+        kbps = if scaled_retry {
+            // Rescale by how far the video stream overshot (the audio is on target).
+            let secs = duration as f64 / 1000.0;
+            let audio = if probe.audio_channels > 0 { AUDIO_KBPS as f64 * 1000.0 / 8.0 * secs } else { 0.0 };
+            let got = (size as f64 - audio) * 8.0 / 1000.0 / secs;
+            let want = (TARGET_BYTES as f64 - audio) * 8.0 / 1000.0 / secs;
+            ((kbps as f64) * (want / got) * 0.95) as u64
+        } else {
+            kbps * 85 / 100
+        };
+    }
+    let out_s = out.to_string_lossy().to_string();
+    let result = android::probe_video(&out_s)?;
+    let at = if result.duration_ms > 1500 { 1000 } else { 0 };
+    let frame = android::video_frame(&out_s, at)?;
+    let poster = crate::photo::poster(&frame)?;
+    std::fs::write(out_dir.join(format!("{stem}.webp")), &poster)?;
+    Ok(serde_json::json!({
+        "source": probe, "plan": {"video_kbps": p.video_kbps, "width": width, "height": height, "trimmed": long},
+        "attempts": attempts, "cbr": cbr, "scaled_retry": scaled_retry, "result": result, "poster_bytes": poster.len(), "out": out_s,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +931,16 @@ At least one output file must be specified";
         assert!(parse_probe("clip.mp4: Invalid data found when processing input").is_err());
         assert!(parse_probe("  Duration: 00:03:00.00\n  Stream #0:0: Audio: mp3, 44100 Hz, stereo").is_err());
         assert!(parse_probe("  Duration: N/A\n  Stream #0:0: Video: h264, 640x480").is_err());
+    }
+
+    #[test]
+    fn out_size_keeps_the_shape_and_never_enlarges() {
+        assert_eq!(out_size(1920, 1080, 1280), (1280, 720));
+        assert_eq!(out_size(1080, 1920, 1280), (720, 1280));
+        assert_eq!(out_size(1920, 1080, 854), (854, 480));
+        assert_eq!(out_size(3840, 2160, 854), (854, 480));
+        assert_eq!(out_size(640, 360, 1280), (640, 360));
+        assert_eq!(out_size(1001, 563, 854), (854, 480));
     }
 
     #[test]

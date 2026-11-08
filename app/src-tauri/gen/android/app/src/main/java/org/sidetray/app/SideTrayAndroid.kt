@@ -92,6 +92,9 @@ object SideTrayAndroid {
   /** A tapped notification's target (JSON), until the page takes it. */
   private var openTarget: String? = null
 
+  /** The application context, once the activity or a background job has started. */
+  fun context(): Context? = appContext
+
   /** Load the Rust library and hand it the JavaVM and the app's context (once per process). */
   fun ensureNative(ctx: Context) {
     synchronized(lock) {

@@ -193,6 +193,169 @@ pub fn end_share() {
     }
 }
 
+// --- videos (Phase 9c) -------------------------------------------------------------
+
+const VIDEO: &str = "org.sidetray.app.SideTrayVideo";
+
+fn video_class<'a>(env: &mut JNIEnv<'a>) -> Result<JClass<'a>> {
+    let helper = helper(env)?;
+    let loader = env.call_method(&helper, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+    let name = env.new_string(VIDEO)?;
+    let class = env
+        .call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])?
+        .l()?;
+    Ok(JClass::from(class))
+}
+
+fn opt_string(env: &mut JNIEnv, o: JObject) -> Result<Option<String>> {
+    if o.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(String::from(env.get_string(&JString::from(o))?)))
+}
+
+/// A clip as Android reads it (`SideTrayVideo.probeVideo`).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct VideoProbe {
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub audio_channels: u32,
+    #[serde(default)]
+    pub hdr: bool,
+    #[serde(default)]
+    pub video: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Whether the phone has an H.264 and an AAC encoder.
+pub fn can_encode_video() -> Result<bool> {
+    with_env(|env| {
+        let class = video_class(env)?;
+        Ok(env.call_static_method(&class, "canEncode", "()Z", &[])?.z()?)
+    })
+}
+
+/// `src`: a `content://` URI or a path.
+pub fn probe_video(src: &str) -> Result<VideoProbe> {
+    let s = with_env(|env| {
+        let class = video_class(env)?;
+        let a = env.new_string(src)?;
+        let s = env.call_static_method(&class, "probeVideo", "(Ljava/lang/String;)Ljava/lang/String;", &[JValue::Object(&a)])?.l()?;
+        opt_string(env, s)
+    })?
+    .context("Android didn't read the video")?;
+    let p: VideoProbe = serde_json::from_str(&s).context("reading the video's details")?;
+    if let Some(e) = &p.error {
+        bail!("Android can't read this video ({e})");
+    }
+    Ok(p)
+}
+
+/// The settings for one transcode (`SideTrayVideo.transcodeVideo`).
+pub struct Transcode<'a> {
+    pub src: &'a str,
+    pub out: &'a std::path::Path,
+    pub width: u32,
+    pub height: u32,
+    pub video_bps: u32,
+    pub audio_bps: u32,
+    /// 0: the whole clip.
+    pub end_ms: u64,
+    /// Constant bitrate (else variable).
+    pub cbr: bool,
+}
+
+/// Start a transcode; poll `transcode_state` for how it goes.
+pub fn transcode_video(t: &Transcode) -> Result<()> {
+    let err = with_env(|env| {
+        let class = video_class(env)?;
+        let src = env.new_string(t.src)?;
+        let out = env.new_string(t.out.to_string_lossy())?;
+        let r = env
+            .call_static_method(
+                &class,
+                "transcodeVideo",
+                "(Ljava/lang/String;Ljava/lang/String;IIIIJZ)Ljava/lang/String;",
+                &[
+                    JValue::Object(&src),
+                    JValue::Object(&out),
+                    JValue::Int(t.width as i32),
+                    JValue::Int(t.height as i32),
+                    JValue::Int(t.video_bps as i32),
+                    JValue::Int(t.audio_bps as i32),
+                    JValue::Long(t.end_ms as i64),
+                    JValue::Bool(t.cbr as u8),
+                ],
+            )?
+            .l()?;
+        opt_string(env, r)
+    })?;
+    if let Some(e) = err {
+        bail!("{e}");
+    }
+    Ok(())
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct TranscodeState {
+    /// "idle", "running", "done", "error", "cancelled".
+    pub state: String,
+    /// 0–100.
+    pub progress: u32,
+    pub error: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+pub fn transcode_state() -> Result<TranscodeState> {
+    let s = with_env(|env| {
+        let class = video_class(env)?;
+        let s = env.call_static_method(&class, "transcodeState", "()Ljava/lang/String;", &[])?.l()?;
+        opt_string(env, s)
+    })?
+    .context("no transcode state")?;
+    Ok(serde_json::from_str(&s)?)
+}
+
+pub fn cancel_transcode() -> Result<()> {
+    with_env(|env| {
+        let class = video_class(env)?;
+        env.call_static_method(&class, "cancelTranscode", "()V", &[])?;
+        Ok(())
+    })
+}
+
+/// The frame at `at_ms` as a JPEG.
+pub fn video_frame(src: &str, at_ms: u64) -> Result<Vec<u8>> {
+    with_env(|env| {
+        let class = video_class(env)?;
+        let a = env.new_string(src)?;
+        let r = env
+            .call_static_method(&class, "videoFrame", "(Ljava/lang/String;J)[B", &[JValue::Object(&a), JValue::Long((at_ms * 1000) as i64)])?
+            .l()?;
+        if r.is_null() {
+            bail!("Android couldn't take a frame from the video");
+        }
+        Ok(env.convert_byte_array(JByteArray::from(r))?)
+    })
+}
+
+/// The Media3 spike's folder (external app storage, readable with adb). Test only.
+pub fn video_spike_dir() -> Result<PathBuf> {
+    let s = with_env(|env| {
+        let class = video_class(env)?;
+        let s = env.call_static_method(&class, "spikeDir", "()Ljava/lang/String;", &[])?.l()?;
+        opt_string(env, s)
+    })?
+    .context("no external storage")?;
+    Ok(PathBuf::from(s))
+}
+
 // --- notifications (A3) -----------------------------------------------------------
 
 fn call_string(method: &str, args: &[&str]) -> Result<Option<String>> {

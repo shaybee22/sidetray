@@ -118,6 +118,10 @@ dependencies {
     // A3: UnifiedPush (wake-ups through the ntfy app) and background sync.
     implementation("org.unifiedpush.android:connector:3.3.5")
     implementation("androidx.work:work-runtime-ktx:2.10.1")
+    // Phase 9c: video transcoding on the phone's hardware encoder.
+    implementation("androidx.media3:media3-transformer:1.11.1")
+    implementation("androidx.media3:media3-effect:1.11.1")
+    implementation("androidx.media3:media3-common:1.11.1")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
