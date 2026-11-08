@@ -7,14 +7,24 @@ the app, the Rust crates and the relay share one version number.
 
 ### App
 
-- **Short videos in posts and direct messages** (Windows for now). The Video
-  button prepares a clip on your computer: at most a minute (a longer one can
-  go as its first 60 seconds), 720p or 480p, under 10 MB, with location and
-  other details removed. Videos download in the background and play in the
-  feed or chat. Once a video has left the server you see "Video expired" and
-  can ask the person to send it again in a message.
+- **Short videos in posts and direct messages**, sent from Windows and
+  Android and played everywhere. The Video button prepares a clip on your
+  device: at most a minute (a longer one can go as its first 60 seconds),
+  720p or 480p, under 10 MB, with location, device model and recording time
+  removed. Videos download in the background and play in the feed or chat.
+  Once a video has left the server you see "Video expired" and can ask the
+  person to send it again in a message; they can send it with one tap.
+  (macOS and Linux can watch videos but not send them yet.)
+- **On Android:** pick a video with the Video button or share one to Side Tray
+  from another app; a full-screen button while it plays; and a setting,
+  *Download videos on mobile data* (on by default), that makes videos wait
+  for Wi-Fi when it's off (tap one to download it anyway).
 - The app tells the relay which photos and videos it has downloaded, so the
   relay can let them go.
+- Android: the post box's Photos, Camera and Video buttons are icons, so Post
+  stays on the same line. Sharing to Side Tray shows its notes again (they
+  were cleared as the pictures loaded) and no longer adds blank lines to a
+  draft when nothing but pictures was shared.
 
 ### Relay
 

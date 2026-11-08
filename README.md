@@ -766,6 +766,12 @@ keyPassword=...
 
 Then `cargo tauri android build --apk --target aarch64` (no `--debug`)
 writes `gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`.
+For testing a release-signed build on a phone, `SIDETRAY_WEBVIEW_DEBUG=1` in
+the environment turns on WebView DevTools (`chrome://inspect`, or
+`adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>`) and marks
+the APK with `assets/webview-debug`. It's for local builds only: Gradle
+refuses it when `CI` is set, and the release workflow rejects an APK that
+carries the marker.
 Without that file the release APK comes out unsigned. A debug build and a
 release build are signed with different keys, so one can't replace the
 other: `adb uninstall org.sidetray.app` first (which deletes the phone's
@@ -827,12 +833,37 @@ hand-made small desktop icons).
   (and AVIF) photos are decoded by Android itself (Android 9 and newer), then
   go through the same resize, EXIF strip and WebP encode; a computer refuses
   them with a message saying so.
-- **Share → Side Tray.** Intent filters for one or several images and for
-  text and links. `MainActivity.kt` hands the intent to `SideTrayAndroid.kt`,
-  which copies the pictures into the app's cache; the page asks for them
-  (`take_share`, `src/android.rs`), stages them, and lets the person post them
-  or send them as a message. Not in a group yet (or still waiting for
+- **Share → Side Tray.** Intent filters for one or several images and videos,
+  and for text and links. `MainActivity.kt` hands the intent to
+  `SideTrayAndroid.kt`, which copies the pictures into the app's cache; the
+  page asks for them (`take_share`, `src/android.rs`), stages them, and lets
+  the person post them or send them as a message. A shared video isn't
+  copied: its URI goes to the chosen composer, which prepares it like a
+  picked one; it goes on its own (other videos and pictures shared with it
+  are left out, with a note). Not in a group yet (or still waiting for
   approval): it says so.
+- **Videos (Phase 9c).** Prepared with [Media3
+  Transformer](https://developer.android.com/media/media3/transformer)
+  (Apache 2.0) on the phone's hardware H.264 encoder, not ffmpeg
+  (`SideTrayVideo.kt`, `video::prepare_android`): scaled to 720p or 480p,
+  30 fps at most, HDR tone-mapped to SDR (Android 10+), constant bitrate
+  (the encoders' VBR overshot by about 27%), aimed 400 KB under 9.5 MB for
+  the muxer's reserved `moov` space, and encoded once more with the bitrate
+  rescaled by the overshoot if it still comes out too big. Media3 copies the
+  source's location, device tags and recording time, so every prepared MP4
+  (desktop too) has its `udta`/`meta` boxes turned into zeroed padding and
+  its creation times zeroed (`video::strip_mp4_metadata`). *Video* opens the
+  Photo Picker for videos (`pickVideo`). Playback streams the decrypted MP4
+  from the `media` protocol with `Range` (`serve_media`): Tauri's Android IPC
+  returns large binary replies as script text, so the desktop's blob route
+  can't carry a whole video there. The WebView's own full screen can't open
+  inside Tauri, so a button moves the playing video into a full-screen viewer
+  of the app's own; one video stays in memory at a time, and playing stops
+  when the app is hidden. *Device → Settings → Download videos on mobile data*
+  (`<data dir>/device-settings.json`, all groups, also read by the background
+  sync): when it's off and Android says the network is metered
+  (`ACCESS_NETWORK_STATE`), videos wait for Wi-Fi, checked before each file;
+  tapping one downloads it anyway.
 - **Back button.** `MainActivity.kt` passes Back to the page: it closes the
   photo viewer, a dialog or a chat, then goes back to the feed, and only then
   puts the app in the background, asking first if a post, comment or message
@@ -1204,3 +1235,6 @@ It is built from the unmodified FFmpeg 9.0.2 source
 external libraries, by `scripts/build-ffmpeg.sh`, which holds the exact
 configuration. It runs as a separate program; you may replace it with your own
 build of FFmpeg.
+
+**Media3.** The Android app includes AndroidX Media3 (Transformer, Effect,
+Common), licensed under the Apache License 2.0.
