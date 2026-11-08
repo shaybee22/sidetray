@@ -624,7 +624,15 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
   - Back to unmetered: the held video was no longer held and downloaded at the next sync.
   - Setting on + metered: a new video downloaded as usual.
   - The razr's flip mid-playback: closing it moved the app to the outer screen and reopening moved it back; each move re-creates the activity, which reloads the page, so the video went back to its poster (as planned: no errors, the feed comes back). Resuming at the same point is a possible later nicety.
-- Next: 9c checkpoint 4 (sending from the phone).
+- **9c checkpoint 4 done (sending from the phone), waiting for the go-ahead.** `video::prepare_source`/`source_duration_ms` pick ffmpeg or Media3; the Android path (`prepare_android`): probe → `plan_for(9.5 MB − 400 KB)` → CBR transcode with progress and cancel → retry rescaled by the measured overshoot (`rescaled_kbps`) → `strip_mp4_metadata` → poster. `pick_video` on Android opens the Photo Picker (`PickVisualMedia(VideoOnly)`, registered in `MainActivity`, polled with `takePickedVideo`). Video buttons show on phones; `video_support` checks `MediaCodecList`. The spike command is gone. Tested on the razr (Alex's desktop copy as the receiver):
+  - 45 s 1080p (with a GPS tag) → 1280×720, 9.47 MB in one pass, 4.8 s; 90 s → "Use the first 60 seconds?" → 854×480, 60.02 s, 9.48 MB in one pass, 5.8 s; a real razr camera clip picked with the Photo Picker (portrait, 16 s) → 720×1280 (as displayed), 5.6 MB in about 1 s; an HLG-tagged synthetic clip → 1280×720 SDR in 1.5 s; a DM with the camera clip; Cancel at 33% clears the composer. Alex downloaded and played all of them (seek, portrait upright).
+  - Metadata: Media3 copied the source's `©xyz` location, the `com.android.*` model tags and the recording time. Renaming boxes alone left the coordinates readable in the bytes, so `strip_mp4_metadata` now turns `udta`/`meta` into zeroed `free` padding and zeroes the `mvhd`/`tkhd`/`mdhd` creation and modification times (desktop output goes through it too). Checked on the received file: no location, model or `creation_time`.
+  - HDR: the clip recorded for this was SDR (8-bit BT.709 H.264; the razr camera's HDR video option was off), so tone-mapping of real HDR footage is still unchecked.
+- **Issues found in 9c, for after 9c** (not fixed):
+  - Flip/unfold re-creates the activity and reloads the page (Signal carries over without a reload). Drafts (post and DM), the tab and the open chat are restored; the chat reopens scrolled to the top (oldest messages) and the feed's scroll position is lost; a playing video stops.
+  - On the phone the post composer's four buttons (Photos, Camera, Video, Post) wrap, putting Post on its own line.
+  - Android's own fullscreen button shows greyed out in the video controls.
+- Next: 9c checkpoint 5 (Share → Side Tray with videos).
 
 ## Distribution and later
 
