@@ -63,7 +63,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y mingw-w64 nasm make pkg-config xz-utils
-          scripts/build-ffmpeg.sh
+          bash scripts/build-ffmpeg.sh
       - uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-windows
