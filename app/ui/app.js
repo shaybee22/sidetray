@@ -1701,6 +1701,27 @@ function renderVideo(v, ctx = {}) {
     const p = videoProgress.get(v.id);
     status.textContent = p ? `Downloading video… ${fmtMB(p)} of ${fmtMB(v.size)}` : "Downloading video…";
     box.append(status);
+  } else if (v.state === "pending" && v.held) {
+    const label = document.createElement("span");
+    label.textContent = "Waiting for Wi-Fi";
+    const get = document.createElement("button");
+    get.type = "button";
+    get.className = "ghost small";
+    get.textContent = `Download (${fmtMB(v.size)})`;
+    get.title = "Download it now, on mobile data";
+    get.addEventListener("click", async () => {
+      get.disabled = true;
+      get.textContent = "Starting…";
+      try {
+        await invoke("download_video", { id: v.id });
+      } catch (e) {
+        get.disabled = false;
+        get.textContent = `Download (${fmtMB(v.size)})`;
+        notice("Couldn't start the download", String(e));
+      }
+    });
+    status.append(label, get);
+    box.append(status);
   } else if (v.state === "pending") {
     status.textContent = `Video (${fmtDuration(v.duration_ms)}, ${fmtMB(v.size)}): waiting to download`;
     box.append(status);
@@ -3178,11 +3199,27 @@ async function loadSettings() {
   try {
     const s = await invoke("get_settings");
     $("#set-autostart").checked = s.start_with_os;
+    $("#set-videos-mobile").checked = s.videos_on_mobile_data;
     hideError($("#set-err"));
   } catch (e) {
     showError($("#set-err"), `Couldn't read settings: ${e}`);
   }
 }
+
+$("#set-videos-mobile").addEventListener("change", async (ev) => {
+  const box = ev.target;
+  box.disabled = true;
+  try {
+    const s = await invoke("set_videos_on_mobile_data", { enabled: box.checked });
+    box.checked = s.videos_on_mobile_data;
+    hideError($("#set-err"));
+  } catch (e) {
+    box.checked = !box.checked;
+    showError($("#set-err"), `Couldn't change that: ${e}`);
+  } finally {
+    box.disabled = false;
+  }
+});
 
 $("#set-autostart").addEventListener("change", async (ev) => {
   const box = ev.target;

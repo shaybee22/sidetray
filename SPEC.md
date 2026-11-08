@@ -619,7 +619,12 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
   - A feed post (720p, 45 s) and a DM (480p, 60 s) from Alex downloaded and played on the phone. Posts the phone received while on the old app stay text-only (it never recorded their video), as expected.
   - Desktop re-checked on Alex's copy: blob playback and seeking unchanged, no ⛶ button.
   - Not tested: the razr switching screens (activity re-creation) mid-playback.
-- Next: 9c checkpoint 3 (metered check and the mobile-data setting).
+- **9c checkpoint 3 done (metered check and the mobile-data setting), waiting for the go-ahead.** `device.rs` (`<data dir>/device-settings.json`, loaded with the profiles so the background sync follows it; `auto_download_videos()`), `SideTrayVideo.isMetered` (`ConnectivityManager.isActiveNetworkMetered`, cached 3 s; `ACCESS_NETWORK_STATE`), `fetch_videos` skips held videos per file, `videos.forced` + `download_video` for a tapped one, `VideoView.held`, the "Waiting for Wi-Fi · Download (8.2 MB)" poster, and the *Download videos on mobile data* switch in Settings (phones only). Tested on the razr with its Wi-Fi marked metered (`cmd netpolicy set metered-network MaisonLapin true`; tst-svr is LAN-only), then put back to `undefined`:
+  - Setting off + metered: a new video stayed pending through two syncs, poster shown, "Waiting for Wi-Fi"; a real tap on Download fetched that one in about a second while the next stayed held.
+  - Back to unmetered: the held video was no longer held and downloaded at the next sync.
+  - Setting on + metered: a new video downloaded as usual.
+  - The razr's flip mid-playback: closing it moved the app to the outer screen and reopening moved it back; each move re-creates the activity, which reloads the page, so the video went back to its poster (as planned: no errors, the feed comes back). Resuming at the same point is a possible later nicety.
+- Next: 9c checkpoint 4 (sending from the phone).
 
 ## Distribution and later
 

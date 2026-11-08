@@ -2,6 +2,7 @@ package org.sidetray.app
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.net.ConnectivityManager
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaExtractor
@@ -60,6 +61,13 @@ object SideTrayVideo {
 
   private fun uri(src: String): Uri =
     if (src.startsWith("content://") || src.startsWith("file://")) Uri.parse(src) else Uri.fromFile(File(src))
+
+  /** Whether the current network is metered (mobile data, a hotspot, metered Wi-Fi). */
+  @JvmStatic
+  fun isMetered(): Boolean {
+    val cm = context().getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    return cm.isActiveNetworkMetered
+  }
 
   /** Whether this phone can make videos: an H.264 and an AAC encoder. */
   @JvmStatic

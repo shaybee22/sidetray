@@ -233,6 +233,15 @@ pub struct VideoProbe {
     pub error: Option<String>,
 }
 
+/// Whether Android calls the current network metered (mobile data, a hotspot,
+/// a Wi-Fi network marked metered).
+pub fn is_metered() -> Result<bool> {
+    with_env(|env| {
+        let class = video_class(env)?;
+        Ok(env.call_static_method(&class, "isMetered", "()Z", &[])?.z()?)
+    })
+}
+
 /// Whether the phone has an H.264 and an AAC encoder.
 pub fn can_encode_video() -> Result<bool> {
     with_env(|env| {

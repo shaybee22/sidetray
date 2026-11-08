@@ -452,6 +452,9 @@ pub struct VideoView {
     /// only, where the IPC can't carry a whole file (Tauri sends large binary
     /// replies there as script text). Elsewhere `None`: `read_video` and a blob.
     pub src: Option<String>,
+    /// Waiting for an unmetered network (*Auto-download videos on mobile data*
+    /// is off): tapping it downloads it now.
+    pub held: bool,
 }
 
 /// The video of a post (`post`) or message, if it has one.
@@ -460,12 +463,13 @@ pub fn view(conn: &rusqlite::Connection, owner_column: &str, owner_id: &str) -> 
     let column = if owner_column == "post_id" { "post_id" } else { "message_id" };
     Ok(conn
         .query_row(
-            &format!("SELECT id, thumb_path, state, width, height, duration_ms, size, mine, local_path FROM videos WHERE {column} = ?1 LIMIT 1"),
+            &format!("SELECT id, thumb_path, state, width, height, duration_ms, size, mine, local_path, forced FROM videos WHERE {column} = ?1 LIMIT 1"),
             [owner_id],
             |r| {
                 let state: String = r.get(2)?;
                 let local: Option<String> = r.get(8)?;
                 let src = local.filter(|_| cfg!(target_os = "android") && state == "ready").as_deref().map(crate::feed::media_url);
+                let held = state == "pending" && !r.get::<_, bool>(9)? && !crate::device::auto_download_videos();
                 Ok(VideoView {
                     id: r.get(0)?,
                     thumb: r.get::<_, Option<String>>(1)?.as_deref().map(crate::feed::media_url),
@@ -476,6 +480,7 @@ pub fn view(conn: &rusqlite::Connection, owner_column: &str, owner_id: &str) -> 
                     size: r.get::<_, i64>(6)? as u64,
                     mine: r.get(7)?,
                     src,
+                    held,
                 })
             },
         )
@@ -665,6 +670,12 @@ pub async fn fetch_videos(app: &crate::state::App, id: &crate::db::Identity, s: 
         Err(e) => return eprintln!("videos: {e:#}"),
     };
     for t in rows {
+        // On mobile data with auto-download off, only what was tapped (checked
+        // per file: the phone can leave Wi-Fi mid-sync).
+        let forced: bool = app.db().query_row("SELECT forced FROM videos WHERE id = ?1", [&t.id], |r| r.get(0)).unwrap_or(false);
+        if !forced && !crate::device::auto_download_videos() {
+            continue;
+        }
         let _ = app.db().execute("UPDATE videos SET state = 'downloading' WHERE id = ?1", [&t.id]);
         emit(app, &t.id, Some(0), t.size);
         let result: Result<()> = async {

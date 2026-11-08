@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Phase 9c: is the network metered (videos wait for Wi-Fi if asked to). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Notifications (A3); on Android 13+ the app asks for this after joining. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- So Side Tray can ask, with Android's own dialog, to run unrestricted in the

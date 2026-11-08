@@ -52,6 +52,13 @@ pub fn shared(root: PathBuf) -> Result<Arc<Profiles>> {
     Ok(p)
 }
 
+impl Profiles {
+    /// The app's data folder (the profiles are in `groups/` under it).
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+}
+
 /// This process's profiles, if they were opened.
 pub fn current() -> Option<Arc<Profiles>> {
     lock(&SHARED).clone()
@@ -91,6 +98,7 @@ impl Profiles {
     fn open(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
         migrate(&root).context("moving this app's group into its own folder")?;
+        crate::device::load(&root);
         let mut apps = Vec::new();
         for e in std::fs::read_dir(root.join(GROUPS))?.flatten() {
             let name = e.file_name().to_string_lossy().to_string();

@@ -206,6 +206,8 @@ pub fn open(path: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS videos_post ON videos(post_id);
         CREATE INDEX IF NOT EXISTS videos_message ON videos(message_id);",
     )?;
+    // Phase 9c: tapped to download now, mobile data or not.
+    add_column(&conn, "videos", "forced", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(conn)
 }
 

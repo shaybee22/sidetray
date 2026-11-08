@@ -18,6 +18,7 @@ mod alerts;
 mod android;
 mod api;
 mod db;
+mod device;
 mod dm;
 mod feed;
 mod invite;
@@ -1127,18 +1128,48 @@ struct Settings {
     start_with_os: bool,
     /// A phone: no tray, no autostart, no self-update; the UI hides those.
     mobile: bool,
+    /// Download videos on mobile data (phones; `device.rs`).
+    videos_on_mobile_data: bool,
 }
 
 #[cfg(desktop)]
 #[tauri::command]
 fn get_settings(handle: AppHandle) -> Res<Settings> {
-    Ok(Settings { start_with_os: handle.autolaunch().is_enabled().map_err(|e| e.to_string())?, mobile: false })
+    Ok(Settings {
+        start_with_os: handle.autolaunch().is_enabled().map_err(|e| e.to_string())?,
+        mobile: false,
+        videos_on_mobile_data: device::videos_on_mobile_data(),
+    })
 }
 
 #[cfg(mobile)]
 #[tauri::command]
 fn get_settings(_handle: AppHandle) -> Res<Settings> {
-    Ok(Settings { start_with_os: false, mobile: true })
+    Ok(Settings { start_with_os: false, mobile: true, videos_on_mobile_data: device::videos_on_mobile_data() })
+}
+
+/// *Auto-download videos on mobile data* (all groups on this device).
+#[tauri::command]
+fn set_videos_on_mobile_data(handle: AppHandle, enabled: bool) -> Res<Settings> {
+    let profiles = handle.state::<Arc<Profiles>>();
+    device::set_videos_on_mobile_data(profiles.root(), enabled).map_err(err)?;
+    if enabled {
+        // Held videos can come now.
+        for a in profiles.all() {
+            a.wake.notify_one();
+        }
+    }
+    get_settings(handle)
+}
+
+/// Download a video now, even on mobile data with auto-download off (tapped).
+#[tauri::command]
+fn download_video(app: Active, id: String) -> Res<()> {
+    app.db()
+        .execute("UPDATE videos SET forced = 1 WHERE id = ?1 AND state = 'pending'", [&id])
+        .map_err(|e| e.to_string())?;
+    app.wake.notify_one();
+    Ok(())
 }
 
 #[cfg(desktop)]
@@ -1504,6 +1535,8 @@ pub fn run() {
             mark_dm_read,
             get_settings,
             set_start_with_os,
+            set_videos_on_mobile_data,
+            download_video,
             update_status,
             check_for_updates,
             install_update,
