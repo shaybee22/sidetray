@@ -153,6 +153,7 @@ object SideTrayAndroid {
     }
     val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() ?: ""
     val subject = intent.getStringExtra(Intent.EXTRA_SUBJECT) ?: ""
+    val intentType = intent.type ?: ""
     // Handled: if the activity is recreated it mustn't share the same thing again.
     a.intent = Intent(Intent.ACTION_MAIN)
 
@@ -169,7 +170,17 @@ object SideTrayAndroid {
       var skipped = 0
       dir.deleteRecursively()
       dir.mkdirs()
+      // A video (9c) goes on its own: the first one, by its URI (Media3 reads
+      // it directly; the share's read grant lasts while this activity does).
+      // The other videos and any pictures with it are left out.
+      val mimes = uris.map { uri ->
+        (try { resolver.getType(uri) } catch (e: Exception) { null }) ?: intentType.takeIf { !it.contains('*') }
+      }
+      val firstVideo = mimes.indexOfFirst { it?.startsWith("video/") == true }
+      val video = if (firstVideo >= 0) uris.elementAt(firstVideo).toString() else null
+      val leftOut = if (video != null) uris.size - 1 else 0
       for ((i, uri) in uris.withIndex()) {
+        if (video != null) break
         if (i >= MAX_FILES) {
           skipped += uris.size - MAX_FILES
           break
@@ -209,6 +220,8 @@ object SideTrayAndroid {
         .put("subject", subject)
         .put("dir", dir.absolutePath)
         .put("files", files)
+        .put("video", video ?: JSONObject.NULL)
+        .put("left_out", leftOut)
         .put("skipped", skipped)
         .put("errors", errors)
       synchronized(lock) {

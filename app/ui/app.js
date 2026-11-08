@@ -303,6 +303,7 @@ listen("invite", handleInvite);
 
 let shareTray = null; // made on first use (the Attachments class is defined further down)
 let shareText = "";
+let shareVideo = null; // a shared video's URI, staged once a destination is chosen
 let shareChecking = null;
 let shareGen = 0; // which share the dialog is showing; an older one's pictures stop loading
 
@@ -342,6 +343,7 @@ async function receiveShare(s) {
   const text = sharedText(s);
   const notes = [...s.errors];
   if (s.skipped) notes.push(`${s.skipped} shared file${s.skipped > 1 ? "s weren't pictures" : " wasn't a picture"}, so ${s.skipped > 1 ? "they were" : "it was"} left out.`);
+  if (s.left_out) notes.push("One video at a time, and not with photos: using the first video.");
   const active = view.stage === "active" && !$("#screen-main").classList.contains("readonly");
   if (!active) {
     invoke("end_share");
@@ -354,7 +356,7 @@ async function receiveShare(s) {
     }[view.stage] || "Side Tray can't share anything right now.";
     return notice("Can't share this yet", why);
   }
-  if (!s.photos && !text) {
+  if (!s.photos && !text && !s.video) {
     invoke("end_share");
     return notice("Nothing to share", notes.join(" ") || "Side Tray didn't receive a picture or any text.");
   }
@@ -367,16 +369,17 @@ async function receiveShare(s) {
   }
   shareTray.clear();
   shareText = text;
+  shareVideo = s.video || null;
   const dlg = $("#share");
   if (!dlg.open) dlg.showModal();
   const what = [];
+  if (s.video) what.push("a video");
   if (s.photos) what.push(`${s.photos} picture${s.photos > 1 ? "s" : ""}`);
   if (text) what.push(/^https?:\/\/\S+$/.test(s.text.trim()) ? "a link" : "some text");
   $("#sh-what").textContent = `From another app: ${what.join(" and ")}. Where should it go?`;
   $("#sh-text").textContent = text;
   $("#sh-text").hidden = !text;
   hideError($("#sh-err"));
-  if (notes.length) showError($("#sh-err"), notes.join("\n"));
   $("#sh-dm").hidden = true;
   invoke("dm_recipients").then((people) => {
     $("#sh-people").replaceChildren(...people.map((p) => {
@@ -400,8 +403,13 @@ async function receiveShare(s) {
     label: s.photos > 1 ? `Picture ${index + 1}` : "The picture",
     load: () => (gen === shareGen ? invoke("stage_shared_photo", { index }) : null),
   }));
-  await shareTray.add(sources);
+  if (sources.length) await shareTray.add(sources);
   if (gen !== shareGen) return;
+  // Loading the pictures clears the error line: put the notes back after.
+  if (notes.length) {
+    const el = $("#sh-err");
+    showError(el, [el.hidden ? "" : el.textContent, ...notes].filter(Boolean).join("\n"));
+  }
   invoke("end_share");
   if (dlg.open) setShareReady(true);
 }
@@ -416,8 +424,11 @@ function shareTo(memberId) {
   const items = shareTray.take();
   const text = shareText;
   shareText = "";
+  const video = shareVideo;
+  shareVideo = null;
   $("#share").close("sent");
   const into = (input) => {
+    if (!text) return;
     input.value = input.value.trim() ? `${input.value.trimEnd()}\n\n${text}` : text;
   };
   if (memberId) {
@@ -425,10 +436,12 @@ function shareTo(memberId) {
     selectTab("messages"); // opens the chat; its draft belongs to this person from here on
     into($("#dm-text"));
     dmTray.adopt(items);
+    if (video) dmVideo.stage(video, false); // the usual flow: "Use the first 60 seconds?", progress
   } else {
     selectTab("feed");
     into($("#cp-text"));
     postTray.adopt(items);
+    if (video) postVideo.stage(video, false);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 }
@@ -439,6 +452,7 @@ $("#share").addEventListener("close", () => {
   // Cancelled (the button, or Back): nothing of it is kept.
   shareTray?.clear();
   shareText = "";
+  shareVideo = null;
   invoke("end_share");
 });
 

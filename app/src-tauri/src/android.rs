@@ -129,6 +129,12 @@ struct Shared {
     subject: String,
     dir: PathBuf,
     files: Vec<SharedFile>,
+    /// A shared video's `content://` URI (9c), staged like a picked one.
+    #[serde(default)]
+    video: Option<String>,
+    /// Other files left out because a video goes on its own.
+    #[serde(default)]
+    left_out: usize,
     skipped: usize,
     errors: Vec<String>,
 }
@@ -144,6 +150,10 @@ pub enum ShareView {
         text: String,
         subject: String,
         photos: usize,
+        /// A shared video (its URI), for `stage_video`.
+        video: Option<String>,
+        /// Pictures and other videos left out because a video goes on its own.
+        left_out: usize,
         /// Files that weren't pictures (or over the limit of 20).
         skipped: usize,
         errors: Vec<String>,
@@ -171,7 +181,15 @@ pub fn take_share() -> Result<Option<ShareView>> {
     end_share();
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((shared.dir, shared.files.into_iter().map(|f| Some(f.path)).collect()));
-    Ok(Some(ShareView::Ready { text: shared.text, subject: shared.subject, photos, skipped: shared.skipped, errors: shared.errors }))
+    Ok(Some(ShareView::Ready {
+        text: shared.text,
+        subject: shared.subject,
+        photos,
+        video: shared.video,
+        left_out: shared.left_out,
+        skipped: shared.skipped,
+        errors: shared.errors,
+    }))
 }
 
 /// The shared picture number `index`, read once and deleted.

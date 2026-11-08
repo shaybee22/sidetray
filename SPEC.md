@@ -630,9 +630,15 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
   - HDR: the clip recorded for this was SDR (8-bit BT.709 H.264; the razr camera's HDR video option was off), so tone-mapping of real HDR footage is still unchecked.
 - **Issues found in 9c, for after 9c** (not fixed):
   - Flip/unfold re-creates the activity and reloads the page (Signal carries over without a reload). Drafts (post and DM), the tab and the open chat are restored; the chat reopens scrolled to the top (oldest messages) and the feed's scroll position is lost; a playing video stops.
-  - On the phone the post composer's four buttons (Photos, Camera, Video, Post) wrap, putting Post on its own line.
   - Android's own fullscreen button shows greyed out in the video controls.
-- Next: 9c checkpoint 5 (Share → Side Tray with videos).
+  - The relay's 429 message reads awkwardly in the composer ("…Try again later.: server said 429: too many uploads…; try again in 1345 seconds").
+- **9c checkpoint 5 done (Share → Side Tray with videos), waiting for the go-ahead.** `video/*` in the `SEND` and `SEND_MULTIPLE` filters; `SideTrayAndroid.receive` passes the first video's URI (not copied) as `video` and counts what it leaves out (`left_out`: other videos and pictures); `ShareView::Ready` carries both; the share dialog says "a video" and, once a destination is chosen, the post or DM composer stages it with the usual flow. Also: the phone composer's Photos, Camera and Video buttons are icon-only (`icon-on-phone`), so Post stays on their line; the share dialog's notes are shown after the pictures load (loading them cleared the error line, so "One video at a time…" and the existing "wasn't a picture" note never showed); a share with no text no longer adds blank lines to a draft. Tested on the razr with the Files app (a test folder, deleted afterwards):
+  - One video → "a video", to Alex → the DM composer staged it (720×1280, 20 s, 6.8 MB) and it was sent; Alex played it.
+  - The 90 s video → the feed → "Use the first 60 seconds?" (real tap) → 854×480, 60.02 s, posted; Alex has it.
+  - Two videos and a picture → "a video" with "One video at a time, and not with photos: using the first video." → the first video staged (its post then hit the relay's 50 MB/hour upload limit after the day's tests: the error showed and the staged video stayed).
+  - A picture alone still shares as before.
+  - `am start … SEND --eu EXTRA_STREAM content://media/…` from adb fails (`setDataSource failed`): the shell can't grant MediaStore reads. Real shares (Files) carry their grant.
+- Next: 9c checkpoint 6 (the full "Done when" on the razr and desktop, release build check, CHANGELOG/README).
 
 ## Distribution and later
 
