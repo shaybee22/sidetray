@@ -495,7 +495,7 @@ Built in three stages, each tested before the next: **9a** the relay (video rete
 - Sync records the video reference with a state: `pending → downloading → ready | expired | failed`.
 - Download is automatic in the background after the poster frame, newest first, one at a time, so a device acks soon and the file can leave the server. After the digest check and decryption, it saves `<id>.mp4` and acks it with `POST /media/acks`. A 410 sets `expired`; other errors count toward the existing attempts limit.
 - **Mobile data:** a setting *Auto-download videos on mobile data* (Device → Settings, default on). When it's off and Android says the network is metered (`ConnectivityManager.isActiveNetworkMetered`), videos stay `pending` until the next sync on an unmetered network, or until tapped. Computers always download.
-- **Playback:** the app reads the decrypted file through a command and plays it from a `blob:` URL in a `<video controls>` element (CSP gains `media-src blob:`). No `Range` support in `serve_media`; only if blob playback fails on the razr (seeking, memory) does `serve_media` learn `.mp4` with 206 responses.
+- **Playback:** on a computer the app reads the decrypted file through a command and plays it from a `blob:` URL in a `<video controls>` element (CSP `media-src blob:`). On Android that can't work (Tauri's Android IPC sends a large binary reply as script text; 8 MB never arrived in checkpoint 2), so `serve_media` serves `<id>.mp4` from the media folder with `Range` (206, at most 2 MB per response) and the video view carries that URL as `src` (CSP `media-src http://media.localhost media:`).
 - The feed or chat shows the poster frame with a play badge and the duration. While downloading it shows "Downloading video… 3.1 / 8.7 MB"; once `ready`, tapping plays it inline or in the lightbox.
 - **Expired:** the poster frame (greyed), the post text, "Video expired" and a **Request** button. Request opens the DM with the poster and pre-fills "Could you send me your video from <date>?", plus a structured `"video_request": {"post_id", "video_id"}` in the DM body. Request is hidden on your own posts and greyed out with the reason when the poster has left or either side has no verified device (`dm::recipients` rules).
 - **Re-send:** on the poster's devices that have the local file, an incoming `video_request` shows a **Send it** button in the chat. Your own video in the feed also has *Send in a message…*. Both re-upload the local MP4 as a new DM video (new `media_id` and message key; nothing reused). A request for a video this device doesn't have shows "This video isn't on this device".
@@ -609,7 +609,17 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
   - Metadata: the source's location (`©xyz` in `udta`) is copied into the output; other tags (comment) aren't. The planned in-place strip is needed.
   - HDR: an HLG-tagged clip is detected and comes out as 8-bit BT.709, but the test clip is a synthetic pattern, so whether the colours look right needs a real HDR recording from the razr (checkpoint 4).
   - Not tried yet: cancel on the phone (wired, tested in checkpoint 4).
-- Next: the user's go-ahead on the encoder (Media3, CBR), then 9c checkpoint 2 (receiving and playback on the razr).
+- Decided after checkpoint 1: Media3 with CBR; the Android plan budgets 9.5 MB minus the ~400 KB `moov` reserve; the retry rescales the bitrate by the measured overshoot (×0.95 margin) instead of a flat 85%. Built in checkpoint 4.
+- **9c checkpoint 2 done (receiving and playback on the razr), waiting for the go-ahead.** Results:
+  - Blob playback is impossible on Android: `read_video` of an 8 MB file never returned. Tauri 2.12 on Android can't use its custom-protocol IPC (`canUseCustomProtocol = osName !== 'android'`), so a large raw reply goes back as a JS array literal. Replaced by the planned fallback: `serve_media` serves the decrypted `.mp4` with `Range`; `VideoView.src` on Android; desktop keeps the blob.
+  - On the razr (screen on): metadata in 5 ms, a seek to 30 s in 38 ms (the player asks `Range: bytes=131072-` and gets 206); a real tap plays with sound, so `mediaPlaybackRequiresUserGesture` stays as it is; the scrubber seeks.
+  - Full screen: Android's own button is greyed out (`controlslist=nofullscreen`); the app's ⛶ button moves the playing `<video>` into `#video-viewer` (it plays on), × or Back puts it back in the post, still playing.
+  - Leaving the app (Home) pauses it; it stays paused on return.
+  - One video in memory on a phone: playing the DM video put the feed video back to its poster. App process +6 MB while playing (PSS 196 → 202 MB); the WebView renderer 113 MB PSS.
+  - A feed post (720p, 45 s) and a DM (480p, 60 s) from Alex downloaded and played on the phone. Posts the phone received while on the old app stay text-only (it never recorded their video), as expected.
+  - Desktop re-checked on Alex's copy: blob playback and seeking unchanged, no ⛶ button.
+  - Not tested: the razr switching screens (activity re-creation) mid-playback.
+- Next: 9c checkpoint 3 (metered check and the mobile-data setting).
 
 ## Distribution and later
 

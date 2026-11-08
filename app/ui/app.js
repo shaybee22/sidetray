@@ -460,6 +460,7 @@ function unsentWork() {
  */
 async function onBack() {
   if (!$("#lightbox").hidden) return closeLightbox();
+  if (!$("#video-viewer").hidden) return closeVideoViewer();
   const dlg = $$("dialog").find((d) => d.open);
   if (dlg) return dlg.close();
   const main = $("#screen-main");
@@ -1577,28 +1578,88 @@ listen("upload-progress", (ev) => {
 /** Videos being watched (id -> <video>), kept across feed and chat redraws. */
 const playing = new Map();
 
-async function playVideo(id, box) {
-  let el = playing.get(id);
+async function playVideo(v, ctx, box) {
+  let el = playing.get(v.id);
   if (!el) {
-    // The decrypted file, played from memory: nothing is served from disk.
-    const buf = await invoke("read_video", { id });
+    // Android streams it from the app (v.src, with Range); elsewhere the
+    // decrypted file is played from memory.
+    const src = v.src || URL.createObjectURL(new Blob([await invoke("read_video", { id: v.id })], { type: "video/mp4" }));
     el = document.createElement("video");
     el.controls = true;
     el.playsInline = true;
-    el.src = URL.createObjectURL(new Blob([buf], { type: "video/mp4" }));
-    playing.set(id, el);
-    // Keep a few; let go of the oldest that isn't on screen.
-    for (const [old, v] of playing) {
-      if (playing.size <= 3) break;
-      if (old !== id && !v.isConnected) {
-        URL.revokeObjectURL(v.src);
-        playing.delete(old);
-      }
+    if (mobile) {
+      // Android WebView can't show its own full screen (Tauri's WebChromeClient
+      // closes it at once): our viewer instead (videoFullScreen).
+      el.setAttribute("controlslist", "nofullscreen");
+      el.disablePictureInPicture = true;
+    }
+    el.src = src;
+    el._sidetray = { v, ctx };
+    playing.set(v.id, el);
+    // Keep a few in memory (one on a phone); let go of the oldest.
+    const keep = mobile ? 1 : 3;
+    for (const [old, o] of playing) {
+      if (playing.size <= keep) break;
+      if (old === v.id || (!mobile && o.isConnected)) continue;
+      forgetVideo(old);
     }
   }
-  box.replaceChildren(el);
+  attachPlayer(box, el);
   el.play().catch(() => {});
 }
+
+/** Drop a video from memory; if it's on screen, its poster comes back. */
+function forgetVideo(id) {
+  const el = playing.get(id);
+  if (!el) return;
+  playing.delete(id);
+  el.pause();
+  if (el.src.startsWith("blob:")) URL.revokeObjectURL(el.src);
+  el.removeAttribute("src");
+  el.load();
+  const box = el.closest(".video");
+  if (box && el._sidetray) box.replaceWith(renderVideo(el._sidetray.v, el._sidetray.ctx));
+  else el.remove();
+}
+
+/** Put a playing <video> in its box (moving it keeps it playing), with a full-screen button on a phone. */
+function attachPlayer(box, el) {
+  box.replaceChildren(el);
+  if (!mobile) return;
+  const fs = document.createElement("button");
+  fs.type = "button";
+  fs.className = "video-fs";
+  fs.setAttribute("aria-label", "Full screen");
+  fs.title = "Full screen";
+  fs.textContent = "⛶";
+  fs.addEventListener("click", () => videoFullScreen(el));
+  box.append(fs);
+}
+
+function videoFullScreen(el) {
+  const viewer = $("#video-viewer");
+  viewer.dataset.video = el.closest(".video")?.dataset.video || "";
+  $("#video-viewer-x").before(el);
+  viewer.hidden = false;
+}
+
+function closeVideoViewer() {
+  const viewer = $("#video-viewer");
+  if (viewer.hidden) return;
+  viewer.hidden = true;
+  const el = $("video", viewer);
+  if (!el) return;
+  // Back into its post or message, if that's still on screen.
+  const box = document.querySelector(`.video[data-video="${viewer.dataset.video}"]`);
+  if (box) attachPlayer(box, el);
+  else el.remove();
+}
+$("#video-viewer-x").addEventListener("click", closeVideoViewer);
+
+// Leaving the app (or the tab): stop the sound.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) for (const el of playing.values()) el.pause();
+});
 
 /**
  * A post's or message's video: the poster frame and what can be done with
@@ -1610,7 +1671,10 @@ function renderVideo(v, ctx = {}) {
   box.className = "video " + v.state;
   box.dataset.video = v.id;
   if (v.state === "ready" && playing.has(v.id)) {
-    box.append(playing.get(v.id));
+    const el = playing.get(v.id);
+    el._sidetray = { v, ctx };
+    // In the full-screen viewer it stays there; otherwise it moves into this box.
+    if (!el.closest("#video-viewer")) attachPlayer(box, el);
     return box;
   }
   const poster = document.createElement("img");
@@ -1631,7 +1695,7 @@ function renderVideo(v, ctx = {}) {
     play.className = "play";
     play.textContent = "▶";
     play.setAttribute("aria-label", `Play video (${fmtDuration(v.duration_ms)})`);
-    play.addEventListener("click", () => playVideo(v.id, box).catch((e) => notice("Can't play this video", String(e))));
+    play.addEventListener("click", () => playVideo(v, ctx, box).catch((e) => notice("Can't play this video", String(e))));
     box.append(play, tag);
   } else if (v.state === "downloading") {
     const p = videoProgress.get(v.id);

@@ -448,6 +448,10 @@ pub struct VideoView {
     pub duration_ms: u64,
     pub size: u64,
     pub mine: bool,
+    /// Where the WebView streams it from (`serve_media`, with Range): Android
+    /// only, where the IPC can't carry a whole file (Tauri sends large binary
+    /// replies there as script text). Elsewhere `None`: `read_video` and a blob.
+    pub src: Option<String>,
 }
 
 /// The video of a post (`post`) or message, if it has one.
@@ -456,18 +460,22 @@ pub fn view(conn: &rusqlite::Connection, owner_column: &str, owner_id: &str) -> 
     let column = if owner_column == "post_id" { "post_id" } else { "message_id" };
     Ok(conn
         .query_row(
-            &format!("SELECT id, thumb_path, state, width, height, duration_ms, size, mine FROM videos WHERE {column} = ?1 LIMIT 1"),
+            &format!("SELECT id, thumb_path, state, width, height, duration_ms, size, mine, local_path FROM videos WHERE {column} = ?1 LIMIT 1"),
             [owner_id],
             |r| {
+                let state: String = r.get(2)?;
+                let local: Option<String> = r.get(8)?;
+                let src = local.filter(|_| cfg!(target_os = "android") && state == "ready").as_deref().map(crate::feed::media_url);
                 Ok(VideoView {
                     id: r.get(0)?,
                     thumb: r.get::<_, Option<String>>(1)?.as_deref().map(crate::feed::media_url),
-                    state: r.get(2)?,
+                    state,
                     width: r.get(3)?,
                     height: r.get(4)?,
                     duration_ms: r.get::<_, i64>(5)? as u64,
                     size: r.get::<_, i64>(6)? as u64,
                     mine: r.get(7)?,
+                    src,
                 })
             },
         )

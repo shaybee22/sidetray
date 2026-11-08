@@ -1206,17 +1206,23 @@ fn open_install_settings() -> Res<()> {
     Ok(())
 }
 
-// --- photos for the webview ------------------------------------------------------------
+// --- photos and videos for the webview ----------------------------------------------------
 
-/// `media://localhost/<id>.webp` (`http://media.localhost/...` on Windows):
-/// decrypted photos from the media folder, and nothing else.
-fn serve_media(app: &App, path: &str) -> tauri::http::Response<Vec<u8>> {
+/// `media://localhost/<id>.webp` (`http://media.localhost/...` on Windows and
+/// Android): decrypted photos from the media folder, and nothing else. Also
+/// `<id>.mp4`, the decrypted videos, with `Range` (the WebView's player asks
+/// for pieces as it plays and seeks); the Android app plays them from here.
+fn serve_media(app: &App, path: &str, range: Option<&str>) -> tauri::http::Response<Vec<u8>> {
     let name = path.trim_start_matches('/');
-    let ok_name = name
-        .strip_suffix(".webp")
-        .is_some_and(|stem| (1..=64).contains(&stem.len()) && stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
-    let file = if ok_name { std::fs::read(app.media_dir.join(name)).ok() } else { None };
+    let ok_stem = |stem: &str| (1..=64).contains(&stem.len()) && stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     let builder = tauri::http::Response::builder().header("X-Content-Type-Options", "nosniff");
+    if name.strip_suffix(".mp4").is_some_and(ok_stem) {
+        if let Some(r) = serve_video(&app.media_dir.join(name), range) {
+            return r;
+        }
+        return builder.status(404).body(Vec::new()).expect("static response parts are valid");
+    }
+    let file = if name.strip_suffix(".webp").is_some_and(ok_stem) { std::fs::read(app.media_dir.join(name)).ok() } else { None };
     match file {
         Some(bytes) => builder
             .status(200)
@@ -1226,6 +1232,57 @@ fn serve_media(app: &App, path: &str) -> tauri::http::Response<Vec<u8>> {
         None => builder.status(404).body(Vec::new()),
     }
     .expect("static response parts are valid")
+}
+
+/// At most this much of a video per response: the player asks again for the rest.
+const VIDEO_CHUNK: u64 = 2 * 1024 * 1024;
+
+/// A piece of a local MP4 for `Range: bytes=a-b` (or `a-`, `-n`), or from the
+/// start without one. `None` if the file isn't there.
+fn serve_video(path: &std::path::Path, range: Option<&str>) -> Option<tauri::http::Response<Vec<u8>>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let builder = tauri::http::Response::builder()
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Content-Type", "video/mp4")
+        .header("Accept-Ranges", "bytes")
+        .header("Cache-Control", "no-store");
+    let (start, end) = match range.map(|r| parse_range(r, len)) {
+        Some(Some(r)) => r,
+        Some(None) => {
+            return builder.status(416).header("Content-Range", format!("bytes */{len}")).body(Vec::new()).ok();
+        }
+        None if len == 0 => return builder.status(200).body(Vec::new()).ok(),
+        None => (0, len - 1),
+    };
+    let end = end.min(start + VIDEO_CHUNK - 1);
+    let mut body = vec![0; (end + 1 - start) as usize];
+    f.seek(SeekFrom::Start(start)).ok()?;
+    f.read_exact(&mut body).ok()?;
+    builder
+        .status(206)
+        .header("Content-Range", format!("bytes {start}-{end}/{len}"))
+        .header("Content-Length", body.len().to_string())
+        .body(body)
+        .ok()
+}
+
+/// `bytes=a-b`, `bytes=a-` or `bytes=-n` against a file of `len` bytes, as an
+/// inclusive (start, end); `None` if it doesn't fit.
+fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
+    let spec = header.trim().strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (a, b) = spec.split_once('-')?;
+    let last = len.checked_sub(1)?;
+    let (start, end) = match (a.trim(), b.trim()) {
+        ("", n) => {
+            let n: u64 = n.parse().ok()?;
+            (len - n.min(len), last)
+        }
+        (a, "") => (a.parse().ok()?, last),
+        (a, b) => (a.parse().ok()?, b.parse::<u64>().ok()?.min(last)),
+    };
+    (start <= end && start < len).then_some((start, end))
 }
 
 // --- background sync ---------------------------------------------------------------------
@@ -1307,7 +1364,8 @@ pub fn run() {
     builder
         .register_uri_scheme_protocol("media", |ctx, req| {
             let app = ctx.app_handle().state::<Arc<Profiles>>().active();
-            serve_media(&app, req.uri().path())
+            let range = req.headers().get("range").and_then(|v| v.to_str().ok());
+            serve_media(&app, req.uri().path(), range)
         })
         .setup(|tauri_app| {
             // SIDETRAY_DATA_DIR lets several copies run side by side (testing).
@@ -1478,4 +1536,45 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+
+    #[test]
+    fn ranges() {
+        assert_eq!(parse_range("bytes=0-", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=10-19", 100), Some((10, 19)));
+        assert_eq!(parse_range("bytes=90-200", 100), Some((90, 99)));
+        assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
+        assert_eq!(parse_range("bytes=100-", 100), None);
+        assert_eq!(parse_range("bytes=5-4", 100), None);
+        assert_eq!(parse_range("items=0-1", 100), None);
+        assert_eq!(parse_range("bytes=0-", 0), None);
+    }
+
+    #[test]
+    fn video_pieces() {
+        let dir = std::env::temp_dir().join(format!("sidetray-serve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v.mp4");
+        let data: Vec<u8> = (0..(VIDEO_CHUNK + 1000)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let r = serve_video(&path, Some("bytes=10-19")).unwrap();
+        assert_eq!(r.status(), 206);
+        assert_eq!(r.body().as_slice(), &data[10..20]);
+        assert_eq!(r.headers()["content-range"], format!("bytes 10-19/{}", data.len()).as_str());
+        // Capped at a chunk; the player asks for the rest.
+        let r = serve_video(&path, Some("bytes=0-")).unwrap();
+        assert_eq!(r.body().len() as u64, VIDEO_CHUNK);
+        let r = serve_video(&path, Some("bytes=-1000")).unwrap();
+        assert_eq!(r.body().as_slice(), &data[data.len() - 1000..]);
+        // Without Range: the first chunk, as 206 with its Content-Range.
+        assert_eq!(serve_video(&path, None).unwrap().status(), 206);
+        assert_eq!(serve_video(&path, Some("bytes=999999999-")).unwrap().status(), 416);
+        assert!(serve_video(&dir.join("missing.mp4"), None).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
