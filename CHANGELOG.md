@@ -9,7 +9,9 @@ Short videos, on Windows and Android.
 
 Update the relay first (`git pull && sudo ./install.sh`): it adds tables for
 videos and file acks, and writes the new upload limit into `.env`. Apps from
-0.3.x keep working with it; they show a video post's text without the video.
+0.3.x keep working with it (posts, photos, messages, joins): they show a
+video post's text without the video, a post that is only a video as an empty
+post, and skip a message that is only a video. Update the apps to see videos.
 
 ### App
 
