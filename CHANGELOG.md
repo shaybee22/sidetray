@@ -25,6 +25,9 @@ the app, the Rust crates and the relay share one version number.
   stays on the same line. Sharing to Side Tray shows its notes again (they
   were cleared as the pictures loaded) and no longer adds blank lines to a
   draft when nothing but pictures was shared.
+- Over the relay's hourly upload limit, the error is one sentence that says
+  how long to wait ("Try again in about 23 minutes."). "You asked for a
+  video." is readable in your own message bubble.
 
 ### Relay
 
@@ -34,6 +37,10 @@ the app, the Rust crates and the relay share one version number.
   `SIDETRAY_VIDEO_CAP_GB`). A deleted video answers 410 with the reason.
 - Feed photos stay until every updated device has downloaded them, also with
   `SIDETRAY_HISTORY_DAYS=0`.
+- **The upload limit is now 150 MB per hour per device** (it was 50, about
+  five videos), so a family can share a handful of clips at an event.
+  `install.sh` writes `SIDETRAY_MEDIA_MB_PER_HOUR=150` into `.env` unless
+  you've set your own value.
 
 ## [0.3.1] - 2026-11-07
 

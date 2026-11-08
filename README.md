@@ -341,7 +341,7 @@ never go out over the API.
 | What | Limit | Key | Setting in `.env` |
 | --- | --- | --- | --- |
 | `POST /events` and `POST /dms` together | 30 per minute | device | `SIDETRAY_EVENTS_PER_MINUTE` |
-| `POST /media` (posts, avatars and message photos) | 50 MB per hour | device | `SIDETRAY_MEDIA_MB_PER_HOUR` |
+| `POST /media` (photos, videos, poster frames, avatars) | 150 MB per hour | device | `SIDETRAY_MEDIA_MB_PER_HOUR` |
 | `POST /join` | 10 attempts per hour | client IP | `SIDETRAY_JOINS_PER_HOUR` |
 | `GET /group?name=` | 60 per hour | client IP | `SIDETRAY_LOOKUPS_PER_HOUR` |
 

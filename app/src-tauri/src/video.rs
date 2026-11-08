@@ -825,16 +825,7 @@ pub async fn upload(
                 let _ = h.emit("upload-progress", serde_json::json!({ "profile": profile, "sent": sent, "total": total }));
             }
         })
-        .await
-        .map_err(|e| {
-            if crate::api::is_status(&e, 507) {
-                e.context("The server's video storage is full right now. Try again later.")
-            } else if crate::api::is_status(&e, 429) {
-                e.context("You've sent a lot of media in the last hour (the server allows about 50 MB). Try again later.")
-            } else {
-                e
-            }
-        })?;
+        .await?; // 429 and 507 come back in plain words (api::explain_upload)
     let thumb = api.upload_media_as(enc_thumb, "image", |_, _| {}).await?;
     if !crate::feed::safe_media_id(&id) || !crate::feed::safe_media_id(&thumb) {
         bail!("the server returned an unusable media id");

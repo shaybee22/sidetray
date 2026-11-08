@@ -100,7 +100,7 @@ def env_int(name: str, default: int) -> int:
 # Rate limits (SPEC): per device, and per client IP for the unauthenticated
 # calls, so nobody can flood Key Masters with join requests or guess group names.
 EVENTS_PER_MINUTE = env_int("SIDETRAY_EVENTS_PER_MINUTE", 30)
-MEDIA_BYTES_PER_HOUR = env_int("SIDETRAY_MEDIA_MB_PER_HOUR", 50) * 1024 * 1024
+MEDIA_BYTES_PER_HOUR = env_int("SIDETRAY_MEDIA_MB_PER_HOUR", 150) * 1024 * 1024
 JOINS_PER_HOUR = env_int("SIDETRAY_JOINS_PER_HOUR", 10)
 LOOKUPS_PER_HOUR = env_int("SIDETRAY_LOOKUPS_PER_HOUR", 60)
 

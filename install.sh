@@ -439,6 +439,9 @@ if [ "$PUSH" = yes ] && [ "$MODE" = test ]; then
   fi
 fi
 
+# Upload limit per device per hour (also the relay's default).
+MEDIA_MB=150
+
 # Push settings in .env: the compose profile that starts ntfy, and where the
 # relay sends wake-ups.
 if [ "$MODE" = production ]; then NTFY_URL="https://$HOST"; else NTFY_URL="https://$HOST:$NTFY_PORT"; fi
@@ -491,6 +494,8 @@ SIDETRAY_HISTORY_DAYS=$HISTORY
 # install.sh leaves it empty and issues a one-time token instead
 # (sudo sidetray-admin new-group).
 SIDETRAY_SETUP_TOKEN=
+# MB of uploads (photos, videos, avatars) each device may send per hour.
+SIDETRAY_MEDIA_MB_PER_HOUR=$MEDIA_MB
 EOF
   )
   NEW_ENV=1 push_env
@@ -501,6 +506,8 @@ else
   env_set SIDETRAY_ACME_EMAIL "$EMAIL"
   env_set SIDETRAY_RETENTION_DAYS "$RETENTION"
   env_set SIDETRAY_HISTORY_DAYS "$HISTORY"
+  # Added in 0.4.0 (videos); a value the operator set is kept.
+  [ -n "$(env_get SIDETRAY_MEDIA_MB_PER_HOUR)" ] || env_set SIDETRAY_MEDIA_MB_PER_HOUR "$MEDIA_MB"
   push_env
   chmod 600 "$DIR/.env"
   say "  kept .env (setup token and other settings untouched)"

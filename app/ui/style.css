@@ -354,6 +354,7 @@ dialog#crop p { margin: 0; }
 .bubble-row.mine { justify-content: flex-end; }
 .bubble { max-width: min(75%, 440px); background: var(--surface-2); border: 1px solid var(--line); border-radius: 16px 16px 16px 4px; padding: 7px 12px; }
 .bubble-row.mine .bubble { background: var(--accent); border-color: var(--accent); color: var(--accent-text); border-radius: 16px 16px 4px 16px; }
+.bubble-row.mine .bubble .muted { color: inherit; opacity: .85; } /* grey is unreadable on the accent */
 .bubble .text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .bubble .text:empty { display: none; }
 .bubble .when { font-size: .7rem; opacity: .75; margin-top: 2px; text-align: right; }

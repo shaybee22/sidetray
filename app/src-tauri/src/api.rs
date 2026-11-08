@@ -236,7 +236,7 @@ impl Api {
             .header("content-type", "application/octet-stream")
             .timeout(Duration::from_secs(300))
             .body(blob);
-        let r: MediaResp = self.json(self.auth(req)).await?;
+        let r: MediaResp = self.json(self.auth(req)).await.map_err(explain_upload)?;
         Ok(r.id)
     }
 
@@ -261,7 +261,7 @@ impl Api {
             .header("content-length", total)
             .timeout(Duration::from_secs(300))
             .body(reqwest::Body::wrap_stream(body));
-        let r: MediaResp = self.json(self.auth(req)).await?;
+        let r: MediaResp = self.json(self.auth(req)).await.map_err(explain_upload)?;
         Ok(r.id)
     }
 
@@ -299,9 +299,75 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// A relay error status put in plain words: shown as just the message.
+#[derive(Debug)]
+pub struct Explained {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for Explained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Explained {}
+
+/// An upload refused for the hourly limit (429) or full video storage (507),
+/// as one sentence instead of the relay's own text.
+fn explain_upload(e: anyhow::Error) -> anyhow::Error {
+    let Some(h) = e.chain().find_map(|c| c.downcast_ref::<HttpError>()) else { return e };
+    let message = match h.status {
+        429 => format!("You've sent a lot of photos and videos in the last hour. {}", retry_in(&h.detail)),
+        507 => "The server's video storage is full right now. Try again later.".to_string(),
+        _ => return e,
+    };
+    Explained { status: h.status, message }.into()
+}
+
+/// "Try again in about N minutes." from the relay's "try again in N seconds".
+fn retry_in(detail: &str) -> String {
+    let secs: Option<u64> = detail
+        .split("try again in ")
+        .nth(1)
+        .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse().ok());
+    match secs.map(|s| s.div_ceil(60).max(1)) {
+        Some(1) => "Try again in a minute.".to_string(),
+        Some(m) => format!("Try again in about {m} minutes."),
+        None => "Try again later.".to_string(),
+    }
+}
+
 /// Whether `e` (anywhere in its chain) is the relay answering `status`.
 pub fn is_status(e: &anyhow::Error, status: u16) -> bool {
-    e.chain().any(|c| c.downcast_ref::<HttpError>().is_some_and(|h| h.status == status))
+    e.chain().any(|c| {
+        c.downcast_ref::<HttpError>().is_some_and(|h| h.status == status)
+            || c.downcast_ref::<Explained>().is_some_and(|h| h.status == status)
+    })
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+
+    #[test]
+    fn upload_limit_in_one_sentence() {
+        let e: anyhow::Error = HttpError { status: 429, detail: "too many uploads; try again in 1345 seconds".into() }.into();
+        let e = explain_upload(e);
+        assert_eq!(
+            format!("{e:#}"),
+            "You've sent a lot of photos and videos in the last hour. Try again in about 23 minutes."
+        );
+        assert!(is_status(&e, 429));
+        let e = explain_upload(HttpError { status: 429, detail: "try again in 30 seconds".into() }.into());
+        assert!(format!("{e:#}").ends_with("Try again in a minute."));
+        let e = explain_upload(HttpError { status: 429, detail: "slow down".into() }.into());
+        assert!(format!("{e:#}").ends_with("Try again later."));
+        let e = explain_upload(HttpError { status: 413, detail: "too big".into() }.into());
+        assert_eq!(format!("{e:#}"), "server said 413: too big");
+    }
 }
 
 /// The relay refused an event because a newer group key exists (POST /events -> 409).

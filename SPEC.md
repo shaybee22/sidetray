@@ -156,7 +156,7 @@ All endpoints are HTTPS under `/api/v1`, authenticated with a per-device bearer 
 | GET | /media/{id} | member | Download encrypted media |
 | WS | /ws | member | Server pushes `new_event`, `join_request`, `key_rotated`, `removed` |
 
-Rate limits for the MVP: 30 events/minute and 50 MB of media/hour per device.
+Rate limits for the MVP: 30 events/minute and 150 MB of media/hour per device (50 until 0.4.0 added videos).
 
 ## Build phases
 
@@ -201,7 +201,7 @@ Private one-to-one conversations (text and photos) between two members, relayed 
 - Photos use `POST /media` as today, but a message's media is readable only by the participants' devices (`GET /media/{id}` checks the message's device list).
 - `/ws` pushes `{"type": "new_dm", "seq"}` to the recipient's devices and the sender's other devices only.
 - **Pruning, participants only**: a message and its media are deleted once every device in its `dm_keys` has acked it, or when it passes the retention window. Other members' devices don't count, unlike the feed.
-- Rate limits shared with posts (30 events/minute, 50 MB media/hour per device).
+- Rate limits shared with posts (30 events/minute, 150 MB media/hour per device).
 
 **Client**
 
@@ -631,8 +631,8 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
 - **Issues found in 9c, for after 9c** (not fixed):
   - Flip/unfold re-creates the activity and reloads the page (Signal carries over without a reload). Drafts (post and DM), the tab and the open chat are restored; the chat reopens scrolled to the top (oldest messages) and the feed's scroll position is lost; a playing video stops.
   - Android's own fullscreen button shows greyed out in the video controls.
-  - "You asked for a video." under one's own request is hard to read in the sender's (teal) bubble.
-  - The relay's 429 message reads awkwardly in the composer ("…Try again later.: server said 429: too many uploads…; try again in 1345 seconds").
+  - "You asked for a video." under one's own request is hard to read in the sender's (teal) bubble. *Fixed before 0.4.0.*
+  - The relay's 429 message reads awkwardly in the composer ("…Try again later.: server said 429: too many uploads…; try again in 1345 seconds"). *Fixed before 0.4.0: "You've sent a lot of photos and videos in the last hour. Try again in about N minutes."*
 - **9c checkpoint 5 done (Share → Side Tray with videos), waiting for the go-ahead.** `video/*` in the `SEND` and `SEND_MULTIPLE` filters; `SideTrayAndroid.receive` passes the first video's URI (not copied) as `video` and counts what it leaves out (`left_out`: other videos and pictures); `ShareView::Ready` carries both; the share dialog says "a video" and, once a destination is chosen, the post or DM composer stages it with the usual flow. Also: the phone composer's Photos, Camera and Video buttons are icon-only (`icon-on-phone`), so Post stays on their line; the share dialog's notes are shown after the pictures load (loading them cleared the error line, so "One video at a time…" and the existing "wasn't a picture" note never showed); a share with no text no longer adds blank lines to a draft. Tested on the razr with the Files app (a test folder, deleted afterwards):
   - One video → "a video", to Alex → the DM composer staged it (720×1280, 20 s, 6.8 MB) and it was sent; Alex played it.
   - The 90 s video → the feed → "Use the first 60 seconds?" (real tap) → 854×480, 60.02 s, posted; Alex has it.
@@ -657,7 +657,7 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
   - `SIDETRAY_HISTORY_DAYS=0` and feed photos: 9a.
   - Not checked: tone-mapping of a real HDR recording (only a synthetic HLG clip).
 - The razr is left on the local test build (`SIDETRAY_WEBVIEW_DEBUG` on, phase-9-video, signed with the release key), with its settings restored.
-- **Upload limit** (`SIDETRAY_MEDIA_MB_PER_HOUR`, 50): per device, a sliding 60-minute window over the encrypted bytes of every upload (photos, posters, videos, avatars), in memory (a relay restart clears it). A video is up to about 9.5 MB, so 50 MB is about five videos an hour from one phone, which the checkpoint 5 tests hit. Proposed (not changed): 150 MB per hour per device, about 15 full-size clips or 10 clips and a few dozen photos. Abuse protection stays: 10 MB per file, the 2 GB per group and 5 GB per server video caps with the 507, and one device needs over 13 hours to fill a group's 2 GB. Possibly later: a per-group hourly ceiling (new code) if several devices in one group are a concern.
+- **Upload limit** (`SIDETRAY_MEDIA_MB_PER_HOUR`, 50 before 0.4.0, now 150): per device, a sliding 60-minute window over the encrypted bytes of every upload (photos, posters, videos, avatars), in memory (a relay restart clears it). A video is up to about 9.5 MB, so 50 MB is about five videos an hour from one phone, which the checkpoint 5 tests hit. Changed to 150 MB per hour per device, in the relay and in install.sh (which adds it to an existing .env that has no value), about 15 full-size clips or 10 clips and a few dozen photos. Abuse protection stays: 10 MB per file, the 2 GB per group and 5 GB per server video caps with the 507, and one device needs over 13 hours to fill a group's 2 GB. Possibly later: a per-group hourly ceiling (new code) if several devices in one group are a concern.
 - Next: the user's review; then merge and release are the user's call. After 9c: the issues listed above.
 
 ## Distribution and later
