@@ -1208,6 +1208,9 @@ mod tests {
         assert_eq!(l.image.as_deref(), Some(media_url(&format!("link/{pid}.webp")).as_str()));
         let webp = crate::link::image(&f.conn, &pid).unwrap();
         assert_eq!(&webp[8..12], b"WEBP");
+        // What a click opens: the stored address, checked again.
+        assert_eq!(crate::link::to_open(&f.conn, &pid).unwrap(), "https://www.example.org/story?id=7");
+        assert!(crate::link::to_open(&f.conn, "0123456789abcdef0123456789abcdef").is_err());
         // Text only, and no picture: still a card.
         let (p, _) = f.event("post", serde_json::json!({ "text": "https://example.org", "link": { "url": "https://example.org", "title": "Home" } }));
         f.apply(&p).unwrap();
@@ -1276,6 +1279,7 @@ mod tests {
         f.apply(&del).unwrap();
         assert_eq!(previews(&f), 0);
         assert!(crate::link::image(&f.conn, &pid).is_none());
+        assert!(crate::link::to_open(&f.conn, &pid).is_err());
         // The post event arriving again (another page of the log) doesn't bring it back.
         f.apply(&p).unwrap();
         assert_eq!(previews(&f), 0);

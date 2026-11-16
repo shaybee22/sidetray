@@ -198,6 +198,36 @@ html.mobile #video-viewer .lightbox-close { top: calc(12px + var(--sat)); z-inde
 .tag { display: inline-block; font-size: .72rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 1px 8px; vertical-align: middle; }
 .post-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 1rem; }
 .post-text:empty { display: none; }
+
+/* Link previews (Phase 10): a post's card, and the composer's. */
+.link-card {
+  display: block; width: 100%; margin-top: 10px; padding: 0; text-align: left;
+  font: inherit; font-weight: normal; white-space: normal; color: var(--text);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+}
+button.link-card { cursor: pointer; }
+button.link-card:hover { border-color: var(--muted); }
+button.link-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.link-card img { display: block; width: 100%; height: auto; max-height: 360px; object-fit: cover; background: var(--line); }
+.link-card .link-body { padding: 8px 12px 10px; min-width: 0; }
+.link-card .link-title, .link-card .link-desc {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere;
+}
+.link-card .link-title { font-weight: 600; line-height: 1.35; }
+.link-card .link-desc { color: var(--muted); font-size: .9rem; margin-top: 2px; }
+.link-card .link-site { color: var(--muted); font-size: .8rem; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link-card.side { display: flex; align-items: stretch; }
+.link-card.side img { width: 110px; min-height: 96px; max-height: 140px; flex: none; }
+.link-card.side .link-body { flex: 1; align-self: center; }
+.composer-link { position: relative; }
+.composer-link .link-body { padding-right: 40px; }
+.composer-link.loading { padding: 10px 12px; color: var(--muted); font-size: .9rem; }
+.composer-link .link-x {
+  position: absolute; top: 6px; right: 6px; min-height: 0; width: 26px; height: 26px; padding: 0;
+  justify-content: center; line-height: 1; border-radius: 999px; border: none; font-size: .9rem;
+  background: rgba(0,0,0,.6); color: #fff;
+}
+@media (pointer: coarse) { .composer-link .link-x { width: 30px; height: 30px; font-size: 1rem; } }
 .photos { display: grid; gap: 4px; margin-top: 10px; border-radius: 10px; overflow: hidden; }
 .photos:empty { display: none; }
 .photos.n1 { grid-template-columns: 1fr; }

@@ -632,6 +632,21 @@ pub fn image(conn: &rusqlite::Connection, post_id: &str) -> Option<Vec<u8>> {
     .flatten()
 }
 
+/// The address to open for a post's card (`open_link`): only one stored with a
+/// post that isn't deleted, checked again, and as the URL parser writes it.
+pub fn to_open(conn: &rusqlite::Connection, post_id: &str) -> Result<String> {
+    let url: String = conn
+        .query_row(
+            "SELECT l.url FROM link_previews l JOIN posts p ON p.id = l.post_id WHERE l.post_id = ?1 AND p.deleted = 0",
+            [post_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("that link isn't in this app's archive"))?;
+    let u = parse(&url)?;
+    check_url(&u, false)?;
+    Ok(u.to_string())
+}
+
 /// The host a link goes to, without "www.", for the card.
 pub fn host(url: &str) -> String {
     let h = Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();

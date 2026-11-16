@@ -1029,6 +1029,7 @@ function renderPost(p) {
   $(".when", el).textContent = when(p.created_at) + (p.edited ? " · edited" : "");
   $(".when", el).title = new Date(p.created_at * 1000).toLocaleString();
   $(".post-text", el).textContent = p.text;
+  if (p.link) $(".post-text", el).after(renderLinkPreview(p));
 
   const photos = $(".photos", el);
   const n = p.photos.length;
@@ -1112,6 +1113,58 @@ function renderPost(p) {
     });
   }
   return el;
+}
+
+/**
+ * A link preview card's contents (Phase 10): the picture, title, description,
+ * and "site · host". The host comes from the address itself, so a card can't
+ * pretend to go somewhere else. Everything is plain text.
+ */
+function fillLinkCard(card, l) {
+  if (l.image) {
+    const img = document.createElement("img");
+    img.src = l.image;
+    img.alt = "";
+    img.loading = "lazy";
+    img.draggable = false;
+    if (l.width && l.height) {
+      img.width = l.width;
+      img.height = l.height;
+      // Squarish pictures sit beside the text, wide ones above it.
+      if (l.width / l.height < 1.3) card.classList.add("side");
+    }
+    card.append(img);
+  }
+  const body = document.createElement("div");
+  body.className = "link-body";
+  const title = document.createElement("div");
+  title.className = "link-title";
+  title.textContent = l.title;
+  body.append(title);
+  if (l.description) {
+    const d = document.createElement("div");
+    d.className = "link-desc";
+    d.textContent = l.description;
+    body.append(d);
+  }
+  const site = document.createElement("div");
+  site.className = "link-site";
+  site.textContent = l.site && l.site.toLowerCase() !== l.host.toLowerCase() ? `${l.site} · ${l.host}` : l.host;
+  body.append(site);
+  card.append(body);
+}
+
+/** A post's link card: opens the link in the system browser. */
+function renderLinkPreview(p) {
+  const card = document.createElement("button");
+  card.type = "button";
+  card.className = "link-card";
+  card.title = p.link.url;
+  fillLinkCard(card, p.link);
+  card.addEventListener("click", () => {
+    invoke("open_link", { postId: p.id }).catch((e) => showError($("#cp-err"), e));
+  });
+  return card;
 }
 
 function renderPhoto(ph, large) {
@@ -1383,6 +1436,7 @@ class Attachments {
   render() {
     saveDraftsSoon();
     if (!this.box) return;
+    if (this.box.id === "cp-photos") linkChanged(); // photos and a link card don't mix
     this.box.replaceChildren(...this.items.map((s) => {
       const item = document.createElement("div");
       item.className = "staged-item" + (s.preview ? "" : " busy");
@@ -1537,6 +1591,7 @@ class VideoSlot {
 
   render() {
     const box = this.box;
+    if (box.id === "cp-video") linkChanged(); // nor do a video and a link card
     box.hidden = !this.prep && !this.v;
     if (this.prep) {
       const wrap = document.createElement("div");
@@ -2002,10 +2057,12 @@ $("#composer").addEventListener("submit", async (ev) => {
     $("#cp-post").textContent = photos.length || video ? "Uploading…" : "Posting…";
     uploadingSlot = video ? postVideo : null;
     try {
-      await invoke("create_post", { text, photos, video });
+      const link = await linkForPost(text);
+      await invoke("create_post", { text, photos, video, link });
       $("#cp-text").value = "";
       postTray.sent();
       postVideo.sent();
+      resetLinkCard();
       await loadFeed();
     } catch (e) {
       postVideo.upload = null;
@@ -2020,6 +2077,127 @@ $("#composer").addEventListener("submit", async (ev) => {
 $("#cp-text").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("#composer").requestSubmit();
 });
+
+// --- link preview in the composer (Phase 10) --------------------------------------------
+
+/**
+ * The first link in the post's text gets a preview card under the textarea,
+ * fetched by this device only (preview_link). × means that address isn't
+ * previewed again in this draft. A failed fetch shows nothing: the post goes
+ * out as text. No card with photos or a video.
+ */
+const linkCard = {
+  url: null,       // the address the card is for
+  tried: false,    // its preview was asked for (it may have failed)
+  staged: null,    // what preview_link returned
+  loading: null,   // the request, while it runs
+  seq: 0,          // answers to older requests are thrown away
+  noPreview: new Set(),
+  timer: null,
+};
+
+/** How long after typing stops the text is looked at, and how long Post waits for a preview. */
+const LINK_DEBOUNCE_MS = 700;
+const LINK_POST_WAIT_MS = 3000;
+
+function linkBlocked() {
+  return postTray.items.length > 0 || postVideo.busy;
+}
+
+function checkLinkSoon(ms) {
+  clearTimeout(linkCard.timer);
+  linkCard.timer = setTimeout(checkLink, ms);
+}
+
+/** Photos or a video came or went: show or hide the card (and fetch, if it's now allowed). */
+function linkChanged() {
+  queueMicrotask(() => checkLinkSoon(0));
+}
+
+async function checkLink() {
+  let url = null;
+  try { url = await invoke("link_in_text", { text: $("#cp-text").value }); } catch (_) {}
+  if (!url || linkCard.noPreview.has(url)) {
+    dropLink();
+  } else if (url !== linkCard.url) {
+    dropLink();
+    linkCard.url = url;
+  }
+  if (linkCard.url && !linkCard.tried && !linkBlocked()) fetchLink(linkCard.url);
+  renderLinkCard();
+}
+
+function fetchLink(url) {
+  const seq = ++linkCard.seq;
+  linkCard.tried = true;
+  linkCard.loading = invoke("preview_link", { url })
+    .then((r) => {
+      if (seq === linkCard.seq) linkCard.staged = r;
+      else invoke("unstage_link", { id: r.id }).catch(() => {});
+    })
+    .catch((e) => { if (seq === linkCard.seq) console.warn("no link preview", e); })
+    .finally(() => {
+      if (seq !== linkCard.seq) return;
+      linkCard.loading = null;
+      renderLinkCard();
+    });
+}
+
+/** Forget the card (the link left the text, or another one is first now). */
+function dropLink() {
+  if (linkCard.staged) invoke("unstage_link", { id: linkCard.staged.id }).catch(() => {});
+  linkCard.seq++;
+  Object.assign(linkCard, { url: null, tried: false, staged: null, loading: null });
+}
+
+/** The draft is gone (posted, or discarded): start over. */
+function resetLinkCard() {
+  dropLink();
+  linkCard.noPreview.clear();
+  renderLinkCard();
+}
+
+/** The preview to send with the post: waits a little for one still loading. */
+async function linkForPost(text) {
+  if (linkBlocked() || !linkCard.url) return null;
+  if (linkCard.loading) await Promise.race([linkCard.loading, new Promise((r) => setTimeout(r, LINK_POST_WAIT_MS))]);
+  const s = linkCard.staged;
+  return s && text.includes(s.url) ? s.id : null;
+}
+
+function renderLinkCard() {
+  const box = $("#cp-link");
+  const show = linkCard.url && !linkBlocked() && (linkCard.loading || linkCard.staged);
+  box.hidden = !show;
+  if (!show) return box.replaceChildren();
+  if (!linkCard.staged) {
+    const card = document.createElement("div");
+    card.className = "link-card composer-link loading";
+    card.textContent = "Loading preview…";
+    return box.replaceChildren(card);
+  }
+  const card = document.createElement("div");
+  card.className = "link-card composer-link";
+  fillLinkCard(card, linkCard.staged);
+  const x = document.createElement("button");
+  x.type = "button";
+  x.className = "link-x";
+  x.textContent = "×";
+  x.setAttribute("aria-label", "Remove the link preview");
+  x.title = "Post without a preview";
+  x.addEventListener("click", () => {
+    linkCard.noPreview.add(linkCard.url);
+    dropLink();
+    renderLinkCard();
+    saveDraftsSoon();
+  });
+  card.append(x);
+  box.replaceChildren(card);
+}
+
+$("#cp-text").addEventListener("input", () => checkLinkSoon(LINK_DEBOUNCE_MS));
+// A paste is a whole link at once: look straight away (once the text is in).
+$("#cp-text").addEventListener("paste", () => checkLinkSoon(0));
 
 // --- Key Master ---------------------------------------------------------------------------
 
@@ -2257,6 +2435,7 @@ async function letGoOfDrafts() {
     if (!yes) return false;
   }
   $("#cp-text").value = "";
+  resetLinkCard();
   postTray.clear();
   dmTray.clear();
   postVideo.clear();
@@ -3435,7 +3614,7 @@ function saveDrafts() {
   const chatOpen = chatWith && !$("#dm-chat-view").hidden;
   const d = {
     view: { tab: $(".tab[aria-selected=true]")?.dataset.tab || "feed", chat: chatOpen ? chatWith : null },
-    post: { text: $("#cp-text").value, photos: ids(postTray) },
+    post: { text: $("#cp-text").value, photos: ids(postTray), noPreview: [...linkCard.noPreview] },
     dm: draftFor ? { member: draftFor, text: $("#dm-text").value, photos: ids(dmTray) } : null,
     comments,
   };
@@ -3460,7 +3639,8 @@ async function restoreDrafts() {
       tray.render();
     };
     if (!$("#cp-text").value) $("#cp-text").value = d.post.text || "";
-    fill(postTray, d.post.photos);
+    linkCard.noPreview = new Set(d.post.noPreview || []);
+    fill(postTray, d.post.photos); // and that looks at the text's link again
     if (d.dm) {
       draftFor = d.dm.member;
       $("#dm-text").value = d.dm.text || "";

@@ -68,6 +68,9 @@ tauri-plugin-updater = "2.14.1"
 # file's path and never moves the whole file through the webview. Called from
 # Rust only; the webview gets no dialog permission.
 tauri-plugin-dialog = "2"
+# A link preview's card opens its address in the system browser (Phase 10).
+# Called from Rust only, with an address from the archive; the webview can't open anything.
+open = "5"
 
 # Android: the device's secrets are wrapped by a Keystore key, reached over JNI.
 [target.'cfg(target_os = "android")'.dependencies]
