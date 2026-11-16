@@ -660,6 +660,194 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
 - **Upload limit** (`SIDETRAY_MEDIA_MB_PER_HOUR`, 50 before 0.4.0, now 150): per device, a sliding 60-minute window over the encrypted bytes of every upload (photos, posters, videos, avatars), in memory (a relay restart clears it). A video is up to about 9.5 MB, so 50 MB is about five videos an hour from one phone, which the checkpoint 5 tests hit. Changed to 150 MB per hour per device, in the relay and in install.sh (which adds it to an existing .env that has no value), about 15 full-size clips or 10 clips and a few dozen photos. Abuse protection stays: 10 MB per file, the 2 GB per group and 5 GB per server video caps with the 507, and one device needs over 13 hours to fill a group's 2 GB. Possibly later: a per-group hourly ceiling (new code) if several devices in one group are a concern.
 - Next: the user's review; then merge and release are the user's call. After 9c: the issues listed above.
 
+## Phase 10: Link previews
+
+A post with a link to a web page or a YouTube video shows a preview card under its text: picture, title, description and site, like Facebook. The person posting fetches the preview once, at compose time, and it travels inside the encrypted post. The relay and the readers' devices never contact the linked site, and the relay doesn't change.
+
+**Scope**: feed posts only. Not comments, not direct messages, and URLs in text don't become clickable. A post with photos or a video has no preview: photos, a video and a link card are mutually exclusive, the same way photos and a video already are.
+
+**Payload**
+
+The post event gets one more optional field, next to `photos` and `video`:
+
+```
+{"text": str, "photos"?: [...], "video"?: {...}, "link"?: {"url", "title", "description"?, "site"?, "image"?, "width"?, "height"?}}
+```
+
+- `url`: the address as written in the post's text (surrounding punctuation trimmed), http or https, at most 2048 bytes, no `user:pass@`. It has to appear in `text`, so the card can never point somewhere the text doesn't show.
+- `title`: required, 1–300 characters. `description`: at most 500. `site`: at most 100 (`og:site_name`; "YouTube" for YouTube). Plain text: the sender collapses whitespace and removes control characters.
+- `image`: base64 of a WebP thumbnail, at most 48 KiB decoded, longest side at most 600 px. `width` and `height` are required with it and must match the decoded image.
+- A post that also has `photos` or `video` keeps those and drops `link`.
+
+**What older apps see**: `PostBody` (`feed.rs`) is a plain `#[derive(Deserialize)]` with no `deny_unknown_fields`, the same reason 0.3.x apps ignore `video`. So 0.4.x and earlier drop `link` and show the text, URL included, as plain text. They have no size limit on a post's payload, so the bigger event is fine there too. A link post always has text (the URL is in it), so unlike a video-only post, an old app never shows an empty post.
+
+**Why the thumbnail is inline, and the size budget**
+
+The picture goes inside the payload, not through `POST /media`. So upload, `download_media`, `video::fetch_thumbs`, the Phase 9 per-file acks (`ack_media`, `media_acks_pending`) and the relay's prune rules are all untouched. A link post has no `media_ids`, so the relay prunes it like a text post, and the preview goes with its event.
+
+- Worst case on the wire: 48 KiB of WebP is about 64 KiB as base64 in the JSON, and about 86 KiB once the ciphertext is base64 in the event.
+  - Caddy's `request_body` limit is 12 MB.
+  - `EventIn` (`server/app/main.py`) has no ciphertext cap; only direct messages have one, 256 KB.
+  - Events are stored as SQLite blobs, and `/ws` pushes carry only the seq.
+  - The relay needs no change.
+- Rate limits: 30 events a minute still applies. Inline bytes don't count toward the 150 MB/hour upload limit, but 30 × 86 KiB a minute is small.
+- The one thing to watch: `GET /events` returns up to 500 events a page, and the client allows each request 30 s (`api.rs`).
+  - A page made entirely of link posts would be about 43 MB. A new member's 14-day backlog realistically holds a few dozen links, a few MB, so this is fine.
+  - If it ever bites, the client can ask for smaller pages (`limit=`, which the relay already supports) without a server change.
+- The sender aims for about 20–35 KiB: 600 px at WebP quality 70. If that's over 48 KiB, it tries quality 50, then 400 px at quality 50, and otherwise sends the card without a picture.
+
+**Fetching (sender's device, new `link.rs`)**
+
+- **Commands**:
+  - `preview_link(url)`, called by the composer, returns a staged preview `{id, url, title, description, site, image, width, height}`. `image` is a `data:` URL for the composer; the reply is a ~50 KB JSON string, nothing like the large binary replies Android's IPC can't carry.
+  - The preview is kept in the `App` next to `staged` and `staged_videos` (`staged_links`). `unstage_link(id)` drops it.
+  - `create_post(text, photos, video, link)` takes the staged id. An unknown id, photos or a video mean no `link`, and the post still goes out.
+- **YouTube** (`youtube.com`, `www.`, `m.`, `youtu.be`):
+  - `GET https://www.youtube.com/oembed?format=json&url=<url>`, at most 64 KiB of JSON.
+  - `title` → title, `author_name` → description, site "YouTube", `thumbnail_url` → image (fetched with the same guards).
+  - If oEmbed fails (a private or removed video), there's no preview.
+  - The YouTube page itself is never scraped: it's huge, and in Europe it redirects to a consent page.
+- **Everything else**:
+  - `GET` the page. Only `text/html` or `application/xhtml+xml` is read, at most 512 KiB, stopping at `</head>` or `<body`.
+  - A small hand-written scanner (no HTML crate) reads `<meta>` tags (`property`/`name` and `content`, quoted or bare, any case) and `<title>`.
+  - It skips comments, `<script>` and `<style>`, and decodes the usual entities (`&amp; &lt; &gt; &quot; &#39; &nbsp;` and numeric ones).
+  - title: `og:title`, then `twitter:title`, then `<title>`
+  - description: `og:description`, then `twitter:description`, then `<meta name=description>`
+  - site: `og:site_name`
+  - image: `og:image`, then `twitter:image`, then `twitter:image:src`, resolved against the final URL after redirects; http or https only
+  - No title means no preview. The page is read as UTF-8 (lossy); other charsets are under "Later".
+- **The picture** goes through `photo.rs`, where a new `link_image()` sits next to `poster()`.
+  - It reuses `decode` (EXIF orientation applied, animated images keep their first frame), `fit` and `encode_webp`, so nothing from the original file survives.
+  - At most 5 MiB is downloaded.
+  - Decoding uses `image::Limits` (6000 px a side, a memory cap), so a decompression bomb can't exhaust a phone.
+  - A picture that won't decode means a card without a picture. SVG isn't supported.
+- **Guards**, on a `reqwest` client used only for previews:
+  - http and https only, no `user:pass@`; `localhost` and `*.localhost` refused by name.
+  - A custom DNS resolver (`ClientBuilder::dns_resolver`) drops every loopback, private, link-local, CGNAT, unspecified, broadcast, multicast and documentation address: 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, 0/8, 198.18/15, ::1, ::, fc00::/7, fe80::/10, ff00::/8, and IPv4-mapped or NAT64 addresses that embed one of those. reqwest connects only to what's left, so DNS rebinding can't reach the LAN. This needs tokio's `net` feature (0.4.0 has `process`, `io-util`, `fs` and `rt`, but not `net`).
+  - IP-literal hosts skip the resolver, so the URL and every redirect hop are checked directly by a custom `redirect::Policy`, which also allows at most 5 redirects.
+  - `no_proxy()`: through a proxy, the resolver check wouldn't apply.
+  - No cookies; 5 s to connect; 10 s overall for the page and picture together; an honest `User-Agent: SideTray/<version> (link preview)`.
+  - Sites that serve nothing to non-crawlers (X, Instagram, Facebook, some shops) just get no preview.
+- **Sharing with `download_image()`** (`lib.rs`):
+  - The streaming read with a byte cap becomes one shared helper.
+  - `stage_photo_url` keeps its own client and behaves as before, because it fetches what the person dragged in on purpose, including pictures from their own network.
+  - Previews fetch on their own, from text, so only they get the address guards.
+- **Privacy**: the linked site sees the sender's IP address when the preview is fetched. That happens while they compose, even if they never post. Nobody else contacts the site.
+
+**Receiving (`apply_event`)**
+
+- The post is stored as today. Then `link` is checked:
+  - the URL: scheme, length, no user info, and it appears in `text`
+  - the text lengths
+  - the picture: valid base64, `RIFF…WEBP` magic, decodes as WebP with the image crate, its size matches `width` and `height`, and it's within 600 px
+- A bad `link`, or one on a post with photos or a video, is dropped whole (`Ok(false)`, like `video::store_ref`). The post still shows, and the event isn't counted as rejected.
+- A `delete` removes the preview in the same transaction as the post's comments and reactions.
+- An `edit` changes only the text. The preview stays as it was posted (there's no edit button in the UI today).
+
+**Local database (`db.rs`)**
+
+A new table, created with `CREATE TABLE IF NOT EXISTS` like `videos`, so existing archives get it on the next start; no `add_column` is needed:
+
+```sql
+-- Phase 10: a post's link preview, as its author sent it.
+CREATE TABLE IF NOT EXISTS link_previews (
+    post_id      TEXT PRIMARY KEY,      -- the post's event id
+    url          TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    description  TEXT,
+    site         TEXT,
+    image        BLOB,                  -- the WebP thumbnail, NULL: no picture
+    width        INTEGER,
+    height       INTEGER
+);
+```
+
+The picture is a blob in the row, not a file in `media/`. A delete is then one `DELETE` in the event's transaction, with no file left behind for `remove_deleted_media`, nothing to ack and no download state. Leaving a group deletes it with the database.
+
+**Serving it to the webview**
+
+- `serve_media` gets a third path next to `<id>.webp` and `<id>.mp4`: `media://localhost/link/<post_id>.webp` (`http://media.localhost/link/...` on Windows and Android).
+  - It returns the blob for a post that isn't deleted, as `image/webp` with `nosniff` and the same immutable cache header as photos (a post id is a hash of its content).
+  - `<post_id>` must be 32 hex characters. Photo and video file names can't contain `/`, so there's no collision.
+- `PostView` gets `link: Option<LinkView>`: `{url, host, title, description, site, image (that URL or null), width, height}`. `host` is worked out on the receiving device from `url`, with `www.` stripped.
+- No CSP change: `img-src` already allows the media scheme and `data:`. No remote images, ever.
+
+**Opening the link**
+
+- A new command, `open_link(post_id)`, looks up the post's preview URL in `link_previews`, re-parses it (http or https, no user info, at most 2048 bytes) and opens it. The webview can only open links that are in a stored post, never an arbitrary address.
+- Desktop: the `open` crate, as a desktop-only dependency called from Rust only (like `tauri-plugin-dialog` in 9b). It uses `ShellExecuteW` on Windows and `xdg-open` on Linux (argv, not a shell), given the re-serialized URL.
+- Android: `android::open_link(url)` calls `call_string("openLink", &[url])`, which runs a new `SideTrayAndroid.openLink(url)` next to `openNotificationSettings`, in the same style:
+  - `Intent(ACTION_VIEW, uri)` with `CATEGORY_BROWSABLE` and `FLAG_ACTIVITY_NEW_TASK`, started on the UI thread
+  - `"no_browser"` on `ActivityNotFoundException`
+  - a YouTube link may open the YouTube app, which is intended
+  - no manifest change: `startActivity` doesn't need a `<queries>` entry
+- No new webview permissions, no opener plugin capability, no `<a href>` navigation in the page.
+
+**Composer**
+
+- **Finding the URL**: the first `http(s)://` URL in `#cp-text` is looked up 700 ms after typing stops, and straight away after a paste. Trailing `.,;:!?'"` and an unbalanced closing bracket are trimmed. Only one URL gets a preview.
+- **The card**: while it loads, a small "Loading preview…" card sits under the textarea, where `#cp-photos` and `#cp-video` go. Once loaded it shows picture, title, description and host, with an × to remove it. A failed fetch removes the card and says nothing.
+- **Stale answers**: a newer request replaces an older one, and a late answer for a URL that's no longer first in the text is thrown away. If the URL leaves the text, the card goes.
+- **×** adds the URL to a per-draft `noPreview` list, and it isn't previewed again until the draft is posted or discarded. The list is saved with the phone's draft (`saveDrafts`, `post.noPreview`); after a page rebuild the preview is fetched again.
+- **Photos or a video**: with photos staged, or a video staged or preparing (`postTray`, `postVideo`), nothing is fetched and the card is hidden. Removing them brings it back.
+- **Post**: if a preview is still loading, the post waits for it at most 3 s more, then goes out without it.
+- **Discarding**: `letGoOfDrafts` (switching groups) and a sent post drop the staged preview (`unstage_link`), like photos and videos.
+- **Shared links**: a link shared from another app (Android share puts title and URL into the composer) gets a preview the same way.
+
+**Feed**
+
+- The card sits under the post text (a `.link-card` in `tpl-post`, filled by `renderPost`). It shows:
+  - the picture, full width at its aspect ratio, if it has one
+  - the title (bold, two lines at most)
+  - the description (two lines, muted)
+  - "site · host", or just the host when there's no site
+- All of it is set through `textContent`.
+- The whole card is a `<button>` that calls `open_link(post.id)`, with a tooltip showing the full URL.
+- The host shown always comes from the URL, not from `site`, so a forged "PayPal" card still says where it really goes.
+
+**Files to touch**
+
+- new `link.rs` (fetch, guards, scanner, YouTube)
+- `feed.rs` (`PostBody.link`, checks and storage in `apply_event`, delete, `PostView.link`, `create_post`)
+- `db.rs` (the table)
+- `photo.rs` (`link_image`)
+- `state.rs` (`staged_links`)
+- `lib.rs` (`preview_link`, `unstage_link`, `open_link`, the `create_post` argument, `serve_media`, the shared capped download)
+- `android.rs` and `SideTrayAndroid.kt` (`openLink`)
+- `Cargo.toml` (tokio `net`; `open` for desktop)
+- `app/ui/app.js`, `index.html`, `style.css`
+- `README.md` ("Event payloads"), `CHANGELOG.md`
+
+**Done when**:
+
+- A YouTube link and a news article each post with a card from Windows and from the razr, and the card shows on the other devices.
+- Clicking the card opens the system browser on Windows, and the YouTube app or the browser on the razr.
+- × in the composer keeps that URL from being previewed again in that draft.
+- A post with photos, or with a video, has no card.
+- These get no preview: a link to `http://192.168.1.1`, a link to `http://localhost:8000`, and a public URL that redirects to a private address.
+- A capture on a receiving device shows no traffic to the linked site.
+- A 0.4.0 app shows the same post as plain text.
+- Deleting the post removes its `link_previews` row.
+- Unit tests:
+  - the meta scanner: OG, twitter and `<title>` fallbacks, entities, attribute quoting, scripts and comments skipped, the 512 KiB cut
+  - URL extraction and trimming
+  - the address filter: every range above, plus mapped IPv6
+  - YouTube URL detection
+  - `apply_event` dropping a bad `link` while keeping the post: wrong scheme, URL not in the text, oversized text, a non-WebP image, wrong dimensions, over 48 KiB, alongside photos or a video
+  - delete removing the preview
+  - the image budget steps
+
+**Later**
+
+- Previews in comments and direct messages; clickable URLs in text; URLs without a scheme (`example.com`).
+- Pages in other charsets (reqwest's `charset` feature, `encoding_rs`).
+- Re-encoding received preview pictures (and photos and poster frames) on the receiving device, so a crafted WebP from a member can't reach the webview's decoder.
+- Cropping the black bars off YouTube's 4:3 `hqdefault` thumbnails, or using `maxresdefault` when it exists.
+- A setting to turn previews off (typing a URL contacts that site).
+- Direct links to an image or PDF.
+- Picking which URL to preview when there are several.
+- A relay cap on feed event ciphertext size, like `MAX_DM_CIPHERTEXT` (a server change).
+
 ## Distribution and later
 
 **Distribution**

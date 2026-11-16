@@ -1082,7 +1082,7 @@ it without breaking the signature.
 
 | kind | payload |
 | --- | --- |
-| post | `{"text", "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}], "video"?: {"id", "digest", "thumb", "thumb_digest", "width", "height", "duration_ms", "size"}}`, with media ids, and digests as base64 `blob_digest` of each encrypted blob. A video (Phase 9, at most one, never with photos) is an MP4 encrypted like a photo and uploaded with `?kind=video`; `thumb` is its poster frame, an ordinary photo |
+| post | `{"text", "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}], "video"?: {"id", "digest", "thumb", "thumb_digest", "width", "height", "duration_ms", "size"}}`, with media ids, and digests as base64 `blob_digest` of each encrypted blob. A video (Phase 9, at most one, never with photos) is an MP4 encrypted like a photo and uploaded with `?kind=video`; `thumb` is its poster frame, an ordinary photo. `"link"?: {"url", "title", "description"?, "site"?, "image"?, "width"?, "height"?}` (Phase 10) is a preview of a link in the text, fetched by the sender's device only: `url` as written in `text` (http or https, at most 2048 bytes), `title` at most 300 characters, `description` 500, `site` 100, `image` a base64 WebP of at most 48 KiB and 600 px a side, with its `width` and `height`. Never with photos or a video. A bad `link` is dropped and the post still shows; apps before Phase 10 ignore it |
 | comment | `{"post": event_id, "text", "photos"?: [...]}`. Photo references as in posts (0.1.1, at most 4); with photos the text may be empty |
 | reaction | `{"post": event_id, "emoji"}`. The latest one per member wins; `""` removes it |
 | edit | `{"post": event_id, "text"}`. Only the post's author |

@@ -22,6 +22,7 @@ mod device;
 mod dm;
 mod feed;
 mod invite;
+mod link;
 #[cfg(target_os = "android")]
 mod keystore;
 mod manage;
@@ -714,12 +715,9 @@ async fn download_image(url: &str) -> anyhow::Result<Vec<u8>> {
     if !resp.status().is_success() {
         bail!("couldn't download that picture (the site said {})", resp.status());
     }
-    let mut out = Vec::new();
-    while let Some(chunk) = resp.chunk().await.context("couldn't download that picture")? {
-        out.extend_from_slice(&chunk);
-        if out.len() > photo::MAX_INPUT_BYTES {
-            bail!("that picture is over {} MB", photo::MAX_INPUT_BYTES / 1024 / 1024);
-        }
+    let (out, whole) = link::read_capped(&mut resp, photo::MAX_INPUT_BYTES, |_| false).await.context("couldn't download that picture")?;
+    if !whole {
+        bail!("that picture is over {} MB", photo::MAX_INPUT_BYTES / 1024 / 1024);
     }
     Ok(out)
 }
@@ -952,8 +950,66 @@ fn staged_video(app: Active, id: String) -> Option<StagedVideoView> {
 }
 
 #[tauri::command]
-async fn create_post(app: Active, text: String, photos: Vec<String>, video: Option<String>) -> Res<()> {
-    feed::create_post(&app, &text, &photos, video.as_deref()).await.map_err(err)
+async fn create_post(app: Active, text: String, photos: Vec<String>, video: Option<String>, link: Option<String>) -> Res<()> {
+    feed::create_post(&app, &text, &photos, video.as_deref(), link.as_deref()).await.map_err(err)
+}
+
+// --- link previews (Phase 10) --------------------------------------------------------------
+
+/// The first link in the composer's text, the one that gets a preview.
+#[tauri::command]
+fn link_in_text(text: String) -> Option<String> {
+    link::first_url(&text).map(str::to_string)
+}
+
+#[derive(Serialize)]
+struct LinkStaged {
+    id: String,
+    url: String,
+    title: String,
+    description: Option<String>,
+    site: Option<String>,
+    host: String,
+    /// A data: URL, for the composer's card.
+    image: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+/// Staged previews kept at most; the composer has one at a time.
+const MAX_STAGED_LINKS: usize = 8;
+
+/// Fetch the preview for `url` and keep it until it's posted (`create_post`'s
+/// `link`) or dropped (`unstage_link`). An error means no preview; the
+/// composer says nothing.
+#[tauri::command]
+async fn preview_link(app: Active, url: String) -> Res<LinkStaged> {
+    let p = link::fetch(&url).await.map_err(err)?;
+    let mut idb = [0u8; 9];
+    getrandom::getrandom(&mut idb).map_err(|e| e.to_string())?;
+    let id: String = idb.iter().map(|b| format!("{b:02x}")).collect();
+    let view = LinkStaged {
+        id: id.clone(),
+        url: p.url.clone(),
+        title: p.title.clone(),
+        description: p.description.clone(),
+        site: p.site.clone(),
+        host: link::host(&p.url),
+        image: p.image.as_ref().map(|(webp, _, _)| format!("data:image/webp;base64,{}", B64.encode(webp))),
+        width: p.image.as_ref().map(|i| i.1),
+        height: p.image.as_ref().map(|i| i.2),
+    };
+    let mut staged = app.staged_links.lock().unwrap_or_else(|e| e.into_inner());
+    if staged.len() >= MAX_STAGED_LINKS {
+        staged.clear(); // left behind by a page that went away
+    }
+    staged.insert(id, p);
+    Ok(view)
+}
+
+#[tauri::command]
+fn unstage_link(app: Active, id: String) {
+    app.staged_links.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
 /// A downloaded (or sent) video's MP4, as raw bytes for a blob: URL.
@@ -1252,7 +1308,14 @@ fn serve_media(app: &App, path: &str, range: Option<&str>) -> tauri::http::Respo
         }
         return builder.status(404).body(Vec::new()).expect("static response parts are valid");
     }
-    let file = if name.strip_suffix(".webp").is_some_and(ok_stem) { std::fs::read(app.media_dir.join(name)).ok() } else { None };
+    // Phase 10: `link/<post id>.webp`, a link preview's picture, kept in the database.
+    let file = if let Some(post_id) = name.strip_prefix("link/").and_then(|n| n.strip_suffix(".webp")) {
+        link::image(&app.db(), post_id)
+    } else if name.strip_suffix(".webp").is_some_and(ok_stem) {
+        std::fs::read(app.media_dir.join(name)).ok()
+    } else {
+        None
+    };
     match file {
         Some(bytes) => builder
             .status(200)
@@ -1522,6 +1585,9 @@ pub fn run() {
             page_boot,
             photo_preview,
             create_post,
+            link_in_text,
+            preview_link,
+            unstage_link,
             add_comment,
             set_reaction,
             delete_post,

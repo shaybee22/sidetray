@@ -208,6 +208,19 @@ pub fn open(path: &Path) -> Result<Connection> {
     )?;
     // Phase 9c: tapped to download now, mobile data or not.
     add_column(&conn, "videos", "forced", "INTEGER NOT NULL DEFAULT 0")?;
+    // Phase 10: a post's link preview, as its author sent it.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS link_previews (
+            post_id      TEXT PRIMARY KEY,      -- the post's event id
+            url          TEXT NOT NULL,
+            title        TEXT NOT NULL,
+            description  TEXT,
+            site         TEXT,
+            image        BLOB,                  -- the WebP thumbnail, NULL: no picture
+            width        INTEGER,
+            height       INTEGER
+        );",
+    )?;
     Ok(conn)
 }
 

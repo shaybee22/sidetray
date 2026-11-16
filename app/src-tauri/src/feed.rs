@@ -4,7 +4,7 @@
 //!
 //! | kind     | payload |
 //! | -------- | ------- |
-//! | post     | `{"text": str, "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}], "video"?: {"id", "digest", "thumb", "thumb_digest", "width", "height", "duration_ms", "size"}}` |
+//! | post     | `{"text": str, "photos"?: [{"full", "full_digest", "thumb", "thumb_digest", "width", "height"}], "video"?: {"id", "digest", "thumb", "thumb_digest", "width", "height", "duration_ms", "size"}, "link"?: {"url", "title", "description"?, "site"?, "image"?, "width"?, "height"?}}` (`link`: Phase 10, a preview of a URL in `text`, never with photos or a video; `image` a base64 WebP, see link.rs) |
 //! | comment  | `{"post": event_id, "text": str}` |
 //! | reaction | `{"post": event_id, "emoji": str}` (empty emoji removes yours) |
 //! | edit     | `{"post": event_id, "text": str}` |
@@ -53,6 +53,10 @@ struct PostBody {
     /// Phase 9: at most one, never with photos (apps before it ignore the field).
     #[serde(default)]
     video: Option<crate::video::VideoRef>,
+    /// Phase 10: a link preview. Left as JSON here so a malformed one is
+    /// dropped on its own (link.rs) instead of failing the whole post.
+    #[serde(default)]
+    link: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -313,6 +317,10 @@ fn apply_event(
             if let Some(v) = &body.video {
                 crate::video::store_ref(conn, crate::video::Owner::Post { post_id: &event_id, key_version: e.key_version }, v, false)?;
             }
+            // Only with the post's first arrival (not a replay of a since-deleted one), and never with photos or a video.
+            if let Some(l) = body.link.as_ref().filter(|_| inserted > 0 && body.photos.is_empty() && body.video.is_none()) {
+                crate::link::store(conn, &event_id, l, &body.text)?;
+            }
             let text = match (&body.video, snippet(&body.text, body.photos.len())) {
                 (Some(_), t) if t.is_empty() => "shared a video".to_string(),
                 (_, t) => t,
@@ -386,6 +394,7 @@ fn apply_event(
             if n > 0 {
                 conn.execute("DELETE FROM comments WHERE post_id = ?1", params![b.post])?;
                 conn.execute("DELETE FROM reactions WHERE post_id = ?1", params![b.post])?;
+                conn.execute("DELETE FROM link_previews WHERE post_id = ?1", params![b.post])?;
                 // The files are removed by the next media pass (rows with no live post).
             }
             Ok(None)
@@ -733,7 +742,10 @@ async fn publish(app: &App, kind: &str, body: serde_json::Value, staged: &[Strin
     Ok(())
 }
 
-pub async fn create_post(app: &App, text: &str, staged: &[String], video: Option<&str>) -> Result<()> {
+/// `link`: a preview staged by `preview_link` (Phase 10). It goes with the post
+/// only when there are no photos or video and its URL is still in the text;
+/// otherwise the post goes out without it.
+pub async fn create_post(app: &App, text: &str, staged: &[String], video: Option<&str>, link: Option<&str>) -> Result<()> {
     let text = text.trim();
     if text.len() > MAX_TEXT {
         bail!("that post is too long");
@@ -747,7 +759,16 @@ pub async fn create_post(app: &App, text: &str, staged: &[String], video: Option
     if text.is_empty() && staged.is_empty() && video.is_none() {
         bail!("write something or add a photo");
     }
-    publish(app, "post", serde_json::json!({ "text": text }), staged, None, video).await
+    let mut body = serde_json::json!({ "text": text });
+    let preview = link.and_then(|id| app.staged_links.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned());
+    if let Some(p) = preview.filter(|p| staged.is_empty() && video.is_none() && text.contains(&p.url)) {
+        body["link"] = serde_json::to_value(p.to_ref())?;
+    }
+    publish(app, "post", body, staged, None, video).await?;
+    if let Some(id) = link {
+        app.staged_links.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    }
+    Ok(())
 }
 
 fn require_post(app: &App, post_id: &str) -> Result<String> {
@@ -811,6 +832,8 @@ pub struct PostView {
     pub edited: bool,
     pub photos: Vec<PhotoView>,
     pub video: Option<crate::video::VideoView>,
+    /// Phase 10: the link preview card.
+    pub link: Option<crate::link::LinkView>,
     pub comments: Vec<CommentView>,
     pub reactions: Vec<ReactionView>,
 }
@@ -882,6 +905,7 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
             edited: r.get(7)?,
             photos: vec![],
             video: None,
+            link: None,
             comments: vec![],
             reactions: vec![],
         })
@@ -915,6 +939,7 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
     for p in &mut posts {
         p.photos = photos.query_map(params![p.id], photo_view)?.collect::<rusqlite::Result<_>>()?;
         p.video = crate::video::view(conn, "post_id", &p.id)?;
+        p.link = crate::link::view(conn, &p.id)?;
         p.comments = comments
             .query_map(params![p.id, UNKNOWN], |r| {
                 let author_id: String = r.get(1)?;
@@ -1147,6 +1172,113 @@ mod tests {
         let (old, _) = f.event("post", serde_json::json!({ "text": "plain" }));
         assert!(f.apply(&old).unwrap().is_some());
         let _ = pid;
+    }
+
+    /// A link preview's picture as the sender makes it: (base64 WebP, width, height).
+    fn link_picture(w: u32, h: u32) -> (String, u32, u32) {
+        let img = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 60]));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let (webp, w, h) = crate::photo::link_image(&png).unwrap().unwrap();
+        (B64.encode(webp), w, h)
+    }
+
+    fn a_link() -> serde_json::Value {
+        let (image, width, height) = link_picture(1200, 630);
+        serde_json::json!({ "url": "https://www.example.org/story?id=7", "title": "A story", "description": "What happened",
+                            "site": "Example News", "image": image, "width": width, "height": height })
+    }
+
+    const LINK_TEXT: &str = "Read this: https://www.example.org/story?id=7";
+
+    fn previews(f: &Fixture) -> i64 {
+        f.conn.query_row("SELECT COUNT(*) FROM link_previews", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn link_posts_show_their_preview() {
+        let mut f = fixture();
+        let (p, pid) = f.event("post", serde_json::json!({ "text": LINK_TEXT, "link": a_link() }));
+        assert_eq!(f.apply(&p).unwrap().unwrap().text, LINK_TEXT);
+        let posts = feed(&f.conn, "m_me", false, None, 10).unwrap();
+        let l = posts[0].link.as_ref().unwrap();
+        assert_eq!((l.url.as_str(), l.host.as_str(), l.title.as_str()), ("https://www.example.org/story?id=7", "example.org", "A story"));
+        assert_eq!((l.description.as_deref(), l.site.as_deref()), (Some("What happened"), Some("Example News")));
+        assert_eq!((l.width, l.height), (Some(600), Some(315)));
+        assert_eq!(l.image.as_deref(), Some(media_url(&format!("link/{pid}.webp")).as_str()));
+        let webp = crate::link::image(&f.conn, &pid).unwrap();
+        assert_eq!(&webp[8..12], b"WEBP");
+        // Text only, and no picture: still a card.
+        let (p, _) = f.event("post", serde_json::json!({ "text": "https://example.org", "link": { "url": "https://example.org", "title": "Home" } }));
+        f.apply(&p).unwrap();
+        let posts = feed(&f.conn, "m_me", false, None, 10).unwrap();
+        let l = posts[0].link.as_ref().unwrap();
+        assert_eq!((l.title.as_str(), l.image.is_none(), l.width), ("Home", true, None));
+        // A post without one has none.
+        let (p, _) = f.event("post", serde_json::json!({ "text": "no link" }));
+        f.apply(&p).unwrap();
+        assert!(feed(&f.conn, "m_me", false, None, 1).unwrap()[0].link.is_none());
+    }
+
+    #[test]
+    fn bad_link_previews_are_dropped_and_the_post_stays() {
+        let mut f = fixture();
+        let d = B64.encode([7u8; 32]);
+        let photo = serde_json::json!({ "full": "f1", "full_digest": d, "thumb": "t1", "thumb_digest": d, "width": 1, "height": 1 });
+        let video = serde_json::json!({ "id": "v1", "digest": d, "thumb": "v1t", "thumb_digest": d, "width": 1280, "height": 720,
+                                        "duration_ms": 1000, "size": 1000 });
+        let mut png = Vec::new();
+        image::RgbImage::new(8, 8).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let with = |k: &str, v: serde_json::Value| {
+            let mut l = a_link();
+            l[k] = v;
+            l
+        };
+        let cases = [
+            ("wrong scheme", LINK_TEXT.replace("https", "ftp"), with("url", "ftp://www.example.org/story?id=7".into()), None),
+            ("not in the text", "Read this.".to_string(), a_link(), None),
+            ("a local address", "http://192.168.1.1/".to_string(), with("url", "http://192.168.1.1/".into()), None),
+            ("a user name", "https://me:pw@example.org/".to_string(), with("url", "https://me:pw@example.org/".into()), None),
+            ("no title", LINK_TEXT.to_string(), with("title", "  ".into()), None),
+            ("a long title", LINK_TEXT.to_string(), with("title", "t".repeat(301).into()), None),
+            ("a control character", LINK_TEXT.to_string(), with("description", "a\u{7}b".into()), None),
+            ("a PNG", LINK_TEXT.to_string(), with("image", B64.encode(&png).into()), None),
+            ("the wrong size", LINK_TEXT.to_string(), with("width", 599.into()), None),
+            ("no size", LINK_TEXT.to_string(), with("height", serde_json::Value::Null), None),
+            ("over 48 KiB", LINK_TEXT.to_string(), with("image", B64.encode(vec![0u8; 50_000]).into()), None),
+            ("not base64", LINK_TEXT.to_string(), with("image", "!!!".into()), None),
+            ("a wrong type", LINK_TEXT.to_string(), with("width", "wide".into()), None),
+            ("not an object", LINK_TEXT.to_string(), "https://www.example.org/story?id=7".into(), None),
+            ("with photos", LINK_TEXT.to_string(), a_link(), Some(("photos", serde_json::json!([photo])))),
+            ("with a video", LINK_TEXT.to_string(), a_link(), Some(("video", video))),
+        ];
+        for (i, (why, text, link, extra)) in cases.into_iter().enumerate() {
+            let mut body = serde_json::json!({ "text": text, "link": link });
+            if let Some((k, v)) = extra {
+                body[k] = v;
+            }
+            let (p, pid) = f.event("post", body);
+            assert!(f.apply(&p).unwrap().is_some(), "{why}: the post should still arrive");
+            assert_eq!(previews(&f), 0, "{why}: the preview should be dropped");
+            let posts = feed(&f.conn, "m_me", false, None, 100).unwrap();
+            assert_eq!(posts.len(), i + 1, "{why}");
+            assert!(posts.iter().find(|q| q.id == pid).unwrap().link.is_none(), "{why}");
+        }
+    }
+
+    #[test]
+    fn deleting_a_post_deletes_its_preview() {
+        let mut f = fixture();
+        let (p, pid) = f.event("post", serde_json::json!({ "text": LINK_TEXT, "link": a_link() }));
+        f.apply(&p).unwrap();
+        assert_eq!(previews(&f), 1);
+        let (del, _) = f.event("delete", serde_json::json!({ "post": pid }));
+        f.apply(&del).unwrap();
+        assert_eq!(previews(&f), 0);
+        assert!(crate::link::image(&f.conn, &pid).is_none());
+        // The post event arriving again (another page of the log) doesn't bring it back.
+        f.apply(&p).unwrap();
+        assert_eq!(previews(&f), 0);
     }
 
     #[test]

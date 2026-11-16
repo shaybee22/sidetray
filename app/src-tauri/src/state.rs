@@ -38,6 +38,8 @@ pub struct App {
     pub staged: Mutex<HashMap<String, Processed>>,
     /// Videos prepared in the composer (Phase 9), waiting for "Post" or "Send".
     pub staged_videos: Mutex<HashMap<String, crate::video::Prepared>>,
+    /// Link previews fetched in the composer (Phase 10), waiting for "Post".
+    pub staged_links: Mutex<HashMap<String, crate::link::Preview>>,
     /// Cancels the video being prepared, if any (one at a time).
     pub transcode: Mutex<Option<crate::video::Cancel>>,
     /// One sync at a time.
@@ -102,6 +104,7 @@ impl App {
             secrets: Mutex::new(None),
             staged: Mutex::new(HashMap::new()),
             staged_videos: Mutex::new(HashMap::new()),
+            staged_links: Mutex::new(HashMap::new()),
             transcode: Mutex::new(None),
             sync_lock: tokio::sync::Mutex::new(()),
             rotate_lock: tokio::sync::Mutex::new(()),

@@ -71,16 +71,55 @@ const HEIF_UNSUPPORTED: &str = "HEIC/HEIF photos (the format iPhones and many ph
 
 /// The image library: the photo with its EXIF orientation applied, and whether it was animated.
 fn decode(bytes: &[u8]) -> Result<(DynamicImage, bool)> {
+    let reader = reader(bytes)?;
+    let still = is_animated(bytes, reader.format());
+    Ok((oriented(reader)?, still))
+}
+
+fn reader(bytes: &[u8]) -> Result<ImageReader<Cursor<&[u8]>>> {
     let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     if reader.format().is_none() {
         return Err(anyhow!(UNREADABLE));
     }
-    let still = is_animated(bytes, reader.format());
+    Ok(reader)
+}
+
+fn oriented(reader: ImageReader<Cursor<&[u8]>>) -> Result<DynamicImage> {
     let mut decoder = reader.into_decoder().context("reading the photo")?;
     let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(decoder).context("decoding the photo")?;
     img.apply_orientation(orientation);
-    Ok((img, still))
+    Ok(img)
+}
+
+/// Link previews (SPEC.md Phase 10): the longest side of the card's picture,
+/// and the most it may weigh (it travels inside the post).
+pub const LINK_SIDE: u32 = 600;
+pub const MAX_LINK_IMAGE: usize = 48 * 1024;
+/// A picture from a web page is refused beyond this many pixels a side.
+const LINK_MAX_INPUT_SIDE: u32 = 6000;
+
+/// A web page's picture as a link preview's WebP: decoded and re-encoded like
+/// a photo (nothing from the original file survives), at most `LINK_SIDE`
+/// and `MAX_LINK_IMAGE`. `None` if even the smallest step is too big.
+/// Animated pictures keep their first frame.
+pub fn link_image(bytes: &[u8]) -> Result<Option<(Vec<u8>, u32, u32)>> {
+    let mut reader = reader(bytes)?;
+    // A small file can claim a huge picture: refuse it before allocating.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(LINK_MAX_INPUT_SIDE);
+    limits.max_image_height = Some(LINK_MAX_INPUT_SIDE);
+    limits.max_alloc = Some(160 * 1024 * 1024);
+    reader.limits(limits);
+    let img = oriented(reader)?;
+    for (side, quality) in [(LINK_SIDE, 70.0), (LINK_SIDE, 50.0), (400, 50.0)] {
+        let small = fit(&img, side);
+        let webp = encode_webp(&small, quality);
+        if webp.len() <= MAX_LINK_IMAGE {
+            return Ok(Some((webp, small.width(), small.height())));
+        }
+    }
+    Ok(None)
 }
 
 /// Android's own decoder, for what the image library can't read (HEIC/HEIF, AVIF).
@@ -262,6 +301,40 @@ mod tests {
         let mut bmp = Vec::new();
         img.write_to(&mut Cursor::new(&mut bmp), ImageFormat::Bmp).unwrap();
         assert_eq!(process(&bmp).unwrap().width, 30);
+    }
+
+    #[test]
+    fn link_images_fit_the_budget() {
+        // Noise compresses badly: it has to go down the quality and size steps.
+        let mut seed = 1u32;
+        let noisy = RgbImage::from_fn(2000, 1500, |_, _| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let b = seed.to_le_bytes();
+            image::Rgb([b[1], b[2], b[3]])
+        });
+        let mut png = Vec::new();
+        noisy.write_to(&mut Cursor::new(&mut png), ImageFormat::Png).unwrap();
+        if let Some((webp, w, h)) = link_image(&png).unwrap() {
+            assert!(webp.len() <= MAX_LINK_IMAGE, "{}", webp.len());
+            assert!(w.max(h) <= LINK_SIDE);
+            assert_eq!(dims(&webp), (w, h));
+        }
+        // An ordinary picture: 600 px, EXIF gone.
+        let (webp, w, h) = link_image(&jpeg_with_exif(1200, 630, 1)).unwrap().unwrap();
+        assert_eq!((w, h), (600, 315));
+        assert!(webp.len() <= MAX_LINK_IMAGE);
+        assert!(!contains(&webp, MARKER));
+        // A small one keeps its size.
+        assert_eq!(link_image(&jpeg_with_exif(120, 90, 1)).unwrap().unwrap().1, 120);
+    }
+
+    #[test]
+    fn link_images_refuse_huge_dimensions() {
+        let img = image::GrayImage::new(7000, 10);
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), ImageFormat::Png).unwrap();
+        assert!(link_image(&png).is_err());
+        assert!(link_image(b"<svg xmlns='http://www.w3.org/2000/svg'/>").is_err());
     }
 
     #[test]
