@@ -3,6 +3,35 @@
 All notable changes to Side Tray. Versions follow [Semantic Versioning](https://semver.org/);
 the app, the Rust crates and the relay share one version number.
 
+## [0.5.0] - 2026-11-16
+
+Link previews on posts, and tappable links.
+
+The relay is unchanged (only its version number moves), so updating it is
+optional. Apps from 0.4.0 show a post with a preview as plain text, and the
+preview isn't kept: a post that arrived before you updated stays without its
+card. Update the apps to see and send previews.
+
+### App
+
+- **Link previews on posts.** Paste or type a link in the post box and a card
+  appears with the page's picture, title, description and site, on Windows
+  and Android. YouTube links show the video's title, channel and thumbnail.
+  The × on the card leaves that link without a preview in this post. A post
+  with photos or a video has no card, and a page that gives no preview just
+  posts as text.
+- **Your device makes the preview, before it sends the post:** it fetches the
+  page, and the card (with a small picture of at most 48 KB) travels
+  encrypted inside the post. The relay and the people reading never contact
+  the site. The app only fetches public web addresses: never this computer,
+  your home network or other private addresses, also not after a redirect.
+- **Tap a card, or any link in a post's text, to open it** in your browser
+  (on Android, or in the app that handles it, such as YouTube). The app only
+  opens links that are in that post; the host shown on a card always comes
+  from the link itself, so a card can't claim to be from somewhere else.
+  Links in comments and direct messages stay plain text for now.
+- Deleting a post deletes its preview.
+
 ## [0.4.0] - 2026-11-07
 
 Short videos, on Windows and Android.
@@ -277,6 +306,7 @@ The first release: everything in [SPEC.md](SPEC.md) through Phase 7.
 - Clicking an old notification in the Windows notification centre doesn't
   open the post it was about (one still on screen does).
 
+[0.5.0]: https://github.com/shaybee22/sidetray/releases/tag/v0.5.0
 [0.4.0]: https://github.com/shaybee22/sidetray/releases/tag/v0.4.0
 [0.3.1]: https://github.com/shaybee22/sidetray/releases/tag/v0.3.1
 [0.3.0]: https://github.com/shaybee22/sidetray/releases/tag/v0.3.0
