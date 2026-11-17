@@ -664,7 +664,7 @@ So Media3, as the SPEC already planned. The bundled ffmpeg would only win on sha
 
 A post with a link to a web page or a YouTube video shows a preview card under its text: picture, title, description and site, like Facebook. The person posting fetches the preview once, at compose time, and it travels inside the encrypted post. The relay and the readers' devices never contact the linked site, and the relay doesn't change.
 
-**Scope**: feed posts only. Not comments, not direct messages, and URLs in text don't become clickable. A post with photos or a video has no preview: photos, a video and a link card are mutually exclusive, the same way photos and a video already are.
+**Scope**: feed posts only. Not comments and not direct messages. Links in a post's text are tappable too (checkpoint (e)), in posts only. A post with photos or a video has no preview: photos, a video and a link card are mutually exclusive, the same way photos and a video already are.
 
 **Payload**
 
@@ -805,6 +805,11 @@ The picture is a blob in the row, not a file in `media/`. A delete is then one `
 - The whole card is a `<button>` that calls `open_link(post.id)`, with a tooltip showing the full URL.
 - The host shown always comes from the URL, not from `site`, so a forged "PayPal" card still says where it really goes.
 
+**Links in the text** (checkpoint (e))
+
+- `PostView.urls` lists the links in the post's text, found by the same rules as the previewed link (`link::urls`; `first_url` is its first). The page wraps each one in an `<a class="post-link">` with no `href`, so the webview itself never navigates.
+- Clicking one calls `open_link(post_id, url)`. `link::text_link` opens it only if it is one of the links in that post's current text (not deleted; an edit that removes it closes it), http or https, without a user name or password. A local address such as `http://192.168.1.1` is allowed here: the person chose to open it, and the app never fetches it.
+
 **Files to touch**
 
 - new `link.rs` (fetch, guards, scanner, YouTube)
@@ -827,6 +832,7 @@ The picture is a blob in the row, not a file in `media/`. A delete is then one `
 - These get no preview: a link to `http://192.168.1.1`, a link to `http://localhost:8000`, and a public URL that redirects to a private address.
 - A capture on a receiving device shows no traffic to the linked site.
 - A 0.4.0 app shows the same post as plain text.
+- Every link in a post's text opens in the browser on Windows and on the razr; an address that isn't in that post's text is refused.
 - Deleting the post removes its `link_previews` row.
 - Unit tests:
   - the meta scanner: OG, twitter and `<title>` fallbacks, entities, attribute quoting, scripts and comments skipped, the 512 KiB cut
@@ -839,7 +845,7 @@ The picture is a blob in the row, not a file in `media/`. A delete is then one `
 
 **Later**
 
-- Previews in comments and direct messages; clickable URLs in text; URLs without a scheme (`example.com`).
+- Previews and tappable links in comments and direct messages; URLs without a scheme (`example.com`).
 - Pages in other charsets (reqwest's `charset` feature, `encoding_rs`).
 - Re-encoding received preview pictures (and photos and poster frames) on the receiving device, so a crafted WebP from a member can't reach the webview's decoder.
 - Cropping the black bars off YouTube's 4:3 `hqdefault` thumbnails, or using `maxresdefault` when it exists.

@@ -410,9 +410,10 @@ object SideTrayAndroid {
   }
 
   /**
-   * A link preview's address in the browser (Phase 10). Rust passes an http(s)
-   * address from the archive, never one from the webview. "no_window" without an
-   * activity, "no_browser" if nothing opens web links, null when it opened.
+   * A post's link (its preview card, or one in its text) in the browser (Phase 10).
+   * Rust passes an http(s) address from the archive, never one from the webview.
+   * "no_window" without an activity, "no_browser" if nothing opens web links,
+   * null when it opened.
    */
   @JvmStatic
   fun openLink(url: String): String? {

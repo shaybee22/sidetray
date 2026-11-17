@@ -452,8 +452,8 @@ pub fn open_notification_settings() -> Result<()> {
     Ok(())
 }
 
-/// A link preview's address in the browser (ACTION_VIEW). `url` comes from the
-/// archive and has been checked (`link::to_open`).
+/// A post's link (its card or its text) in the browser (ACTION_VIEW). `url` comes from the
+/// archive and has been checked (`link::to_open`, `link::text_link`).
 pub fn open_link(url: &str) -> Result<()> {
     match call_string("openLink", &[url])?.as_deref() {
         None => Ok(()),

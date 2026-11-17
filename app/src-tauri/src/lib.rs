@@ -1012,13 +1012,19 @@ fn unstage_link(app: Active, id: String) {
     app.staged_links.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
-/// A post's link card was clicked: open its address in the system browser.
-/// Takes the post, not an address, so the page can only open links that are
-/// in the archive.
+/// A post's link card, or a link in its text, was clicked: open the address in
+/// the system browser. Always names the post, so the page can only open links
+/// that are in the archive.
 #[tauri::command]
-fn open_link(app: Active, post_id: String) -> Res<()> {
+fn open_link(app: Active, post_id: String, url: Option<String>) -> Res<()> {
     app.require_archive().map_err(err)?;
-    let url = link::to_open(&app.db(), &post_id).map_err(err)?;
+    // Without `url`, the post's preview card; with it, a link in the post's text,
+    // which has to be there (Phase 10 (e)).
+    let url = match url {
+        None => link::to_open(&app.db(), &post_id),
+        Some(u) => link::text_link(&app.db(), &post_id, &u),
+    }
+    .map_err(err)?;
     #[cfg(desktop)]
     {
         open::that_detached(&url).map_err(|e| format!("couldn't open the browser: {e}"))

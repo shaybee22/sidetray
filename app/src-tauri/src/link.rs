@@ -658,34 +658,62 @@ pub fn host(url: &str) -> String {
 /// The first http(s) address in `text`, as written, without the punctuation
 /// that usually follows a link in a sentence. Only this one gets a preview.
 pub fn first_url(text: &str) -> Option<&str> {
+    urls(text).into_iter().next()
+}
+
+/// Every http(s) link in a post's text, in order (Phase 10 (e): they're tappable).
+/// The same rules as the preview's link, so the card and the text agree.
+pub fn urls(text: &str) -> Vec<&str> {
     let lower = text.to_ascii_lowercase();
+    let mut found = Vec::new();
     let mut from = 0;
-    let start = loop {
-        let at = from + ["http://", "https://"].iter().filter_map(|p| lower[from..].find(p)).min()?;
+    while let Some(at) = ["http://", "https://"].iter().filter_map(|p| lower[from..].find(p)).min().map(|i| from + i) {
         // Not the tail of a longer word ("xhttp://").
-        if !text[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric()) {
-            break at;
+        if text[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric()) {
+            from = at + 4;
+            continue;
         }
-        from = at + 4;
-    };
-    let rest = &text[start..];
-    let end = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '“' | '”')).unwrap_or(rest.len());
-    let mut url = &rest[..end];
-    while let Some(last) = url.chars().next_back() {
-        let unbalanced = |open: char, close: char| last == close && url.matches(open).count() < url.matches(close).count();
-        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '’' | '»')
-            || unbalanced('(', ')')
-            || unbalanced('[', ']')
-            || unbalanced('{', '}')
-        {
-            url = &url[..url.len() - last.len_utf8()];
-        } else {
-            break;
+        let rest = &text[at..];
+        let end = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '“' | '”')).unwrap_or(rest.len());
+        let mut url = &rest[..end];
+        while let Some(last) = url.chars().next_back() {
+            let unbalanced = |open: char, close: char| last == close && url.matches(open).count() < url.matches(close).count();
+            if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '’' | '»')
+                || unbalanced('(', ')')
+                || unbalanced('[', ']')
+                || unbalanced('{', '}')
+            {
+                url = &url[..url.len() - last.len_utf8()];
+            } else {
+                break;
+            }
         }
+        // Just a scheme ("https://") isn't a link.
+        let scheme_len = if url.to_ascii_lowercase().starts_with("https://") { 8 } else { 7 };
+        if url.len() > scheme_len {
+            found.push(url);
+        }
+        from = at + url.len().max(scheme_len);
     }
-    // Just a scheme ("https://") isn't a link.
-    let scheme_len = if url.to_ascii_lowercase().starts_with("https://") { 8 } else { 7 };
-    (url.len() > scheme_len).then_some(url)
+    found
+}
+
+/// A link in a post's text, to open in the browser. Only an address that is in
+/// that (not deleted) post's text, http or https, without a user name or
+/// password (which can disguise where a link goes). Unlike a preview, a local
+/// address is fine: the person tapped it, and the app never fetches it.
+pub fn text_link(conn: &rusqlite::Connection, post_id: &str, url: &str) -> Result<String> {
+    let text: String = conn
+        .query_row("SELECT body FROM posts WHERE id = ?1 AND deleted = 0", [post_id], |r| r.get(0))
+        .map_err(|_| anyhow::anyhow!("that post isn't in this app's archive"))?;
+    if !urls(&text).contains(&url) {
+        bail!("that link isn't in the post");
+    }
+    let u = parse(url)?;
+    if !matches!(u.scheme(), "http" | "https") || !u.username().is_empty() || u.password().is_some() {
+        bail!("that link can't be opened");
+    }
+    Ok(u.to_string())
 }
 
 #[cfg(test)]
@@ -756,6 +784,19 @@ mod tests {
         assert_eq!(first_url("xhttp://nope.example https://yes.example"), Some("https://yes.example"));
         assert_eq!(first_url("just https:// and nothing"), None);
         assert_eq!(first_url("no links here, example.org"), None);
+        assert_eq!(first_url("https:// then https://x.example"), Some("https://x.example"));
+    }
+
+    #[test]
+    fn every_link_in_the_text() {
+        assert_eq!(
+            urls("first http://a.example/, then (https://b.example/x) and HTTPS://C.example!"),
+            ["http://a.example/", "https://b.example/x", "HTTPS://C.example"]
+        );
+        assert_eq!(urls("xhttp://nope.example https://yes.example https://"), ["https://yes.example"]);
+        assert_eq!(urls("twice https://a.example https://a.example"), ["https://a.example", "https://a.example"]);
+        assert_eq!(urls("ünïcödé “https://example.org/é” 😀https://x.example"), ["https://example.org/é", "https://x.example"]);
+        assert!(urls("no links here, example.org").is_empty());
     }
 
     #[test]

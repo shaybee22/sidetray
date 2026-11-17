@@ -1028,7 +1028,7 @@ function renderPost(p) {
   }
   $(".when", el).textContent = when(p.created_at) + (p.edited ? " · edited" : "");
   $(".when", el).title = new Date(p.created_at * 1000).toLocaleString();
-  $(".post-text", el).textContent = p.text;
+  fillPostText($(".post-text", el), p);
   if (p.link) $(".post-text", el).after(renderLinkPreview(p));
 
   const photos = $(".photos", el);
@@ -1152,6 +1152,36 @@ function fillLinkCard(card, l) {
   site.textContent = l.site && l.site.toLowerCase() !== l.host.toLowerCase() ? `${l.site} · ${l.host}` : l.host;
   body.append(site);
   card.append(body);
+}
+
+/**
+ * A post's text, with its links (found by the app, `p.urls`) tappable. They
+ * have no href, so the webview never goes anywhere: the app opens only a link
+ * that is in this post's text, in the system browser (Phase 10 (e)).
+ */
+function fillPostText(box, p) {
+  box.replaceChildren();
+  const add = (s) => s && box.append(s);
+  let at = 0;
+  for (const url of p.urls || []) {
+    const i = p.text.indexOf(url, at);
+    if (i < 0) continue;
+    add(p.text.slice(at, i));
+    const a = document.createElement("a");
+    a.className = "post-link";
+    a.textContent = url;
+    a.title = url;
+    a.tabIndex = 0;
+    a.setAttribute("role", "link");
+    const open = () => invoke("open_link", { postId: p.id, url }).catch((e) => showError($("#cp-err"), e));
+    a.addEventListener("click", open);
+    a.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") open();
+    });
+    box.append(a);
+    at = i + url.length;
+  }
+  add(p.text.slice(at));
 }
 
 /** A post's link card: opens the link in the system browser. */

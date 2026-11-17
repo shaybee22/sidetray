@@ -834,6 +834,8 @@ pub struct PostView {
     pub video: Option<crate::video::VideoView>,
     /// Phase 10: the link preview card.
     pub link: Option<crate::link::LinkView>,
+    /// The links in `text`, in order, as written: the page makes them tappable.
+    pub urls: Vec<String>,
     pub comments: Vec<CommentView>,
     pub reactions: Vec<ReactionView>,
 }
@@ -906,6 +908,7 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
             photos: vec![],
             video: None,
             link: None,
+            urls: vec![],
             comments: vec![],
             reactions: vec![],
         })
@@ -940,6 +943,7 @@ pub fn feed(conn: &Connection, me: &str, keymaster: bool, before: Option<i64>, l
         p.photos = photos.query_map(params![p.id], photo_view)?.collect::<rusqlite::Result<_>>()?;
         p.video = crate::video::view(conn, "post_id", &p.id)?;
         p.link = crate::link::view(conn, &p.id)?;
+        p.urls = crate::link::urls(&p.text).into_iter().map(str::to_string).collect();
         p.comments = comments
             .query_map(params![p.id, UNKNOWN], |r| {
                 let author_id: String = r.get(1)?;
@@ -1283,6 +1287,33 @@ mod tests {
         // The post event arriving again (another page of the log) doesn't bring it back.
         f.apply(&p).unwrap();
         assert_eq!(previews(&f), 0);
+    }
+
+    #[test]
+    fn links_in_the_text_open_only_from_their_post() {
+        let mut f = fixture();
+        let text = "See http://192.168.1.1/admin and https://Example.org/a?b=1, or https://u:p@example.org/";
+        let (p, pid) = f.event("post", serde_json::json!({ "text": text }));
+        f.apply(&p).unwrap();
+        let posts = feed(&f.conn, "m_me", false, None, 1).unwrap();
+        assert_eq!(posts[0].urls, ["http://192.168.1.1/admin", "https://Example.org/a?b=1", "https://u:p@example.org/"]);
+        let open = |f: &Fixture, url: &str| crate::link::text_link(&f.conn, &pid, url);
+        // A local address is fine to open (it's never fetched); the address is normalised.
+        assert_eq!(open(&f, "http://192.168.1.1/admin").unwrap(), "http://192.168.1.1/admin");
+        assert_eq!(open(&f, "https://Example.org/a?b=1").unwrap(), "https://example.org/a?b=1");
+        // Not in the text, only part of a link, or with a user name and password: refused.
+        for bad in ["https://evil.example/", "https://Example.org/a", "https://u:p@example.org/", "javascript:alert(1)"] {
+            assert!(open(&f, bad).is_err(), "{bad} should be refused");
+        }
+        assert!(crate::link::text_link(&f.conn, "0123456789abcdef0123456789abcdef", "https://Example.org/a?b=1").is_err());
+        // Edited out of the text: gone. Deleted: nothing opens.
+        let (ed, _) = f.event("edit", serde_json::json!({ "post": pid, "text": "See https://new.example" }));
+        f.apply(&ed).unwrap();
+        assert!(open(&f, "https://Example.org/a?b=1").is_err());
+        assert!(open(&f, "https://new.example").is_ok());
+        let (del, _) = f.event("delete", serde_json::json!({ "post": pid }));
+        f.apply(&del).unwrap();
+        assert!(open(&f, "https://new.example").is_err());
     }
 
     #[test]
