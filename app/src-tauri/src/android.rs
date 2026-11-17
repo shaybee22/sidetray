@@ -452,6 +452,16 @@ pub fn open_notification_settings() -> Result<()> {
     Ok(())
 }
 
+/// A link preview's address in the browser (ACTION_VIEW). `url` comes from the
+/// archive and has been checked (`link::to_open`).
+pub fn open_link(url: &str) -> Result<()> {
+    match call_string("openLink", &[url])?.as_deref() {
+        None => Ok(()),
+        Some("no_browser") => bail!("there's no browser on this phone to open links"),
+        Some(other) => bail!("couldn't open the link ({other})"),
+    }
+}
+
 /// Whether Android lets an app run in the background freely ("Unrestricted"
 /// battery use) or holds it back to save battery.
 #[derive(Serialize, Deserialize, Clone, Debug)]

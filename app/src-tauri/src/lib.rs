@@ -1023,10 +1023,14 @@ fn open_link(app: Active, post_id: String) -> Res<()> {
     {
         open::that_detached(&url).map_err(|e| format!("couldn't open the browser: {e}"))
     }
-    // Checkpoint (d): Android's ACTION_VIEW through SideTrayAndroid.openLink.
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
     {
-        Err(format!("opening links on a phone isn't built yet ({url})"))
+        android::open_link(&url).map_err(err)
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = url;
+        Err("opening links isn't supported here".into())
     }
 }
 

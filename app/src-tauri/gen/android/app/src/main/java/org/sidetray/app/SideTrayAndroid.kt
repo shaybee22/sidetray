@@ -6,6 +6,7 @@ import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -35,7 +36,9 @@ import java.io.File
 import java.io.IOException
 import java.lang.ref.WeakReference
 import java.nio.ByteBuffer
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 /**
@@ -404,6 +407,25 @@ object SideTrayAndroid {
     }
     a.runOnUiThread { a.startActivity(i) }
     return null
+  }
+
+  /**
+   * A link preview's address in the browser (Phase 10). Rust passes an http(s)
+   * address from the archive, never one from the webview. "no_window" without an
+   * activity, "no_browser" if nothing opens web links, null when it opened.
+   */
+  @JvmStatic
+  fun openLink(url: String): String? {
+    val a = activity?.get() ?: return "no_window"
+    val i = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+      .addCategory(Intent.CATEGORY_BROWSABLE)
+      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    // Runs at once on the UI thread; from another thread, wait so a missing browser is reported.
+    val done = CompletableFuture<String?>()
+    a.runOnUiThread {
+      done.complete(try { a.startActivity(i); null } catch (e: ActivityNotFoundException) { "no_browser" })
+    }
+    return try { done.get(5, TimeUnit.SECONDS) } catch (e: Exception) { null }
   }
 
   // --- battery restrictions ------------------------------------------------------------
