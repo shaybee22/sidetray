@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# Side Tray operator commands on the host, installed by install.sh as
+# /usr/local/bin/sidetray-admin. Run as root (sudo).
+#
+#   sidetray-admin backup [--final] [--no-videos] [--no-encrypt] [--out DIR]
+#       One archive with everything needed to move this server to a new host
+#       (install.sh --restore): the database (a consistent copy, taken while
+#       the relay runs), photos, avatars and videos, the settings (.env), and
+#       a manifest with versions and checksums. A test server's backup also
+#       carries Caddy's own certificate authority, which the apps have pinned.
+#       Never the Let's Encrypt certificates: the new host gets its own.
+#       Encrypted with a passphrase you type (never stored).
+#         --final       turn maintenance mode on first (the backup you move with)
+#         --no-videos   leave videos out (they're temporary anyway; the apps
+#                       show them as expired after the move)
+#         --no-encrypt  write a plain .tar.gz
+#         --out DIR     where to write it (default /var/backups/sidetray)
+#
+#   sidetray-admin maintenance on|off|status
+#       While on, posts, messages, uploads, joins and Key Master actions are
+#       refused with "this server is moving". Reads and acks still work.
+#
+#   Everything else runs in the relay's container:
+#   sidetray-admin new-group | list-groups | setup-status | prune
+set -euo pipefail
+
+DIR=${SIDETRAY_DIR:-/opt/sidetray}
+OUT=/var/backups/sidetray
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+compose() { docker compose --project-directory "$DIR" -f "$DIR/compose.yaml" "$@"; }
+in_api() { compose exec -T api sidetray-admin "$@"; }
+
+env_get() {
+  [ -f "$DIR/.env" ] || return 0
+  sed -n "s/^$1=//p" "$DIR/.env" | tail -1 | sed 's/^"\(.*\)"$/\1/'
+}
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# A JSON string's contents (backslashes and quotes escaped).
+json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+read_passphrase() {
+  { exec 3</dev/tty; } 2>/dev/null || die "no terminal to ask for the backup passphrase on (or pass --no-encrypt)"
+  local again
+  while :; do
+    printf 'Passphrase for the backup (not stored anywhere; you need it to restore): ' >/dev/tty
+    IFS= read -rs PASS <&3; printf '\n' >/dev/tty
+    if [ ${#PASS} -lt 8 ]; then say "Use at least 8 characters."; continue; fi
+    printf 'Again: ' >/dev/tty
+    IFS= read -rs again <&3; printf '\n' >/dev/tty
+    [ "$PASS" = "$again" ] && break
+    say "They don't match; try again."
+  done
+  exec 3<&-
+  [ ${#PASS} -ge 12 ] || warn "a short passphrase: anyone who gets the file can try to guess it."
+}
+
+backup() {
+  local final=0 videos=1 encrypt=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --final) final=1; shift ;;
+      --no-videos) videos=0; shift ;;
+      --no-encrypt) encrypt=0; shift ;;
+      --out) OUT=${2:?--out needs a folder}; shift 2 ;;
+      -h|--help) usage 0 ;;
+      *) printf 'Unknown option: %s\n\n' "$1" >&2; usage 2 ;;
+    esac
+  done
+  [ "$(id -u)" = 0 ] || die "run this as root (sudo sidetray-admin backup)"
+  [ -f "$DIR/.env" ] || die "no Side Tray install in $DIR (no .env)"
+  [ -n "$(compose ps -q --status running api 2>/dev/null)" ] || die "the relay isn't running (cd $DIR && docker compose up -d)"
+  local host mode
+  host=$(env_get SIDETRAY_HOST); mode=$(env_get SIDETRAY_MODE)
+  [ -n "$host" ] || die "SIDETRAY_HOST isn't set in $DIR/.env"
+  if [ -z "$mode" ]; then
+    if [[ $host =~ ^[0-9.]+$ ]]; then mode=test; else mode=production; fi
+  fi
+
+  if [ "$encrypt" = 1 ]; then
+    if ! command -v gpg >/dev/null; then
+      say "Installing gnupg (for the backup's encryption)..."
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg >/dev/null || die "couldn't install gnupg"
+    fi
+    read_passphrase
+  fi
+
+  if [ "$final" = 1 ]; then
+    in_api maintenance on
+  elif [ "$(in_api maintenance status)" != "maintenance=on" ]; then
+    say "Note: the relay still accepts posts. For the backup you move with, use --final"
+    say "(maintenance mode first), or anything posted after this backup is lost in the move."
+  fi
+
+  # Globals: the EXIT trap still needs them after this function returns.
+  ts="" name="" snap="" stage="" gpghome=""
+  ts=$(date -u +%Y%m%d-%H%M%SZ)
+  name="sidetray-backup-$host-$ts"
+  snap="/data/.backup-$ts"
+  install -d -m 755 "$OUT"
+  stage=$(mktemp -d "$OUT/.stage-XXXXXX")
+  chmod 700 "$stage"
+  cleanup() {
+    rm -rf "$stage" "$OUT/$name".tar.gz*.part
+    [ -z "$gpghome" ] || { gpgconf --homedir "$gpghome" --kill gpg-agent 2>/dev/null || true; rm -rf "$gpghome"; }
+    in_api snapshot-clean "$snap" >/dev/null 2>&1 || true
+  }
+  trap cleanup EXIT
+
+  say "Taking a consistent copy of the database and media..."
+  local info
+  if [ "$videos" = 1 ]; then info=$(in_api snapshot "$snap"); else info=$(in_api snapshot "$snap" --no-videos); fi
+  num() { printf '%s' "$info" | sed -n "s/.*\"$1\": \([0-9]*\).*/\1/p"; }
+  str() { printf '%s' "$info" | sed -n "s/.*\"$1\": \"\([^\"]*\)\".*/\1/p"; }
+  mkdir -p "$stage/data"
+  compose exec -T api tar -C "$snap" -cf - . | tar -C "$stage/data" -xf - --no-same-owner
+  in_api snapshot-clean "$snap" >/dev/null
+  [ -s "$stage/data/sidetray.db" ] || die "the database copy is missing"
+
+  install -m 600 "$DIR/.env" "$stage/settings.env"
+  local ca=false
+  if [ "$mode" = test ]; then
+    # Not a host certificate: the root the apps pinned, so they keep trusting the new host.
+    mkdir -p "$stage/caddy-ca"
+    if compose exec -T caddy tar -C /data/caddy/pki/authorities/local -cf - . 2>/dev/null | tar -C "$stage/caddy-ca" -xf - --no-same-owner \
+       && [ -s "$stage/caddy-ca/root.crt" ] && [ -s "$stage/caddy-ca/root.key" ]; then
+      ca=true
+    else
+      rm -rf "$stage/caddy-ca"
+      warn "couldn't copy Caddy's certificate authority: after the move, every app would have to trust a new one."
+    fi
+    if [ -s "$DIR/ntfy-tls/cert.pem" ] && [ -s "$DIR/ntfy-tls/key.pem" ]; then
+      mkdir -p "$stage/ntfy-tls"
+      cp -p "$DIR/ntfy-tls/cert.pem" "$DIR/ntfy-tls/key.pem" "$stage/ntfy-tls/"
+    fi
+  fi
+
+  say "Writing the manifest..."
+  local files sep="" f
+  files=$(cd "$stage" && find . -type f ! -name manifest.json | sed 's|^\./||' | LC_ALL=C sort)
+  {
+    printf '{\n'
+    printf '  "format": 1,\n'
+    printf '  "app_version": "%s",\n' "$(json_str "$(str app_version)")"
+    printf '  "schema_version": %s,\n' "$(num schema_version)"
+    printf '  "fqdn": "%s",\n' "$(json_str "$host")"
+    printf '  "mode": "%s",\n' "$mode"
+    printf '  "created_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "videos_included": %s,\n' "$([ "$videos" = 1 ] && echo true || echo false)"
+    printf '  "test_ca_included": %s,\n' "$ca"
+    printf '  "maintenance": %s,\n' "$([ "$(in_api maintenance status)" = "maintenance=on" ] && echo true || echo false)"
+    printf '  "groups": %s,\n' "$(num groups)"
+    printf '  "events": %s,\n' "$(num events)"
+    printf '  "files": {\n'
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      printf '%s    "%s": "%s"' "$sep" "$(json_str "$f")" "$(sha256sum "$stage/$f" | cut -d' ' -f1)"
+      sep=$',\n'
+    done <<<"$files"
+    printf '\n  }\n}\n'
+  } >"$stage/manifest.json"
+
+  local file
+  if [ "$encrypt" = 1 ]; then
+    file="$OUT/$name.tar.gz.gpg"
+    gpghome=$(mktemp -d)
+    say "Packing and encrypting..."
+    tar -C "$stage" -czf - . | gpg --homedir "$gpghome" --batch --yes --quiet --no-symkey-cache --pinentry-mode loopback \
+      --passphrase-fd 3 --symmetric --cipher-algo AES256 --s2k-digest-algo SHA512 --s2k-count 65011712 \
+      --compress-algo none -o "$file.part" 3< <(printf '%s' "$PASS")
+  else
+    file="$OUT/$name.tar.gz"
+    say "Packing (not encrypted: the file holds the settings and every group's encrypted data)..."
+    tar -C "$stage" -czf "$file.part" .
+  fi
+  chmod 600 "$file.part"
+  mv "$file.part" "$file"
+  PASS=""
+  # The copy in $OUT stays root's. Run with sudo, a second copy goes to that
+  # user's home, owned by them, so a plain `scp` as that user can fetch it.
+  local who=root fetch=$file
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    local home
+    home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    if [ -n "$home" ] && [ -d "$home" ]; then
+      fetch="$home/$(basename "$file")"
+      if install -m 600 -o "$SUDO_USER" "$file" "$fetch.part" && mv "$fetch.part" "$fetch"; then
+        who=$SUDO_USER
+      else
+        rm -f "$fetch.part"
+        warn "couldn't copy the backup to $home (full disk?); fetch it from $file as root."
+        fetch=$file
+      fi
+    else
+      warn "$SUDO_USER has no home folder; fetch the backup from $file as root."
+    fi
+  fi
+
+  say ""
+  say "Backup: $file ($(du -h "$file" | cut -f1))"
+  [ "$fetch" = "$file" ] || say "        copy for $who: $fetch (delete it once you have it)"
+  say "        $(num groups) group(s), $(num events) events, $(num media_files) media files$([ "$videos" = 1 ] || echo ", videos left out")"
+  [ "$encrypt" = 1 ] && say "        encrypted; you need the passphrase to restore it"
+  say ""
+  say "To copy it to your computer, run this there (Windows PowerShell, macOS or Linux):"
+  say ""
+  say "    scp $who@$host:$fetch ."
+  say ""
+  if [ "$(in_api maintenance status)" = "maintenance=on" ]; then
+    say "Maintenance mode is ON: this server refuses new posts. Leave it on while you move."
+    say "To call off the move: sudo sidetray-admin maintenance off"
+  fi
+}
+
+case "${1:-}" in
+  backup) shift; backup "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *)
+    [ -f "$DIR/compose.yaml" ] || die "no Side Tray install in $DIR"
+    exec docker compose --project-directory "$DIR" -f "$DIR/compose.yaml" exec -T api sidetray-admin "$@" ;;
+esac

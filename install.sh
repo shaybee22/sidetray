@@ -22,7 +22,18 @@
 # of any file it replaces, and issues a new setup token only when the server
 # has no way to create a group yet, or when you pass --new-group.
 #
+# Moving a server (see MIGRATING.md): on the old host `sudo sidetray-admin
+# backup --final`, copy the file here, then `sudo ./install.sh --restore FILE`.
+# It checks the backup (passphrase, checksums, versions), confirms the address
+# with you, restores the settings and data, waits for DNS to point here (a
+# domain), and starts the relay: the apps carry on with no changes. If it
+# stops partway, run the same command again.
+#
 # Options (each skips its question):
+#   --restore FILE                  restore a backup from `sidetray-admin backup`
+#                                   (its passphrase is asked, or read from the
+#                                   SIDETRAY_BACKUP_PASSPHRASE environment variable)
+#   --force-restore                 restore even over a server that already has groups
 #   --domain NAME --email ADDRESS   production mode
 #   --ip ADDRESS                    test mode
 #   --retention DAYS                how long the relay keeps undelivered posts (default 90)
@@ -35,6 +46,15 @@ set -euo pipefail
 
 DIR=${SIDETRAY_DIR:-/opt/sidetray}
 ADMIN_BIN=/usr/local/bin/sidetray-admin
+# Where a backup is unpacked and checked (removed when this script ends).
+RSTAGE=/var/lib/sidetray-restore
+FETCH="" GPGHOME=""
+cleanup() {
+  [ -z "$FETCH" ] || rm -rf "$FETCH"
+  [ -z "$GPGHOME" ] || { gpgconf --homedir "$GPGHOME" --kill gpg-agent 2>/dev/null || true; rm -rf "$GPGHOME"; }
+  [ -z "${RESTORE:-}" ] || rm -rf "$RSTAGE"
+}
+trap cleanup EXIT
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -44,8 +64,11 @@ die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
 DOMAIN="" EMAIL="" IP="" RETENTION="" HISTORY="" NEW_GROUP=0 YES=0 MODE="" PUSH=""
+RESTORE="" FORCE_RESTORE=0 DNS_WAIT=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --restore) RESTORE=${2:?--restore needs a backup file}; shift 2 ;;
+    --force-restore) FORCE_RESTORE=1; shift ;;
     --domain) DOMAIN=${2:?--domain needs a name}; MODE=production; shift 2 ;;
     --email) EMAIL=${2:?--email needs an address}; shift 2 ;;
     --ip) IP=${2:?--ip needs an address}; MODE=test; shift 2 ;;
@@ -60,6 +83,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$DOMAIN" ] && [ -n "$IP" ] && die "pass either --domain or --ip, not both"
+[ -n "$RESTORE" ] && [ -n "$MODE" ] && die "--restore takes the address from the backup; leave out --domain and --ip"
 
 # --- prompts (from the terminal, so this also works piped from curl) ----------
 
@@ -128,7 +152,6 @@ if [ -n "$HERE" ] && [ -f "$HERE/compose.yaml" ] && [ -f "$HERE/server/Dockerfil
 elif [ -n "${SIDETRAY_SOURCE_URL:-}" ]; then
   command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null; }
   FETCH=$(mktemp -d)
-  trap 'rm -rf "$FETCH"' EXIT
   step "Downloading $SIDETRAY_SOURCE_URL"
   curl -fsSL "$SIDETRAY_SOURCE_URL" | tar -xz -C "$FETCH" || die "couldn't download or unpack $SIDETRAY_SOURCE_URL"
   SRC=$(dirname "$(find "$FETCH" -path '*/server/Dockerfile' | head -1)")
@@ -136,6 +159,151 @@ elif [ -n "${SIDETRAY_SOURCE_URL:-}" ]; then
   [ -f "$SRC/compose.yaml" ] || die "$SIDETRAY_SOURCE_URL doesn't look like a Side Tray release (no compose.yaml)"
 else
   die "run this from a Side Tray checkout or release folder (it needs compose.yaml and server/ next to it), or set SIDETRAY_SOURCE_URL to a release tarball"
+fi
+
+# --- restore: check the backup and put its settings in place ------------------
+
+if [ -z "$RESTORE" ] && [ -z "$MODE" ] && [ "$TTY" = 1 ] && [ -z "$(env_get SIDETRAY_HOST)" ]; then
+  say ""
+  say "Fresh install or restore from backup?"
+  say "  1) Fresh install"
+  say "  2) Restore a backup of another Side Tray server (sidetray-admin backup; see MIGRATING.md)"
+  while :; do
+    ask choice "Choose 1 or 2" 1
+    case "$choice" in
+      1) break ;;
+      2)
+        def=$(ls -t sidetray-backup-*.tar.gz* 2>/dev/null | head -1 || true)
+        while [ -z "$RESTORE" ] || [ ! -f "$RESTORE" ]; do
+          [ -n "$RESTORE" ] && say "No file at $RESTORE."
+          ask RESTORE "Backup file" "$def"
+        done
+        break ;;
+    esac
+  done
+fi
+
+RESTORING=0
+if [ -n "$RESTORE" ]; then
+  RESTORING=1
+  [ -f "$RESTORE" ] || die "--restore: no file at $RESTORE"
+  RESTORE=$(readlink -f "$RESTORE")
+  step "Checking the backup $(basename "$RESTORE")"
+  rm -rf "$RSTAGE"
+  install -d -m 700 "$RSTAGE"
+  if [ "$(head -c2 "$RESTORE" | od -An -tx1 | tr -d ' \n')" = 1f8b ]; then
+    ARCHIVE=$RESTORE
+    say "Not encrypted."
+  else
+    if ! command -v gpg >/dev/null; then
+      say "Installing gnupg (to decrypt the backup)..."
+      { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg >/dev/null; } || die "couldn't install gnupg"
+    fi
+    GPGHOME=$(mktemp -d)
+    ARCHIVE=$RSTAGE/backup.tar.gz
+    ok=0
+    for _ in 1 2 3; do
+      if [ -n "${SIDETRAY_BACKUP_PASSPHRASE:-}" ]; then
+        pass=$SIDETRAY_BACKUP_PASSPHRASE
+      elif [ "$TTY" = 1 ]; then
+        printf 'Backup passphrase: '; IFS= read -rs pass <&3; printf '\n'
+      else
+        die "the backup is encrypted: run this in a terminal, or set SIDETRAY_BACKUP_PASSPHRASE"
+      fi
+      # gpg checks the whole file's integrity (MDC) as it decrypts.
+      if gpg --homedir "$GPGHOME" --batch --yes --quiet --no-symkey-cache --pinentry-mode loopback \
+           --passphrase-fd 4 -o "$ARCHIVE" -d "$RESTORE" 4< <(printf '%s' "$pass") 2>"$RSTAGE/gpg.log"; then
+        ok=1; break
+      fi
+      rm -f "$ARCHIVE"
+      if grep -qiE 'bad session key|bad passphrase' "$RSTAGE/gpg.log"; then
+        say "That passphrase doesn't open this backup."
+        [ -z "${SIDETRAY_BACKUP_PASSPHRASE:-}" ] || break
+      else
+        cat "$RSTAGE/gpg.log" >&2
+        die "couldn't decrypt $RESTORE (gpg's message is above): is the file complete?"
+      fi
+    done
+    pass=""
+    [ "$ok" = 1 ] || die "couldn't decrypt the backup: wrong passphrase"
+    say "Decrypted."
+  fi
+  listing=$(tar -tvzf "$ARCHIVE") || die "$RESTORE is damaged (not a complete archive)"
+  if printf '%s\n' "$listing" | grep -q '^[lhcbp]'; then die "$RESTORE holds links or special files: not a Side Tray backup"; fi
+  if tar -tzf "$ARCHIVE" | grep -qE '^/|(^|/)\.\.(/|$)'; then die "$RESTORE has unsafe paths: not a Side Tray backup"; fi
+  mkdir "$RSTAGE/x"
+  tar -C "$RSTAGE/x" -xzf "$ARCHIVE" --no-same-owner || die "couldn't unpack $RESTORE"
+  [ "$ARCHIVE" = "$RESTORE" ] || rm -f "$ARCHIVE"
+
+  M=$RSTAGE/x/manifest.json
+  [ -f "$M" ] || die "$RESTORE has no manifest.json: not a Side Tray backup"
+  # A value of the manifest (written by sidetray-admin backup: one key per line).
+  mget() { sed -n "s/^  \"$1\": \"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}\$/\1/p" "$M" | head -1; }
+  [ "$(mget format)" = 1 ] || die "$RESTORE is a backup format this installer doesn't know (format $(mget format)); use a newer Side Tray release"
+  B_APP=$(mget app_version) B_SCHEMA=$(mget schema_version) B_HOST=$(mget fqdn) B_MODE=$(mget mode)
+  B_CREATED=$(mget created_at) B_VIDEOS=$(mget videos_included) B_CA=$(mget test_ca_included)
+  B_MAINT=$(mget maintenance) B_GROUPS=$(mget groups) B_EVENTS=$(mget events)
+
+  # Every file's checksum, and no file that isn't listed.
+  sed -n 's/^    "\(.*\)": "\([0-9a-f]\{64\}\)",\{0,1\}$/\2  \1/p' "$M" >"$RSTAGE/sums"
+  [ -s "$RSTAGE/sums" ] || die "the manifest lists no files"
+  (cd "$RSTAGE/x" && sha256sum --quiet --strict -c "$RSTAGE/sums") || die "the backup's files don't match their checksums (above): it's damaged"
+  extra=$(cd "$RSTAGE/x" && find . -type f ! -name manifest.json | sed 's|^\./||' | LC_ALL=C sort \
+          | comm -23 - <(cut -c67- "$RSTAGE/sums" | LC_ALL=C sort))
+  [ -z "$extra" ] || die "the backup holds files its manifest doesn't list: $extra"
+  [ -s "$RSTAGE/x/data/sidetray.db" ] && [ -s "$RSTAGE/x/settings.env" ] || die "the backup has no database or no settings"
+  say "Checksums: all $(wc -l <"$RSTAGE/sums") files match."
+
+  SRC_SCHEMA=$(sed -n 's/^SCHEMA_VERSION = \([0-9][0-9]*\).*/\1/p' "$SRC/server/app/main.py")
+  SRC_VERSION=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$SRC/server/app/__init__.py")
+  [[ $B_SCHEMA =~ ^[0-9]+$ ]] && [[ $SRC_SCHEMA =~ ^[0-9]+$ ]] || die "couldn't read the schema versions (backup: '$B_SCHEMA', this release: '$SRC_SCHEMA')"
+  if [ "$B_SCHEMA" -gt "$SRC_SCHEMA" ]; then
+    die "this backup comes from Side Tray $B_APP (database schema $B_SCHEMA), newer than the release you're installing ($SRC_VERSION, schema $SRC_SCHEMA). Install Side Tray $B_APP or newer here, then restore again."
+  fi
+  case "$B_MODE" in
+    production) valid_domain "$B_HOST" || die "the backup's address \"$B_HOST\" isn't a domain name" ;;
+    test) valid_ipv4 "$B_HOST" || die "the backup's address \"$B_HOST\" isn't an IPv4 address" ;;
+    *) die "the backup's mode \"$B_MODE\" is unknown" ;;
+  esac
+
+  say ""
+  say "Backup of:   https://$B_HOST ($B_MODE mode)"
+  say "Made:        $B_CREATED by Side Tray $B_APP"
+  say "Contains:    $B_GROUPS group(s), $B_EVENTS events; videos $([ "$B_VIDEOS" = true ] && echo included || echo "left out (the apps show them as expired)")"
+  if [ "$B_SCHEMA" -lt "$SRC_SCHEMA" ]; then
+    say "Database:    from an older release; updated for $SRC_VERSION when the relay starts"
+  fi
+  if [ "$B_MODE" = test ]; then
+    if [ "$B_CA" = true ]; then
+      say "Certificate: the test certificate authority the apps already trust (kept)"
+    else
+      warn "the backup has no test certificate authority: every app will have to confirm a new fingerprint."
+    fi
+  fi
+  [ "$B_MAINT" = true ] || warn "this backup was made without maintenance mode: anything posted on the old server after it was taken won't be here."
+  cur=$(env_get SIDETRAY_HOST)
+  [ -z "$cur" ] || [ "$cur" = "$B_HOST" ] || warn "this server is set up as $cur; the restore makes it $B_HOST."
+  say ""
+  say "The apps reach the relay at https://$B_HOST. This server has to answer there, so the"
+  if [ "$B_MODE" = production ]; then
+    say "DNS record for $B_HOST has to point here (this installer waits for it before getting a certificate)."
+  else
+    say "address $B_HOST has to be this server's (take it over from the old one)."
+  fi
+  if [ "$TTY" = 1 ]; then
+    yes_no "Restore this server as https://$B_HOST?" y || die "stopped; nothing was changed"
+  fi
+  # Identifies this backup, so restoring it again after a failure is allowed.
+  RESTORE_ID=$(sha256sum "$M" | cut -c1-16)
+
+  install -d -m 755 "$DIR"
+  if [ -f "$DIR/.env" ] && ! cmp -s "$DIR/.env" "$RSTAGE/x/settings.env"; then
+    bak="$DIR/.env.before-restore.$(date +%Y%m%d-%H%M%S)"
+    cp -p "$DIR/.env" "$bak"; say "  kept this server's previous .env as $(basename "$bak")"
+  fi
+  install -m 600 "$RSTAGE/x/settings.env" "$DIR/.env"
+  grep -q '^SIDETRAY_MODE=' "$DIR/.env" || printf 'SIDETRAY_MODE=%s\n' "$B_MODE" >>"$DIR/.env"
+  say "  restored .env"
 fi
 
 # --- settings -----------------------------------------------------------------
@@ -153,7 +321,9 @@ fi
 
 say "Side Tray relay installer ($PRETTY_NAME)"
 KEEP=0
-if [ -n "$OLD_HOST" ] && [ -z "$MODE" ]; then
+if [ "$RESTORING" = 1 ]; then
+  KEEP=1  # the backup's settings, already confirmed above
+elif [ -n "$OLD_HOST" ] && [ -z "$MODE" ]; then
   say ""
   say "Found an existing install in $DIR:"
   say "  address:   https://$OLD_HOST ($OLD_MODE mode)"
@@ -262,12 +432,22 @@ fi
 
 my_ips=$(ip -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth)/ {print $4}' | cut -d/ -f1 | sort -u)
 if [ "$MODE" = production ]; then
-  resolved=$(getent ahosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true)
-  [ -n "$resolved" ] || die "$DOMAIN doesn't resolve. At your DNS provider, add an A record (and AAAA for IPv6) for $DOMAIN pointing at this server's public address, wait a few minutes, and run this again."
   public=$( { curl -4 -fsS -m 5 https://api.ipify.org 2>/dev/null; echo; curl -6 -fsS -m 5 https://api6.ipify.org 2>/dev/null; echo; } | grep . || true)
   mine=$(printf '%s\n%s\n' "$my_ips" "$public" | grep . | sort -u)
-  if printf '%s\n' "$resolved" | grep -qxF -f <(printf '%s\n' "$mine"); then
+  dns_here() {
+    resolved=$(getent ahosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true)
+    [ -n "$resolved" ] && printf '%s\n' "$resolved" | grep -qxF -f <(printf '%s\n' "$mine")
+  }
+  if dns_here; then
     say "DNS: $DOMAIN -> $(echo $resolved) (this server)."
+  elif [ "$RESTORING" = 1 ]; then
+    # A move: the record still points at the old host. The data goes in first;
+    # just before starting, this waits for DNS (Let's Encrypt needs it).
+    say "DNS: $DOMAIN -> $(echo ${resolved:-nothing}), not this server yet ($(echo $mine))."
+    say "     The data is restored first; then you'll be asked to point $DOMAIN here."
+    DNS_WAIT=1
+  elif [ -z "$resolved" ]; then
+    die "$DOMAIN doesn't resolve. At your DNS provider, add an A record (and AAAA for IPv6) for $DOMAIN pointing at this server's public address, wait a few minutes, and run this again."
   else
     warn "$DOMAIN points at $(echo $resolved), but this server's addresses are: $(echo $mine)."
     say "Let's Encrypt checks the domain by connecting to it on ports 80 and 443, so the A/AAAA"
@@ -280,6 +460,10 @@ else
     say "Address: $IP is on this server."
   else
     warn "$IP isn't one of this server's addresses ($(echo $my_ips)). Clients must still reach it there."
+    if [ "$RESTORING" = 1 ] && [ "$TTY" = 1 ]; then
+      say "The apps of this backup's groups connect to $IP, so this server has to take that address over."
+      yes_no "Continue anyway?" n || die "give this server the address $IP (and take it off the old one), then run the same command again"
+    fi
   fi
 fi
 
@@ -427,6 +611,12 @@ fi
 # skips the name check, and a certificate for the server's IP would make Caddy
 # serve it on 443 too, in place of its own CA's.
 install -d -m 755 "$DIR/ntfy-tls"
+# A restored test server keeps the certificate the ntfy apps pinned.
+if [ "$RESTORING" = 1 ] && [ -s "$RSTAGE/x/ntfy-tls/cert.pem" ] && [ -s "$RSTAGE/x/ntfy-tls/key.pem" ]; then
+  install -m 644 "$RSTAGE/x/ntfy-tls/cert.pem" "$DIR/ntfy-tls/cert.pem"
+  install -m 600 "$RSTAGE/x/ntfy-tls/key.pem" "$DIR/ntfy-tls/key.pem"
+  say "  restored the push server's certificate"
+fi
 if [ "$PUSH" = yes ] && [ "$MODE" = test ]; then
   cert="$DIR/ntfy-tls/cert.pem"
   if [ ! -s "$cert" ] || [ ! -s "$DIR/ntfy-tls/key.pem" ] \
@@ -513,18 +703,66 @@ else
   say "  kept .env (setup token and other settings untouched)"
 fi
 
-cat >"$ADMIN_BIN" <<EOF
-#!/bin/sh
-# Installed by Side Tray's install.sh: operator commands, run in the relay's container.
-# sidetray-admin new-group | list-groups | prune   (sidetray-admin -h for details)
-exec docker compose --project-directory "$DIR" -f "$DIR/compose.yaml" exec -T api sidetray-admin "\$@"
-EOF
-chmod 755 "$ADMIN_BIN"
+# Operator commands: backup and maintenance on the host, the rest in the relay's container.
+sed "s|^DIR=\${SIDETRAY_DIR:-/opt/sidetray}\$|DIR=\${SIDETRAY_DIR:-$DIR}|" "$DIR/server/host/sidetray-admin" >"$ADMIN_BIN.new"
+chmod 755 "$ADMIN_BIN.new"
+mv "$ADMIN_BIN.new" "$ADMIN_BIN"
 
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
   ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null && say "  ufw: allowed ports 80 and 443"
   if [ "$PUSH" = yes ] && [ "$MODE" = test ]; then
     ufw allow "$NTFY_PORT/tcp" >/dev/null && say "  ufw: allowed port $NTFY_PORT (push server)"
+  fi
+fi
+
+# --- restore: the data --------------------------------------------------------
+
+if [ "$RESTORING" = 1 ]; then
+  step "Restoring the data (building the relay first; this takes a minute or two)"
+  compose build api
+  compose stop api caddy >/dev/null 2>&1 || true
+  # The relay runs as uid 1000 and copies from here into its own volume.
+  chown -R 1000:1000 "$RSTAGE/x/data"
+  force=""; [ "$FORCE_RESTORE" = 1 ] && force=--force
+  set +e
+  compose run --rm --no-deps -T -v "$RSTAGE/x/data:/restore:ro" api \
+    sidetray-admin restore-data /restore --id "$RESTORE_ID" $force
+  rc=$?
+  set -e
+  case "$rc" in
+    0) say "  restored the database and media" ;;
+    3) die "this server already has groups of its own (above). To replace them with the backup's, run the same command with --force-restore." ;;
+    4) die "the backup's database is newer than this release (above)." ;;
+    *) die "restoring the data failed (above). Fix what it says and run the same command again; restoring again is safe." ;;
+  esac
+  if [ "$B_MODE" = test ] && [ -s "$RSTAGE/x/caddy-ca/root.crt" ]; then
+    # The apps pinned this root: put it back, and drop any certificate an
+    # earlier, different authority made here, so Caddy issues one from it.
+    compose run --rm --no-deps -T -v "$RSTAGE/x/caddy-ca:/restore-ca:ro" --entrypoint sh caddy -c \
+      'set -e; d=/data/caddy/pki/authorities/local; mkdir -p "$d"; cp /restore-ca/* "$d/"; chmod 600 "$d"/*.key; rm -rf /data/caddy/certificates/local' \
+      || die "couldn't restore the test certificate authority. Run the same command again; restoring again is safe."
+    say "  restored the test certificate authority the apps trust"
+  fi
+fi
+
+if [ "$DNS_WAIT" = 1 ]; then
+  step "Point $DOMAIN at this server"
+  say "Everything is in place. Now, at your DNS provider, change the A record (and AAAA, if"
+  say "there is one) of $DOMAIN to this server's public address ($(echo $mine))."
+  say "The old server keeps refusing posts (maintenance mode) meanwhile, so nothing is lost."
+  say "Let's Encrypt only issues this server a certificate once the name points here."
+  if [ "$TTY" = 0 ] || yes_no "Wait here until it points at this server?" y; then
+    waited=0
+    until dns_here; do
+      [ "$waited" -lt 3600 ] || die "$DOMAIN still doesn't point here after an hour. Run the same command again once it does; restoring again is safe."
+      say "  $(date +%H:%M:%S) $DOMAIN -> $(echo ${resolved:-nothing}); checking again in 30 seconds (Ctrl-C stops; running this again is safe)"
+      sleep 30
+      waited=$((waited + 30))
+      resolvectl flush-caches >/dev/null 2>&1 || true
+    done
+    say "DNS: $DOMAIN -> $(echo $resolved) (this server)."
+  else
+    warn "starting before DNS points here: Caddy keeps retrying for a certificate, and the apps reach this server once it does."
   fi
 fi
 
@@ -632,9 +870,17 @@ else
   say "Push server:     ntfy.sh (Android phones need no setup; re-run with --push to run your own)"
 fi
 say "Settings:        $DIR/.env, $DIR/Caddyfile; data in Docker volumes sidetray_api_data and sidetray_caddy_data"
-say "Admin:           sudo sidetray-admin new-group | list-groups | prune"
+say "Admin:           sudo sidetray-admin new-group | list-groups | prune | backup | maintenance"
 say ""
-if [ -n "$TOKEN_OUT" ]; then
+if [ "$RESTORING" = 1 ]; then
+  say "Restored from $(basename "$RESTORE") (made $B_CREATED on Side Tray $B_APP)."
+  say ""
+  "$ADMIN_BIN" list-groups || true
+  say ""
+  say "The apps reconnect to https://$HOST on their own; nobody has to change anything."
+  say "Keep the old server (in maintenance mode) until every device has shown up here,"
+  say "then shut it down. See MIGRATING.md."
+elif [ -n "$TOKEN_OUT" ]; then
   say "$TOKEN_OUT"
   say ""
   say "In the Side Tray app's first-run wizard: server https://$HOST, the group's name,"

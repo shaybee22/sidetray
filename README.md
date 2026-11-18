@@ -163,11 +163,13 @@ installing it again means joining again (another phone call).
 ```
 CHANGELOG.md          what changed in each release
 .github/workflows/    release.yml: installers and the updater manifest on a v* tag
-install.sh            server installer: Docker, /opt/sidetray, HTTPS, first setup token, optional own push server
+install.sh            server installer: Docker, /opt/sidetray, HTTPS, first setup token, optional own push server; --restore a backup
+MIGRATING.md          moving a server to a new host (backup, restore, DNS)
 compose.yaml          api (FastAPI + SQLite) behind caddy (HTTPS); optional ntfy for Android push (profile "push")
 Caddyfile             TLS via Caddy's internal CA, for a dev checkout on a LAN IP
 server/app/main.py    the relay
-server/app/admin.py   operator commands (`sidetray-admin new-group | list-groups | prune`)
+server/app/admin.py   operator commands (`sidetray-admin new-group | list-groups | prune | maintenance`)
+server/host/sidetray-admin  the host's `sidetray-admin`: `backup` and `maintenance` there, the rest in the container
 scripts/smoke-test.sh live TLS checks + full API run on a throwaway container
 scripts/ws_probe.py   stdlib-only WebSocket client the smoke test uses for /ws
 crypto/               Rust crate: keys, sealing, encryption, signatures, safety codes
@@ -329,9 +331,12 @@ exists. Group names are unique per server (case doesn't matter).
 sudo sidetray-admin new-group      # one-time setup token, valid 7 days (--days N)
 sudo sidetray-admin list-groups    # groups with member/device/event counts, unused tokens
 sudo sidetray-admin prune          # run the hourly prune job now
+sudo sidetray-admin backup         # encrypted backup of data and settings (--final, --no-videos, --no-encrypt)
+sudo sidetray-admin maintenance on # refuse new posts while the server moves (off, status)
 ```
 
-`sidetray-admin` on the host runs the same command inside the api container
+`sidetray-admin` on the host runs these inside the api container (`backup`
+also runs on the host)
 (`docker compose exec api sidetray-admin ...`, which also works in a dev
 checkout). `list-groups` is for the operator only; group names and counts
 never go out over the API.
@@ -359,6 +364,15 @@ restart resets them.
 Data lives in the `api_data` volume (`/data/sidetray.db` and `/data/media/`).
 The prune job runs hourly. Caddy's CA and certificates live in `caddy_data`;
 keep that volume, or test-mode clients will need the new root.
+
+### Backups and moving to a new host
+
+`sudo sidetray-admin backup` writes one encrypted archive with the database
+(a consistent copy, taken while the relay runs), photos, videos and `.env`,
+plus a manifest with versions and checksums. On a new host, `sudo ./install.sh
+--restore FILE` puts it back and the apps reconnect with no changes once the
+address points there. [MIGRATING.md](MIGRATING.md) has the step-by-step move,
+including maintenance mode, DNS TTLs and test-mode servers.
 
 ## Run from a checkout (development)
 

@@ -26,6 +26,12 @@ Android A3: phones register a UnifiedPush endpoint (POST /push). Whenever the
 relay would push to a device on /ws but that device has no socket open, it
 POSTs an empty wake-up to the endpoint instead (Waker), and the phone syncs
 over the normal API. The wake-up carries no content, names or group details.
+
+Phase 11: host moves. The database carries a schema version (PRAGMA
+user_version, SCHEMA_VERSION below) so a backup can be checked against the
+server it's restored onto, and a maintenance flag (`sidetray-admin
+maintenance on`, a file in the data folder) makes every write answer 503 while
+the last backup is taken, so nothing posted during the move is lost.
 """
 
 import asyncio
@@ -57,6 +63,14 @@ from . import __version__
 DATA_DIR = Path(os.environ.get("SIDETRAY_DATA", "./data"))
 DB_PATH = DATA_DIR / "sidetray.db"
 MEDIA_DIR = DATA_DIR / "media"
+# Present while the operator moves the server: writes answer 503 (Phase 11).
+MAINTENANCE_FLAG = DATA_DIR / "maintenance"
+MAINTENANCE_MESSAGE = "This server is moving to a new host; try again in a few minutes."
+# The database layout this code writes, stored as PRAGMA user_version. Raise it
+# with every change to SCHEMA or init_db's migrations: a backup records it, and
+# a server refuses a database (or a restore) newer than it knows. 0 means a
+# database from before versions were kept (0.5.0 or older).
+SCHEMA_VERSION = 1
 # Operator secret that creates a server's first group (later ones need a
 # one-time token from `sidetray-admin new-group`). Unset means disabled.
 SETUP_TOKEN = os.environ.get("SIDETRAY_SETUP_TOKEN", "")
@@ -347,10 +361,24 @@ def allow_profile_events(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS events_group_seq ON events (group_id, seq)")
 
 
+class NewerSchemaError(RuntimeError):
+    pass
+
+
+def schema_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     with db() as conn:
+        found = schema_version(conn)
+        if found > SCHEMA_VERSION:
+            raise NewerSchemaError(
+                f"{DB_PATH} has schema version {found}, but this relay ({__version__}) only knows up to"
+                f" {SCHEMA_VERSION}. Install the newer Side Tray release it came from."
+            )
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
         # Phase 3 columns, added in place so existing databases keep working.
@@ -404,6 +432,8 @@ def init_db() -> None:
             " (SELECT COALESCE(MAX(key_version), 1) FROM sealed_keys WHERE group_id = groups.id),"
             " (SELECT COALESCE(MAX(key_version), 1) FROM events WHERE group_id = groups.id))"
         )
+        if found < SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 # The latest profile event of each active member of one group (parameter: group id).
@@ -1220,10 +1250,38 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Side Tray relay", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan)
 api = APIRouter(prefix="/api/v1")
 
+# Writes that still go through in maintenance: acks and push registration
+# only tell the relay what a device already has or how to wake it.
+MAINTENANCE_ALLOWED = ("/api/v1/ack", "/api/v1/dms/ack", "/api/v1/media/acks", "/api/v1/push")
+
+
+def in_maintenance() -> bool:
+    return MAINTENANCE_FLAG.exists()
+
+
+def maintenance_blocks(method: str, path: str) -> bool:
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return False
+    path = path.rstrip("/")
+    if path in MAINTENANCE_ALLOWED or (path.startswith("/api/v1/media/") and path.endswith("/ack")):
+        return False
+    return in_maintenance()
+
+
+@app.middleware("http")
+async def maintenance_mode(request: Request, call_next):
+    if maintenance_blocks(request.method, request.url.path):
+        return JSONResponse({"detail": MAINTENANCE_MESSAGE, "maintenance": True}, status_code=503,
+                            headers={"Retry-After": "300"})
+    return await call_next(request)
+
 
 @api.get("/health")
 def health():
-    return {"ok": True, "version": __version__}
+    out = {"ok": True, "version": __version__}
+    if in_maintenance():
+        out["maintenance"] = True
+    return out
 
 
 @api.get("/group")
