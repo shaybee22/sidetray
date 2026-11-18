@@ -3,6 +3,45 @@
 All notable changes to Side Tray. Versions follow [Semantic Versioning](https://semver.org/);
 the app, the Rust crates and the relay share one version number.
 
+## [0.6.0] - 2026-11-18
+
+Server backups, and moving a server to a new host. See [MIGRATING.md](MIGRATING.md).
+
+Server only: the apps are unchanged apart from their version number, and
+0.5.0 apps work with a 0.6.0 relay. Update the relay with `git pull && sudo
+./install.sh --yes` (or from a release) to get the new commands.
+
+### Relay
+
+- **`sudo sidetray-admin backup`** writes one archive with everything needed to
+  rebuild the server: the database (a consistent copy from SQLite's online
+  backup API, taken while the relay runs), photos, avatars, videos (or not,
+  with `--no-videos`), the settings in `.env`, and a `manifest.json` with the
+  release and schema versions, the address, the date and every file's
+  checksum. It's encrypted with a passphrase you type (gpg, AES-256; never
+  stored), or plain with `--no-encrypt`. Let's Encrypt certificates are left
+  out, because the new host gets its own. A test-mode server's backup carries Caddy's
+  certificate authority, because the apps have pinned it. It prints a
+  ready-to-paste `scp` line for copying the file down: run with `sudo`, it
+  also puts a copy (mode 600) in your home folder, so you can fetch it as
+  yourself.
+- **Maintenance mode** (`sudo sidetray-admin maintenance on|off|status`, or
+  `backup --final`): the relay keeps serving the feed and photos but refuses
+  new posts, comments, messages, uploads, joins and Key Master actions with
+  "This server is moving to a new host; try again in a few minutes" (503), so
+  nothing posted during the move is lost. `/health` reports it.
+- **`install.sh --restore FILE`** (or "Restore from backup" when it asks)
+  decrypts and checks the backup, confirms the address with you, restores the
+  settings and data, waits for DNS to point at the new host before getting a
+  certificate, and starts the relay. Devices reconnect with no changes.
+  It refuses a backup from a newer release, updates one from an older release,
+  won't overwrite a server that already has groups (unless `--force-restore`),
+  and can be run again if it stops partway.
+- The database now records its schema version (`PRAGMA user_version`). A relay
+  refuses to start on a database written by a newer release.
+- Videos left out of a backup show in the apps as expired, the same as videos
+  the relay has let go of.
+
 ## [0.5.0] - 2026-11-16
 
 Link previews on posts, and tappable links.

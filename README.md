@@ -2,7 +2,7 @@
 
 Private, end-to-end encrypted feed for one group. See [SPEC.md](SPEC.md).
 
-**Status: 0.5.0** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 app for
+**Status: 0.6.0** ([CHANGELOG.md](CHANGELOG.md)). A Tauri 2 app for
 Windows, Linux and Android (`app/`) has a first-run wizard (join, or found the group with the setup token),
 the safety-code join flow, a Key Master screen, and a feed with posts, photos,
 comments, reactions, short videos and link previews. It keeps a local SQLite archive and syncs the moment the
